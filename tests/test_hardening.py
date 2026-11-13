@@ -9,18 +9,13 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import signal
 import subprocess
 import sys
-import time
-from pathlib import Path
 
 import pytest
 
-from arl import cli, contract, runner
-from conftest import Project, git
-
-DEAD_PID = 2**22 - 7
+from arl import cli, contract, gitops, render, runner
+from conftest import DEAD_PID, EVAL_PY, NOTHING_NEW, Project, cut_off, git, job_pid, launch, pid_alive
 
 
 def new_exp(p: Project, typ: str, h: str | None = None, code: int = 0, track: str = "main-line") -> str:
@@ -45,45 +40,65 @@ def after_the_run(monkeypatch, action):
 # --- dead ends ----------------------------------------------------------------------
 
 
-def test_run_killed_on_its_last_attempt_can_still_be_judged(project: Project):
+def test_run_cut_off_on_its_last_attempt_is_no_dead_end(project: Project):
     p = project
     h = p.started()
     eid = p.draft("tune", hyps=(h,), params={"x": 0.5, "crash": True})
     p.arl("exp", "run", eid, code=2)
-    rec = p.record(eid)  # the session dies during the second, last attempt
-    rec.update(status="running", pid=DEAD_PID, pid_start=1)
-    rec["attempts"].append({"n": 2, "started": "2026-01-01T00:00:00+00:00"})
-    p.ledger.save_record(rec)
+    cut_off(p, eid)  # the session dies during the second, last attempt
     assert "NEXT: interrupted E0002" in p.arl("next")
-    assert "the limit" in p.arl("exp", "run", eid, code=1)
+    # an interruption is not a failure: the run goes on although both attempts are used
+    assert "FAILED (attempt 2 of 2)" in p.arl("exp", "run", eid, code=2)
     rec = p.record(eid)
-    assert rec["status"] == "crashed" and rec["attempts"][1]["failed"].startswith("interrupted")
-    assert "NEXT: crashed E0002" in p.arl("next") and "judge it as a crash" in p.arl("next")
+    assert rec["status"] == "crashed" and len(rec["attempts"]) == 2
+    assert [s["ended_by"] for s in rec["attempts"][1]["segments"]] == ["interrupted", "failed"]
+    out = p.arl("next")
+    assert "NEXT: crashed E0002" in out and "judge it as a crash" in out
     p.judge(eid, "crash")
     assert "NEXT: hypothesize" in p.arl("next")
 
 
-def test_stale_run_is_settled_by_whichever_command_comes_next(project: Project):
+def test_cut_off_run_is_settled_by_whichever_command_comes_next(project: Project):
     p = project
     h = p.started()
-    wt = p.base / "wt" / "toy-main-line"
     eid = p.draft("feature", hyps=(h,), offset=0.6)
-    rec = p.record(eid)
-    rec.update(status="running", pid=DEAD_PID, pid_start=1, attempts=[{"n": 1, "started": "2026-01-01T00:00:00+00:00"}])
-    p.ledger.save_record(rec)
+    cut_off(p, eid)
     p.edit_code("main-line", 0.5)  # the fix the agent wants to commit after the run died
+    out = p.arl("exp", "commit", eid, "-m", "fix after the interruption", code=1)
+    assert "is paused in the middle of its run" in out and f"exp fail {eid}" in out
+    assert p.record(eid)["status"] == "paused"  # the refused command settled it all the same
+    assert "counts as failed" in p.arl("exp", "fail", eid, "--reason", "the offset was wrong")
     assert "committed" in p.arl("exp", "commit", eid, "-m", "fix after the interruption")
-    assert p.record(eid)["status"] == "crashed" and "OFFSET = 0.5" in (wt / "run.py").read_text()
     p.arl("exp", "run", eid)
+    rec = p.record(eid)
+    assert rec["attempts"][0]["failed"] == "not continued: the offset was wrong" and "failed" not in rec["attempts"][1]
+    assert rec["metrics"]["score"] == pytest.approx(0.8)
 
     p.judge(eid, "keep", "--hyp", f"{h}=supported")
     stuck = p.draft("tune", hyps=(h,), params={"x": 0.2})
+    cut_off(p, stuck)
     rec = p.record(stuck)
-    rec.update(status="running", pid=1, pid_start=1, attempts=[{"n": 1, "started": "2026-01-01T00:00:00+00:00"}])
+    rec.update(pid=1, pid_start=987654321)
     p.ledger.save_record(rec)
     # pid 1 is alive but it is not the arl that started the run: a reused pid must not block for ever
     assert "NEXT: interrupted" in p.arl("next")
     p.judge(stuck, "crash")
+
+
+def test_run_marked_as_started_that_never_got_going(project: Project):
+    p = project
+    h = p.started()
+    eid = p.draft("tune", hyps=(h,), params={"x": 0.5})
+    orphan = subprocess.Popen(["sleep", "300"], start_new_session=True)
+    try:
+        rec = p.record(eid)  # killed between "running" and the first line of the job
+        rec.update(status="running", pid=DEAD_PID, pid_start=1, child=runner.child_ref(orphan.pid), attempts=[{"n": 1, "started": "2026-01-01T00:00:00+00:00"}])
+        p.ledger.save_record(rec)
+        assert "only a draft that never ran" not in p.arl("exp", "abandon", eid, "--reason", "not wanted after all")
+        assert orphan.wait(timeout=20) is not None
+        assert p.record(eid)["status"] == "abandoned" and p.record(eid)["attempts"] == []
+    finally:
+        orphan.kill()
 
 
 def test_what_a_dead_run_left_behind_is_stopped(project: Project):
@@ -92,32 +107,49 @@ def test_what_a_dead_run_left_behind_is_stopped(project: Project):
     eid = p.draft("tune", hyps=(h,), params={"x": 0.5})
     orphan = subprocess.Popen(["sleep", "300"], start_new_session=True)
     try:
-        rec = p.record(eid)
-        rec.update(status="running", pid=DEAD_PID, pid_start=1, child=orphan.pid, attempts=[{"n": 1, "started": "2026-01-01T00:00:00+00:00"}])
-        p.ledger.save_record(rec)
+        cut_off(p, eid, child=runner.child_ref(orphan.pid))
         p.arl("exp", "run", eid)
         assert orphan.wait(timeout=20) is not None  # no second copy of the job beside the new run
-        assert "left behind were stopped" in p.record(eid)["attempts"][0]["failed"]
+        rec = p.record(eid)
+        assert rec["status"] == "evaluated" and len(rec["attempts"]) == 1
+        assert rec["attempts"][0]["segments"][0]["note"] == "the job it left behind was stopped"
     finally:
         orphan.kill()
 
 
-def test_hangup_takes_the_job_down(project: Project):
+def test_leftover_job_is_stopped_whichever_experiment_runs_next(project: Project):
+    p = project
+    p.setup()
+    p.track("alpha")
+    p.track("beta")
+    p.baseline("alpha")
+    p.baseline("beta")
+    h = p.hyp()
+    left = p.draft("tune", "alpha", hyps=(h,), params={"x": 0.5})
+    other = p.draft("tune", "beta", hyps=(h,), params={"x": 0.4})
+    orphan = subprocess.Popen(["sleep", "300"], start_new_session=True)
+    try:
+        cut_off(p, left, child=runner.child_ref(orphan.pid))
+        p.arl("exp", "run", other)  # a command about another experiment: two jobs must not share the machine
+        assert orphan.wait(timeout=20) is not None
+        assert p.record(left)["status"] == "paused" and p.record(other)["status"] == "evaluated"
+    finally:
+        orphan.kill()
+
+
+def test_a_number_from_before_is_not_mistaken_for_the_job(project: Project):
     p = project
     h = p.started()
-    eid = p.draft("tune", hyps=(h,), params={"x": 0.5, "sleep": 60})
-    launcher = Path(cli.__file__).resolve().parents[2] / "bin" / "arl"
-    proc = subprocess.Popen([sys.executable, str(launcher), "exp", "run", eid], cwd=p.root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    deadline = time.time() + 30
-    while time.time() < deadline and not p.record(eid).get("child"):
-        time.sleep(0.1)
-    child = p.record(eid)["child"]
-    assert runner.session_pids(child)
-    os.kill(proc.pid, signal.SIGHUP)
-    proc.communicate(timeout=40)
-    assert proc.returncode == 130 and not runner.session_pids(child)
-    rec = p.record(eid)
-    assert rec["status"] == "crashed" and rec["attempts"][0]["failed"] == "interrupted"
+    bystander = subprocess.Popen(["sleep", "300"], start_new_session=True)
+    try:
+        for x, change in ((0.4, {"boot": "the-boot-before-this-one"}), (0.5, {"start": 1})):
+            eid = p.draft("tune", hyps=(h,), params={"x": x})
+            cut_off(p, eid, child={**runner.child_ref(bystander.pid), **change})
+            p.arl("exp", "run", eid)
+            assert bystander.poll() is None  # same number, another process: left alone
+            p.judge(eid, "discard", "--hyp", f"{h}=open")
+    finally:
+        bystander.kill()
 
 
 def test_refrozen_contract_with_work_pending(project: Project, monkeypatch):
@@ -255,7 +287,7 @@ def test_same_code_on_two_tracks(project: Project):
 # --- gates ----------------------------------------------------------------------------
 
 
-def test_parking_a_stalled_track_does_not_skip_the_review(project: Project, monkeypatch):
+def test_parking_a_stalled_track_does_not_skip_the_introspection(project: Project, monkeypatch):
     p = project
     p.setup(every=20, stagnation=2)
     p.track("alpha")
@@ -265,63 +297,62 @@ def test_parking_a_stalled_track_does_not_skip_the_review(project: Project, monk
     h = p.hyp()
     p.tune(-0.2, "discard", h, track="alpha")
     p.tune(-0.3, "discard", h, track="alpha")
-    assert "A review comes first" in new_exp(p, "tune", h, code=1, track="beta")
-    assert "comes out of a review" in p.arl("track", "set", "alpha", "--status", "parked", "--note", "stalled", code=1)
+    assert "An introspection comes first" in new_exp(p, "tune", h, code=1, track="beta")
+    assert "comes out of an introspection" in p.arl("track", "set", "alpha", "--status", "parked", "--note", "stalled", code=1)
     monkeypatch.setattr(cli, "interactive", lambda: True)
     p.arl("track", "set", "alpha", "--status", "parked", "--note", "stalled")
     monkeypatch.setattr(cli, "interactive", lambda: False)
-    assert "A review comes first" in new_exp(p, "tune", h, code=1, track="beta")
+    assert "An introspection comes first" in new_exp(p, "tune", h, code=1, track="beta")
 
-    p.arl("review", "new")
-    p.fill(p.research / "reviews" / "R001.md")
-    p.arl("review", "close", "R001", "--decision", "adjust")
+    assert p.introspect("adjust") == "N001"
     new_exp(p, "tune", h, track="beta")
-    assert "is already parked" in p.arl("track", "set", "alpha", "--status", "parked", "--note", "x", "--review", "R001", code=1)
-    p.arl("track", "set", "alpha", "--status", "active", "--note", "one more try", "--review", "R001")
+    assert "is already parked" in p.arl("track", "set", "alpha", "--status", "parked", "--note", "x", "--introspection", "N001", code=1)
+    p.arl("track", "set", "alpha", "--status", "active", "--note", "one more try", "--introspection", "N001")
 
 
-def test_only_the_latest_review_opens_tracks(project: Project):
+def test_only_the_latest_introspection_opens_tracks(project: Project):
     p = project
     h = p.started()
-    for rid, decision in (("R001", "branch"), ("R002", "continue")):
-        p.arl("review", "new", "--trigger", "asked")
-        p.fill(p.research / "reviews" / f"{rid}.md")
-        p.arl("review", "close", rid, "--decision", decision)
-    assert "not the latest closed review" in p.arl("track", "new", "late", "--review", "R001", code=1)
-    assert "decided 'continue'" in p.arl("track", "new", "late", "--review", "R002", code=1)
+    assert p.introspect("branch") == "N001"
+    p.arl("introspect", "new", "--trigger", "asked")
+    # while a newer one is open, the one before it decides nothing
+    assert "N002 is not decided yet" in p.arl("track", "new", "late", "--introspection", "N001", code=1)
+    p.fill(p.research / "introspections" / "N002.md")
+    p.arl("introspect", "close", "N002", "--decision", "continue", *NOTHING_NEW)
+    p.arl("reload")
+    assert "not the latest closed introspection" in p.arl("track", "new", "late", "--introspection", "N001", code=1)
+    assert "decided 'continue'" in p.arl("track", "new", "late", "--introspection", "N002", code=1)
     assert h
 
 
 def test_who_may_decide_is_read_from_the_frozen_contract(project: Project):
     p = project
     p.started()
-    p.arl("review", "new", "--trigger", "asked")
-    p.fill(p.research / "reviews" / "R001.md")
+    p.arl("introspect", "new", "--trigger", "asked")
+    p.fill(p.research / "introspections" / "N001.md")
     toml = p.research / "arl.toml"
     frozen = toml.read_text()
     toml.write_text(frozen.replace('"pivot"]', '"pivot", "stop"]'))
-    assert "does not match the files on disk" in p.arl("review", "close", "R001", "--decision", "stop", code=1)
+    assert "does not match the files on disk" in p.arl("introspect", "close", "N001", "--decision", "stop", *NOTHING_NEW, code=1)
     toml.write_text(frozen)
-    assert "may not decide alone" in p.arl("review", "close", "R001", "--decision", "stop")
+    assert "may not decide alone" in p.arl("introspect", "close", "N001", "--decision", "stop", *NOTHING_NEW)
 
 
 def test_stop_budget_and_waiting_hold_for_existing_drafts(project: Project, monkeypatch):
     p = project
     h = p.started(max_experiments=2)
     draft = p.draft("tune", hyps=(h,), params={"x": 0.5})
-    p.arl("review", "new", "--trigger", "asked")
-    p.fill(p.research / "reviews" / "R001.md")
-    p.arl("review", "close", "R001", "--decision", "stop")
+    assert p.introspect("stop") == "N001"
     assert "waits for a person" in p.arl("exp", "run", draft, code=1)
     monkeypatch.setattr(cli, "interactive", lambda: True)
-    p.arl("review", "resolve", "R001", "--decision", "stop", "--note", "enough")
-    assert "NEXT: stopped R001" in p.arl("next")
+    p.arl("introspect", "resolve", "N001", "--decision", "stop", "--note", "enough")
+    assert "NEXT: stopped N001" in p.arl("next")
     assert "Nothing runs until a person reopens it" in p.arl("exp", "run", draft, code=1)
     assert "Nothing runs" in p.arl("exp", "reproduce", "E0001", code=1)
-    p.arl("review", "new", "--trigger", "reopen")
-    p.fill(p.research / "reviews" / "R002.md")
-    p.arl("review", "close", "R002", "--decision", "continue")
-    p.arl("review", "resolve", "R002", "--decision", "continue", "--note", "go on")
+    assert p.introspect("continue") == "N002"  # after a stop even "continue" waits for a person
+    p.arl("introspect", "resolve", "N002", "--decision", "continue", "--note", "go on")
+    assert "has not been read again" in p.arl("exp", "run", draft, code=1)
+    p.arl("reload")
     p.arl("exp", "run", draft)  # the second experiment: the budget of two is now used
     p.judge(draft, "keep", "--hyp", f"{h}=supported")
     assert "NEXT: budget" in p.arl("next")
@@ -349,7 +380,7 @@ def test_run_hours_bound_reruns_too(project: Project):
     p.contract()
     toml = p.research / "arl.toml"
     toml.write_text(toml.read_text().replace("max_experiments = 40", "max_experiments = 40\nmax_run_hours = 0.000001"))
-    (p.research / "eval" / "evaluate.py").write_text(__import__("conftest").EVAL_PY)
+    (p.research / "eval" / "evaluate.py").write_text(EVAL_PY)
     p.fill(p.research / "PROGRAM.md")
     p.arl("freeze", "--reason", "initial")
     p.track()
@@ -357,19 +388,17 @@ def test_run_hours_bound_reruns_too(project: Project):
     assert "budget is spent" in p.arl("exp", "reproduce", "E0001", code=1)
 
 
-def test_experiments_judged_around_a_review_are_counted(project: Project):
+def test_experiments_judged_around_an_introspection_are_counted(project: Project):
     p = project
     h = p.started(every=3)
     crashed = p.draft("tune", hyps=(h,), params={"x": 0.5, "crash": True})
     p.arl("exp", "run", crashed, code=2)
     p.arl("exp", "run", crashed, code=2)
-    p.arl("review", "new", "--trigger", "asked")  # lists E0001 only: E0002 has no verdict yet
-    p.fill(p.research / "reviews" / "R001.md")
-    p.arl("review", "close", "R001", "--decision", "continue")
-    p.judge(crashed, "crash")  # the same second as the review, as likely as not
-    assert "1 of 3 experiments judged since R001" in p.arl("review", "due")
-    p.arl("review", "new", "--trigger", "asked")
-    assert "E0002" in (p.research / "reviews" / "R002.md").read_text()
+    p.introspect("continue")  # lists E0001 only: E0002 has no verdict yet
+    p.judge(crashed, "crash")  # the same second as the introspection, as likely as not
+    assert "1 of 3 experiments judged since N001" in p.arl("introspect", "due")
+    p.arl("introspect", "new", "--trigger", "asked")
+    assert "E0002" in (p.research / "introspections" / "N002.md").read_text()
 
 
 def test_verdict_flags_must_fit(project: Project):
@@ -472,7 +501,7 @@ def test_ids_are_ids(project: Project):
     for bad in ("H*", "h001", "H001-x-nearer-the-target-scores-higher"):
         assert "is not a hypothesis id like H003" in new_exp(p, "tune", bad, code=1)
     assert "no hypothesis H999" in new_exp(p, "tune", "H999", code=1)
-    assert "is not a review id" in p.arl("review", "close", "R1", "--decision", "continue", code=1)
+    assert "is not an introspection id" in p.arl("introspect", "close", "R1", "--decision", "continue", code=1)
     assert "is not an idea id" in p.arl("idea", "set", "I*", "--status", "parked", "--note", "x", code=1)
     assert "no track ''" in p.arl("track", "set", "", "--status", "parked", "--note", "x", code=1)
     assert not list((p.research / "experiments").glob("E0002*")) and h
@@ -501,7 +530,7 @@ def test_text_that_is_typed(project: Project):
     bad = "caf\udce9"  # a byte that is not UTF-8, as the shell hands it over
     assert "not valid UTF-8" in p.arl("hyp", "new", "--title", bad, code=1)
     assert "not valid UTF-8" in p.arl("idea", "add", "--title", "fine", "--body", bad, code=1)
-    assert "the title is empty" in p.arl("idea", "add", "--title", "  \n ", "--body", "text", code=1)
+    assert "--title is empty" in p.arl("idea", "add", "--title", "  \n ", "--body", "text", code=1)
     p.arl("idea", "add", "--title", "two\nlines", "--body", "first\n## I050: smuggled\nStatus: rejected\n# a heading\nlast")
     ideas = p.ledger.ideas()
     assert [(i["id"], i["title"], i["status"]) for i in ideas] == [("I001", "two lines", "open")]
@@ -578,3 +607,282 @@ def test_older_records_survive_a_new_metric(project: Project, monkeypatch):
     assert "score" in p.arl("exp", "show", "E0001")
     assert "verdict: keep" in p.judge(eid, "keep", "--hyp", f"{h}=supported")
     assert "NEXT: baseline main-line" in p.arl("next")
+
+
+# --- found by the second pass ---------------------------------------------------------
+
+
+def test_killed_rerun_leaves_nothing_running_and_keeps_its_number(project: Project):
+    p = project
+    h = p.started()
+    eid = p.draft("tune", hyps=(h,), params={"x": 0.5, "steps": 30, "step_s": 0.1})
+    p.arl("exp", "run", eid)
+    p.judge(eid, "keep", "--hyp", f"{h}=supported")
+    proc = launch(p, "exp", "reproduce", eid)
+    job = job_pid(p, eid, "rerun-1-dev")
+    proc.kill()
+    proc.communicate(timeout=30)
+    assert pid_alive(job) and p.record(eid)["rerun"]["n"] == 1
+    assert "reproduced: True" in p.arl("exp", "reproduce", eid)  # stops the job that was left, then runs its own
+    assert not pid_alive(job) and not (p.base / "wt" / "toy-rerun-E0002-1").exists()
+    rec = p.record(eid)
+    assert "rerun" not in rec and [r["n"] for r in rec["reruns"]] == [1, 2]
+    assert rec["reruns"][0]["failed"] == "interrupted: the arl that ran it was gone, its job was stopped"
+    assert rec["reruns"][0]["run_seconds"] >= 0 and rec["reruns"][1]["reproduced"] is True
+    assert (p.ledger.exp_dir(eid) / "artifacts" / "rerun-2-dev" / "prediction.json").exists()
+
+
+def test_stopping_a_job_reaches_every_process_it_started(tmp_path):
+    seen = []
+    script = "import os, subprocess, time; subprocess.Popen(['sleep', '300'], preexec_fn=os.setpgrp); time.sleep(300)"
+    result = runner.execute(f'{sys.executable} -c "{script}"', tmp_path, dict(os.environ), 2, tmp_path / "log.txt", on_start=seen.append)
+    assert "passed its limit" in result["stopped"]
+    assert runner.session_pids(seen[0]) == []  # the one that left the job's process group as well
+    assert runner._memory_kb(os.getpid()) > 1000
+
+
+def test_crash_leaves_a_settled_hypothesis_alone(project: Project):
+    p = project
+    h = p.started()
+    p.tune(0.5, "keep", h, "supported")
+    crashed = p.draft("tune", hyps=(h,), params={"x": 0.6, "crash": True})
+    p.arl("exp", "run", crashed, code=2)
+    p.arl("exp", "run", crashed, code=2)
+    p.judge(crashed, "crash", "--hyp", f"{h}=open")
+    meta, body = p.ledger.hypothesis(h)
+    assert meta["status"] == "supported" and "E0003 (crash): left as it is" in body
+
+
+def test_same_change_committed_twice_is_the_same_experiment(project: Project):
+    p = project
+    h = p.started()
+    wt = p.base / "wt" / "toy-main-line"
+    first = p.draft("feature", hyps=(h,), offset=0.6)
+    p.arl("exp", "run", first)
+    p.judge(first, "discard", "--hyp", f"{h}=open")
+    second = p.draft("feature", hyps=(h,), offset=0.6)  # another commit, the same files
+    assert git(wt, "rev-parse", "HEAD") != p.record(first)["code_commit"]
+    assert f"as {first}: the result is already known" in p.arl("exp", "run", second, code=1)
+
+
+def test_file_that_is_not_utf8_is_named(project: Project):
+    p = project
+    p.started()
+    ideas = p.research / "IDEAS.md"
+    good = ideas.read_bytes()
+    ideas.write_bytes(b"# Ideas\n\n## I001: caf\xe9\nStatus: open\n")
+    for command in (("next",), ("status",), ("idea", "list"), ("verify",), ("hyp", "new", "--title", "t")):
+        out = p.arl(*command, code=1)
+        assert "IDEAS.md is not UTF-8 text" in out and "Traceback" not in out
+    ideas.write_bytes(good)
+    (p.research / "KNOWLEDGE.md").write_bytes(b"\xff\xfe")
+    assert "KNOWLEDGE.md is not UTF-8 text" in p.arl("reload", code=1)
+
+
+def test_ideas_file_edited_by_hand(project: Project):
+    p = project
+    p.setup()
+    p.arl("idea", "add", "--title", "first", "--body", "b")
+    ideas = p.research / "IDEAS.md"
+    ideas.write_text(ideas.read_text() + "## I001: a second first\nStatus: open\n\ntext\n\n## I7 short number\n\ntext\n\n## I003: no status line\n\ntext\n")
+    out = p.arl("verify", code=1)
+    assert "two entries called I001" in out and "'## I7 short number' is not read as an idea" in out and "I003 has no Status line" in out
+    assert "two entries called I001" in p.arl("idea", "set", "I001", "--status", "parked", "--note", "x", code=1)
+    assert p.arl("idea", "add", "--title", "next", "--body", "b").startswith("I004")
+    p.arl("idea", "set", "I003", "--status", "parked", "--note", "now it has one")
+    text = ideas.read_text()
+    assert "## I003: no status line\nStatus: parked" in text and "## I7 short number" in text
+
+
+def test_verdict_cut_off_in_the_middle_is_finished_later(project: Project, monkeypatch):
+    p = project
+    h = p.started()
+    wt = p.base / "wt" / "toy-main-line"
+    eid = p.draft("feature", hyps=(h,), offset=0.6)
+    p.arl("exp", "run", eid)
+    p.fill(p.ledger.exp_dir(eid) / "analysis.md")
+    real = gitops.Git.fast_forward
+
+    def dies(self, commit):
+        raise KeyboardInterrupt  # the process is stopped after the verdict is written, before the track moves
+
+    monkeypatch.setattr(gitops.Git, "fast_forward", dies)
+    p.arl("exp", "judge", eid, "--verdict", "keep", "--reason", "better", "--hyp", f"{h}=supported", code=130)
+    monkeypatch.setattr(gitops.Git, "fast_forward", real)
+    assert p.record(eid)["status"] == "judging" and p.ledger.track("main-line")["head_experiment"] == "E0001"
+    out = p.arl("next")
+    assert f"NEXT: unfinished {eid}" in out and f"exp judge {eid}" in out
+    assert f"{eid}: its verdict (keep) was cut off" in p.arl("verify", code=1)
+    # the verdict stands: another one can no longer be given
+    out = p.arl("exp", "judge", eid, "--verdict", "discard", "--reason", "changed my mind", "--hyp", f"{h}=refuted")
+    assert "was recorded before and cut off" in out and "'discard' was not applied" in out
+    rec = p.record(eid)
+    assert rec["status"] == "judged" and rec["verdict"]["decision"] == "keep"
+    assert p.ledger.track("main-line")["head_experiment"] == eid and p.ledger.hypothesis(h)[0]["status"] == "supported"
+    assert git(wt, "rev-parse", "HEAD") == rec["code_commit"] and git(wt, "branch", "--show-current") == "track/main-line"
+    assert p.arl("verify").strip() == "ok"
+
+    # cut off again, and this time the next command that writes finishes it without being asked
+    second = p.draft("tune", hyps=(h,), params={"x": 0.1})
+    p.arl("exp", "run", second)
+    p.fill(p.ledger.exp_dir(second) / "analysis.md")
+    monkeypatch.setattr(cli, "finish", lambda ledger, message: (_ for _ in ()).throw(KeyboardInterrupt))
+    p.arl("exp", "judge", second, "--verdict", "discard", "--reason", "worse", "--hyp", f"{h}=open", code=130)
+    monkeypatch.undo()
+    monkeypatch.chdir(p.root)
+    third = p.draft("tune", hyps=(h,), params={"x": 0.2})
+    assert p.record(second)["status"] == "judged" and p.record(third)["status"] == "draft"
+
+
+def test_draft_cut_off_between_its_branch_and_its_folder(project: Project):
+    p = project
+    h = p.started()
+    wt = p.base / "wt" / "toy-main-line"
+    git(wt, "switch", "-qc", "exp/E0002-next-one")  # what a killed 'exp new' leaves: the branch, no folder
+    assert "NEXT: design E0002" in new_exp(p, "feature", h)
+    assert git(wt, "branch", "--show-current") == "exp/E0002-next-one"
+    # the worktree moved off the draft's branch by hand: the draft still finds its branch
+    git(wt, "switch", "-q", "track/main-line")
+    assert "nothing to commit" in p.arl("exp", "commit", "E0002", "-m", "x", code=1)
+    assert git(wt, "branch", "--show-current") == "exp/E0002-next-one"
+    p.arl("exp", "abandon", "E0002", "--reason", "only a leftover")
+    # the worktree left on a branch that no experiment owns
+    git(wt, "switch", "-qc", "scratch")
+    new_exp(p, "tune", h)
+    assert git(wt, "branch", "--show-current") == "track/main-line"
+
+
+def test_freeze_that_cannot_be_committed_did_not_happen(project: Project, monkeypatch):
+    p = project
+    p.arl("init")
+    p.contract()
+    (p.research / "eval" / "evaluate.py").write_text(EVAL_PY)
+    p.fill(p.research / "PROGRAM.md")
+    index_lock = p.root / ".git" / "index.lock"
+    index_lock.write_text("")
+    assert "index.lock" in p.arl("freeze", "--reason", "initial", code=1)
+    assert not (p.research / "frozen.lock").exists() and "NEXT: freeze" in p.arl("next")
+    index_lock.unlink()
+    p.arl("freeze", "--reason", "initial")
+    p.track()
+    p.baseline()
+    evaluator = p.research / "eval" / "evaluate.py"
+    evaluator.write_text(evaluator.read_text() + "\n# stricter\n")
+    monkeypatch.setattr(cli, "interactive", lambda: True)
+    index_lock.write_text("")
+    assert "index.lock" in p.arl("freeze", "--reason", "stricter", "--yes", code=1)
+    assert contract.load(p.ledger)["version"] == 1  # the old lock, so the change still shows as a change
+    index_lock.unlink()
+    p.arl("freeze", "--reason", "stricter", "--yes")
+    assert contract.load(p.ledger)["version"] == 2
+
+
+def test_freeze_covers_only_what_was_shown(project: Project, monkeypatch):
+    p = project
+    p.started()
+    evaluator = p.research / "eval" / "evaluate.py"
+    evaluator.write_text(evaluator.read_text() + "\n# one change\n")
+    program = p.research / "PROGRAM.md"
+
+    def answer(prompt):
+        program.write_text(program.read_text() + "\nA rule that slipped in while the question was open.\n")
+        return "y"
+
+    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr("builtins.input", answer)
+    out = p.arl("freeze", "--reason", "one change", code=1)
+    assert "changed: research/eval/evaluate.py" in out and "changed: research/PROGRAM.md" not in out
+    assert "the files changed while the question was open" in out
+    assert contract.load(p.ledger)["version"] == 1
+
+
+def test_missing_lock_is_not_a_fresh_start(project: Project):
+    p = project
+    p.started()
+    (p.research / "frozen.lock").unlink()
+    out = p.arl("next")
+    assert "NEXT: contract" in out and "STOP" in out and "although experiments exist" in out
+    assert "a new freeze needs a person" in p.arl("freeze", "--reason", "again", code=1)
+    assert not (p.research / "frozen.lock").exists()
+    git(p.root, "restore", "research/frozen.lock")
+    assert "NEXT: hypothesize" in p.arl("next")
+
+
+def test_rerun_survives_a_home_checkout_on_the_wrong_branch(project: Project, monkeypatch):
+    p = project
+    h = p.started()
+    eid = p.tune(0.5, "keep", h)
+    after_the_run(monkeypatch, lambda: git(p.root, "switch", "-qc", "side-work"))
+    out = p.arl("exp", "reproduce", eid)
+    assert "the rerun is saved but could not be committed" in out and "reproduced: True" in out
+    rec = p.record(eid)
+    assert rec["reruns"][0]["reproduced"] is True and "rerun" not in rec
+
+
+def test_result_is_kept_when_its_table_cannot_be_written(project: Project, monkeypatch):
+    p = project
+    h = p.started()
+    eid = p.draft("tune", hyps=(h,), params={"x": 0.5})
+    monkeypatch.setattr(render, "analysis_facts", lambda ledger, rec: (_ for _ in ()).throw(KeyError("reference")))
+    p.arl("exp", "run", eid)
+    assert p.record(eid)["status"] == "evaluated" and p.record(eid)["metrics"]["score"] == pytest.approx(0.8)
+    assert "could not be written" in (p.ledger.exp_dir(eid) / "analysis.md").read_text()
+
+
+def test_repeating_the_baseline_never_moves_the_reference(project: Project):
+    p = project
+    h = p.started()
+    p.tune(0.5, "keep", h, "supported")  # the reference is now E0002
+    eid = p.draft("baseline")
+    assert "the result is already known" in p.arl("exp", "run", eid, code=1)
+    out = p.arl("exp", "run", eid, "--allow-duplicate", "to see the noise")
+    assert "outcome: repeat" in out and "finding" in out
+    assert "the verdict can be finding, not keep" in p.judge(eid, "keep", code=1)
+    p.judge(eid, "finding")
+    assert p.ledger.track("main-line")["head_experiment"] == "E0002"
+    assert "does not replace the reference" in (p.ledger.exp_dir(eid) / "analysis.md").read_text()
+
+
+def test_changed_data_asks_for_a_new_baseline(project: Project):
+    p = project
+    data = p.root / "data.txt"
+    data.write_text("one\n")
+    h = p.started(extra='[data]\nfiles = ["data.txt"]\n')
+    assert p.record("E0001")["conditions"]["data"][0]["path"] == str(data)
+    draft = p.draft("tune", hyps=(h,), params={"x": 0.5})
+    data.write_text("two\n")
+    assert "NEXT: outdated E0002" in p.arl("next")
+    assert "no reference under contract v1 and the data as it is" in p.arl("exp", "run", draft, code=1)
+    p.arl("exp", "abandon", draft, "--reason", "the data changed")
+    assert "NEXT: baseline main-line" in p.arl("next")
+    again = p.baseline()  # the same code and params on other data: a new measurement, not a known one
+    assert p.record(again)["comparison"]["outcome"] == "reference"
+    data.unlink()
+    assert "nothing matches 'data.txt'" in p.arl("exp", "new", "--type", "tune", "--track", "main-line", "--title", "t", "--hyp", h, code=1)
+    assert "NEXT:" in p.arl("next")  # reading goes on without the file
+
+
+def test_verdict_does_not_revive_a_dropped_hypothesis(project: Project):
+    p = project
+    h = p.started()
+    eid = p.draft("tune", hyps=(h,), params={"x": 0.5})
+    p.arl("exp", "run", eid)
+    p.arl("hyp", "set", h, "--status", "dropped", "--note", "the claim was badly put")
+    assert "was dropped" in p.judge(eid, "keep", "--hyp", f"{h}=supported", code=1)
+    p.judge(eid, "keep", "--hyp", f"{h}=open")
+    assert p.ledger.hypothesis(h)[0]["status"] == "dropped"
+
+
+def test_track_cut_off_between_its_branch_and_its_file(project: Project):
+    p = project
+    p.setup()
+    git(p.root, "branch", "track/side")  # a killed 'track new' left the branch
+    p.track("side")
+    git(p.root, "branch", "track/far")  # or the branch and the worktree
+    git(p.root, "worktree", "add", "-q", str(p.base / "wt" / "toy-far"), "track/far")
+    p.track("far")
+    git(p.root, "branch", "track/used", "HEAD~1")  # a branch somewhere else is not a leftover
+    assert "exists already and is not at" in p.arl("track", "new", "used", code=1)
+    (p.base / "wt" / "toy-plain").mkdir()
+    assert "is not a worktree of track/plain" in p.arl("track", "new", "plain", code=1)
+    assert sorted(t["name"] for t in p.ledger.tracks()) == ["far", "side"]

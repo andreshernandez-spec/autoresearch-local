@@ -12,17 +12,23 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from arl import cli  # noqa: E402
+from arl import cli, contract, runner  # noqa: E402
+from arl import ledger as ledger_module  # noqa: E402
 from arl.ledger import Ledger  # noqa: E402
 
+DEAD_PID = 2**22 - 7
+LONG_AGO = "2026-01-01T00:00:00+00:00"
+NOTHING_NEW = ("--no-lessons", "nothing went wrong", "--knowledge-unchanged", "nothing new")
+
 RUN_PY = """\
-import argparse, json, pathlib, sys, time
+import argparse, json, os, pathlib, signal, sys, time
 
 OFFSET = 0.0
 
@@ -34,10 +40,30 @@ if params.get("crash"):
     sys.exit(3)
 if params.get("hog_mb"):
     hog = b"x" * (params["hog_mb"] << 20)
+if params.get("deaf"):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    pathlib.Path(a.out, "deaf.txt").write_text("")
 if params.get("sleep"):
     time.sleep(params["sleep"])
 x = params.get("x", 0.0) + OFFSET
-pathlib.Path(a.out, "prediction.json").write_text(json.dumps({"x": x}))
+out = pathlib.Path(a.out)
+(out / "pid.txt").write_text(str(os.getpid()))
+start = 0
+if params.get("steps"):
+    # A job that saves its state as it goes, stops when asked, and continues where it was.
+    saved = out / "checkpoint" / "step.json"
+    if os.environ.get("ARL_RESUME") == "1" and saved.exists():
+        start = json.loads(saved.read_text())["step"]
+    asked = []
+    signal.signal(signal.SIGTERM, lambda *_: asked.append(1))
+    saved.parent.mkdir(exist_ok=True)
+    for step in range(start, params["steps"]):
+        time.sleep(params.get("step_s", 0.1))
+        saved.write_text(json.dumps({"step": step + 1}))
+        if asked:
+            print("asked to stop at step", step + 1)
+            sys.exit(1)
+pathlib.Path(a.out, "prediction.json").write_text(json.dumps({"x": x, "continued_from": start}))
 pathlib.Path(a.out, "weights.bin").write_bytes(b"0" * 4096)
 print("predicted", x)
 """
@@ -66,6 +92,8 @@ git_email = "test@example.org"
 command = "{python} run.py --params {{params}} --out {{out}} --split {{split}}"
 timeout_s = {timeout}
 max_attempts = 2
+checkpoint_every_s = 1
+pause_grace_s = {grace}
 keep = ["*.json", "*.csv"]
 
 [eval]
@@ -88,8 +116,9 @@ limit = 2.0
 
 [budget]
 max_experiments = {max_experiments}
+{budget}
 
-[review]
+[introspection]
 every = {every}
 stagnation = {stagnation}
 agent_may = ["continue", "adjust", "branch", "pivot"]
@@ -125,7 +154,7 @@ class Project:
         path.write_text(_FILL.sub("Written for the test.", path.read_text()))
 
     def contract(self, **over) -> None:
-        cfg = dict(worktrees=str(self.base / "wt"), python=sys.executable, timeout=60, max_experiments=40, every=6, stagnation=4, extra="")
+        cfg = dict(worktrees=str(self.base / "wt"), python=sys.executable, timeout=60, max_experiments=40, every=6, stagnation=4, extra="", grace=5, budget="")
         cfg.update(over)
         (self.research / "arl.toml").write_text(ARL_TOML.format(**cfg))
 
@@ -188,12 +217,96 @@ class Project:
     def record(self, eid: str) -> dict:
         return self.ledger.record(eid)
 
+    def introspect(self, decision: str = "continue", *extra: str, reload: bool = True) -> str:
+        """Open an introspection, write it, close it with nothing new to record, reload."""
+        before = {n["id"] for n in self.ledger.introspections()}
+        self.arl("introspect", "new", "--trigger", "asked")
+        nid = next(n["id"] for n in self.ledger.introspections() if n["id"] not in before)
+        self.fill(self.research / "introspections" / f"{nid}.md")
+        flags = extra or NOTHING_NEW
+        self.arl("introspect", "close", nid, "--decision", decision, *flags)
+        if reload and self.ledger.introspection(nid)[0]["status"] == "closed":
+            self.arl("reload")
+        return nid
+
     def started(self, **over) -> str:
         """Contract frozen, one track, baseline at x = 0 kept. Returns a hypothesis id."""
         self.setup(**over)
         self.track()
         self.baseline()
         return self.hyp()
+
+
+def cut_off(p: "Project", eid: str, child: dict | None = None) -> None:
+    """Leave the record of a draft or a failed run as it is when the arl that ran it was
+    killed in the middle: marked as running, its process gone."""
+    lock = contract.load(p.ledger)
+    rec = p.record(eid)
+    wt = p.ledger.worktree_path(rec["track"])
+    code = git(wt, "rev-parse", "HEAD")
+    rec["attempts"].append({"n": len(rec["attempts"]) + 1, "started": LONG_AGO, "code_commit": code, "segments": [{"started": LONG_AGO}]})
+    rec.update(status="running", pid=DEAD_PID, pid_start=1, code_commit=code)
+    rec.setdefault("contract", {k: lock[k] for k in ("version", "digest", "eval_digest")})
+    rec.setdefault("conditions", {"command": p.ledger.cfg.run_command, "split": "dev", "worktree": str(wt), "data": [], "data_digest": runner.data_digest([])})
+    if child:
+        rec["child"] = child
+    p.ledger.save_record(rec)
+
+
+def pause_record(p: "Project", eid: str, seconds: float = 1.0) -> None:
+    """Leave the record of a draft as it is after a part of its run was paused."""
+    cut_off(p, eid)
+    rec = p.record(eid)
+    attempt = rec["attempts"][-1]
+    attempt["segments"][0].update(ended=LONG_AGO, ended_by="paused", seconds=seconds)
+    attempt.update(paused="a pause was asked for", run_seconds=seconds)
+    rec["status"] = "paused"
+    for key in ("pid", "pid_start"):
+        rec.pop(key)
+    p.ledger.save_record(rec)
+
+
+LAUNCHER = Path(__file__).resolve().parent.parent / "bin" / "arl"
+
+
+def launch(p: "Project", *argv: str) -> subprocess.Popen:
+    """The real launcher in a process of its own, for what needs a signal or a second process."""
+    return subprocess.Popen([sys.executable, str(LAUNCHER), *argv], cwd=p.root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def wait_for(condition, timeout: float = 30.0) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        if condition():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def job_pid(p: "Project", eid: str, folder: str = "run-1") -> int:
+    """The pid the toy job wrote when it started."""
+    path = p.ledger.exp_dir(eid) / "artifacts" / folder / "pid.txt"
+    assert wait_for(lambda: path.exists() and path.read_text().strip()), f"the job of {eid} did not start"
+    return int(path.read_text())
+
+
+def saved_step(p: "Project", eid: str, folder: str = "run-1") -> int:
+    """The step the toy job last saved, 0 before the first."""
+    try:
+        return json.loads((p.ledger.exp_dir(eid) / "artifacts" / folder / "checkpoint" / "step.json").read_text())["step"]
+    except (OSError, ValueError, KeyError):
+        return 0
+
+
+def prediction(p: "Project", eid: str, folder: str = "run-1") -> dict:
+    return json.loads((p.ledger.exp_dir(eid) / "artifacts" / folder / "prediction.json").read_text())
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().split(")")[-1].split()[0] != "Z"
+    except OSError:
+        return False
 
 
 @pytest.fixture
@@ -208,6 +321,6 @@ def project(tmp_path, monkeypatch) -> Project:
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "toy project")
     monkeypatch.chdir(root)
-    monkeypatch.delenv("ARL_HOME", raising=False)
-    monkeypatch.delenv("ARL_DIR", raising=False)
+    # general lessons belong to this repository: tests write theirs somewhere else
+    monkeypatch.setattr(ledger_module, "GENERAL_LESSONS", tmp_path / "general" / "LESSONS.md")
     return Project(root, tmp_path)

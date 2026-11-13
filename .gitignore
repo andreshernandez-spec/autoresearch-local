@@ -1,3 +1,6 @@
 __pycache__/
 .pytest_cache/
 *.pyc
+# left by arl while it writes the lessons file
+skill/.*.lock
+skill/.*.arltmp

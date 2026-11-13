@@ -70,6 +70,15 @@ def test_min_goal(tmp_path):
         (TOML.replace("limit = 10.0\nmax_regression = 2.0", ""), "needs 'limit' or 'max_regression'"),
         (TOML.replace('command = "eval"', ""), "needs 'command'"),
         (TOML + '[review]\nagent_may = ["continue", "give up"]\n', "unknown decisions"),
+        (TOML + "[introspection]\nevery = 0\n", "every must be at least 1"),
+        (TOML + "[introspection]\nevery = 3\n[review]\nevery = 4\n", "old name of"),
+        (TOML.replace('command = "run"', 'command = "run"\ntimeout_s = "soon"'), "timeout_s must be a number"),
+        (TOML.replace('command = "run"', 'command = "run"\nmax_attempts = 2.5'), "max_attempts must be a whole number"),
+        (TOML.replace('command = "run"', 'command = "run"\nkeep = "*.json"'), "keep must be a list"),
+        (TOML.replace('command = "run"', "command = 3"), "command must be text"),
+        (TOML.replace("min_delta = 0.01", "min_delta = -1"), "min_delta must be at least 0"),
+        (TOML + "[machine]\nmax_loadavg = true\n", "max_loadavg must be a number"),
+        ("run = 1\n" + TOML.replace("[run]", "[other]"), "must be a table"),
     ],
 )
 def test_bad_config(tmp_path, broken, message):
@@ -79,10 +88,23 @@ def test_bad_config(tmp_path, broken, message):
         config.load(path)
 
 
+def test_old_and_new_name_of_the_introspection_table(tmp_path):
+    path = tmp_path / "arl.toml"
+    for name in ("introspection", "review"):
+        path.write_text(TOML + f'[{name}]\nevery = 3\nstagnation = 2\nmax_days = 1.5\nagent_may = ["continue"]\n')
+        cfg = config.load(path)
+        assert (cfg.intro_every, cfg.intro_stagnation, cfg.intro_max_days, cfg.agent_may) == (3, 2, 1.5, ["continue"])
+    path.write_text(TOML)
+    cfg = config.load(path)
+    assert (cfg.intro_every, cfg.checkpoint_every, cfg.pause_grace) == (8, 600.0, 60.0)
+
+
 def test_metrics_must_be_finite(cfg, tmp_path):
     path = tmp_path / "metrics.json"
     path.write_text('{"score": 0.5, "seconds": 1, "note": "text", "extra": 3}')
     assert runner.read_metrics(path, cfg) == {"score": 0.5, "seconds": 1.0, "extra": 3.0}
+    path.write_text('{"score": 0.5, "seconds": 1, "extra": NaN, "more": Infinity}')
+    assert runner.read_metrics(path, cfg) == {"score": 0.5, "seconds": 1.0}  # what is only reported may be missing
     path.write_text('{"score": NaN, "seconds": 1}')
     with pytest.raises(ArlError, match="score = nan"):
         runner.read_metrics(path, cfg)

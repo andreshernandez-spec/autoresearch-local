@@ -4,8 +4,9 @@ A small harness for automated research on one machine. An agent proposes
 hypotheses, designs experiments, runs them and judges the results, in a loop,
 for hours or days. The harness (`arl`) owns the mechanics that an agent should
 not be trusted to remember: the evaluation it may not touch, the record of what
-was run under which conditions, the git branches, and the moments at which it
-has to stop and reconsider.
+was run under which conditions, the git branches, the moments at which it has
+to stop and reconsider, and the state needed to stop the work and take it up
+again later.
 
 It follows [karpathy/autoresearch](https://github.com/karpathy/autoresearch)
 (one program file, keep or discard on a branch, a fixed evaluation) and takes
@@ -22,22 +23,86 @@ The framework lives here. Each project keeps its own `research/` directory.
 
 | Idea | What arl does about it |
 |---|---|
-| **The evaluation is frozen** | `PROGRAM.md`, `arl.toml` and the evaluator files form the contract. `arl freeze` hashes them into `frozen.lock`; every run checks the hashes before and after. The evaluator runs from the home checkout, never from a track's worktree, on what the experiment wrote. Once an experiment exists, a new freeze needs a person at a terminal. Scores are compared only within one evaluator version. |
+| **The evaluation is frozen** | `PROGRAM.md`, `arl.toml` and the evaluator files form the contract. `arl freeze` hashes them into `frozen.lock`; every run checks the hashes before and after. The evaluator runs from the home checkout, never from a track's worktree, on what the experiment wrote. Once an experiment exists, a new freeze needs a person at a terminal. Scores are compared only within one evaluator version and on the same data files. |
 | **Hypothesis, design and evaluation are separate** | Three records written at three times. A hypothesis is a claim with an observable consequence, no plan. A design names the change and the prediction; its hash is taken when the run starts, so it cannot be adjusted to the result. The number comes from the frozen evaluator, the outcome (improve, neutral, worse, constraint not met) is computed, and the verdict has to be one that outcome allows. |
 | **Experiments come in kinds** | `baseline` measures a track as it is. `tune` changes params only. `feature` changes code. `diagnose` observes: not scored, never merged. Each kind is held to what it may change: a baseline with other params than its track's is refused, and so is a tune with a code change. |
 | **Parallel code tracks** | A track is one approach: a branch (`track/<name>`) with its own worktree. A code experiment gets a branch off the track head. Keep is a fast-forward of the track, discard leaves the branch where it is. arl never resets, rebases or pushes, and never deletes a branch. |
-| **Everything can be recalled** | Each experiment has a `record.json`: commit, params, command, contract version, package list, data hashes, timings, artifact hashes, metrics, comparison, verdict. A run whose code or contract changed while it was going is failed, not recorded. The ledger is committed at every step. `arl exp show` reads it back, `arl exp reproduce` runs it again from the recorded commit, `arl verify` checks ledger, contract and git against each other. |
-| **Periodic reconsideration** | After a set number of experiments, a run of failures on one track, or a number of days, no new experiment can be drafted until a review is written: where things stand, whether each track's premises still hold, the case against the current path, the alternatives, a decision. Decisions the agent may not take alone wait for a person, and nothing runs while they wait. Tracks are opened, parked and reopened only by the latest closed review or by a person. After a decision to stop, only a person reopens the program. |
-| **A document of ideas** | `research/IDEAS.md`. Whatever comes up that is outside the current experiment is written there instead of chased. Every review goes through the open ones. |
+| **Everything can be recalled** | Each experiment has a `record.json`: commit, params, command, contract version, package list, data hashes, timings, the parts the run was made of, artifact hashes, metrics, comparison, verdict. A run whose code or contract changed while it was going is failed, not recorded. The ledger is committed at every step. `arl exp show` reads it back, `arl exp reproduce` runs it again from the recorded commit, `arl verify` checks ledger, contract and git against each other. |
+| **The introspection step** | After a set number of experiments, a run of failures on one track, or a number of days, no new experiment can be drafted until an introspection is written and closed. It has four parts, below. Decisions the agent may not take alone wait for a person, and nothing runs while they wait. Tracks are opened, parked and reopened only by the latest closed introspection or by a person. After a decision to stop, only a person reopens the program. |
+| **A document of ideas** | `research/IDEAS.md`. Whatever comes up that is outside the current experiment is written there instead of chased. Every introspection goes through the open ones. |
+| **Stop and continue** | The work can be interrupted and taken up later. A run is made of parts: paused, cut off by a closed terminal or a restart, it continues in the same folder from the state its job last saved, and no attempt is lost. The loop as a whole is paused with a note for whoever continues. Below. |
+
+## The introspection step
+
+`arl introspect new` writes a file with the facts filled in: the experiments
+judged since the last one, the state of every track, the budget, the open
+hypotheses and ideas, the tripwires the last introspection set, and what the
+activity log holds (commands arl refused, runs that failed or were cut short,
+notes written in passing). The agent writes the rest, in four parts:
+
+| Part | Question | What it leaves behind |
+|---|---|---|
+| 1. The path | Is the current approach still worth it, does it need a bigger change, or is a different approach due? | A decision: continue, adjust, branch, pivot, stop or escalate, with tripwires for the next time |
+| 2. How the work went | Which behaviours or errors of the agents are worth a standing instruction? Not about the problem: about the way of working | Lessons, added with `arl lesson add` to the instructions agents load: `skill/LESSONS.md` here for what holds in any project, `research/LESSONS.md` for what holds in one |
+| 3. What we know | What did the work reveal about the problem itself? | `research/KNOWLEDGE.md`, revised: a distillation of everything found so far, in sections by how sure it is (established, likely, ruled out, open) |
+| 4. Reload | | `arl reload` prints the knowledge and the lessons as they now are. Until an agent has run it, nothing new starts |
+
+`arl introspect close` refuses while a part is missing: no lesson recorded and
+no reason given why there is none, or a knowledge file that is byte for byte
+what it was when the introspection was opened. The raw material for parts 2 and
+3 is collected as the work goes: every refused command is logged with its
+message, and `arl note --about work|problem "..."` takes one line at the moment
+something is noticed.
+
+`arl reload` is also how a session starts: it is the one command that brings
+an agent up to date with what earlier sessions learned. And when one of the
+three files changes in between, whoever changed it (the person correcting the
+knowledge file, a loop in another project adding a general lesson), `arl next`
+asks for a reload before anything else.
+
+## Stop and continue
+
+Two levels, and both survive a closed terminal or a restart of the machine.
+
+**A run.** `arl exp pause` asks the running job to save its state and stop;
+`arl exp run <id>` continues it later. The same happens without being asked
+when the terminal that runs arl closes, when arl is interrupted or killed, when
+the machine restarts, or when free memory falls below the floor in `arl.toml`:
+the part ends, the run is marked paused, and the next `arl exp run` goes on in
+the same output folder. Only a real failure (a non-zero exit, the time limit
+over all parts, the run's own memory limit) uses up an attempt. If arl was
+killed outright, the next run first stops the job it left behind.
+
+A job is told what it needs through its environment: `ARL_CHECKPOINT_EVERY`
+(seconds between two saves, from `[run] checkpoint_every_s`: often enough that
+a pause costs little, seldom enough that saving costs nothing), `ARL_RESUME`
+(1 when an earlier part exists) and SIGTERM as the request to stop, with
+`[run] pause_grace_s` to finish saving. State goes into `{out}/checkpoint/`.
+[helpers/arl_job.py](helpers/arl_job.py) is a file to copy next to a run
+script that does this in five lines. A job that saves nothing still runs; arl
+points out a part that ran long without a save, and a pause then costs that
+job its work.
+
+**The loop.** `arl pause --reason "..." --note "where I was, what comes next"`
+stops everything: a run that is going is asked to pause, and nothing starts,
+runs or is judged until `arl resume`. The agent runs it when told to stop, or
+the person runs it from a terminal while the agent works, which then finds a
+STOP at its next command. A pause set at a terminal is lifted at a terminal.
+The note is printed again at the resume, with the knowledge and the lessons, so
+a new session (or a new agent) starts from what the last one wrote and not from
+its memory. If a session ends with no pause at all, the ledger has every step
+that was committed and `arl next` finds the place.
 
 ## A project, start to finish
 
 ```sh
 cd ~/private/open-source/myproject          # a git repository
 arl init                                    # creates research/ with templates
-# write research/PROGRAM.md and research/arl.toml, put the evaluator in research/eval/
+# write research/PROGRAM.md and research/arl.toml, put the evaluator in research/eval/,
+# say what is already known in research/KNOWLEDGE.md
 arl freeze --reason "initial"
 arl track new first-approach                # branch + worktree; then write research/tracks/first-approach.md
+arl reload                                  # at the start of every session
 arl next                                    # from here on, the loop
 ```
 
@@ -46,14 +111,21 @@ does what it says, and runs it again:
 
 | `next` says | Meaning |
 |---|---|
-| `baseline <track>` | the track has no reference under the current evaluator |
+| `setup`, `freeze` | no `research/` yet, or the contract is written and not frozen |
+| `track` | no active track: open one |
+| `baseline <track>` | the track has no reference under the current evaluator and data |
 | `hypothesize` | nothing in flight: write a hypothesis, then draft an experiment |
 | `design <id>` | a draft exists: write the design, change params or code, run |
+| `outdated <id>` | a draft whose reference no longer counts: drop it, measure the track again |
 | `running <id>` | wait |
+| `interrupted <id>` | the arl that ran it is gone: continue the run |
+| `resume <id>` | the run was paused: continue it, or give it up |
 | `judge <id>` | a result exists: write the analysis, record the verdict |
+| `unfinished <id>` | a verdict was cut off halfway: one command completes it |
 | `crashed <id>` | the run failed: fix and rerun, or judge it as a crash |
-| `review` | the reconsideration is due |
-| `wait`, `contract`, `budget`, `target`, `stopped` | stop: a person is needed |
+| `introspect` | the introspection is due, or one is open |
+| `reload` | an introspection was closed, or the knowledge or lessons files changed since they were last read (a person corrected one, another project added a general lesson): read them again |
+| `paused`, `wait`, `contract`, `budget`, `target`, `stopped` | STOP: a person is needed |
 
 One experiment, as commands:
 
@@ -77,7 +149,7 @@ Two commands in `arl.toml`:
   `{out}`. Placeholders: `{params}` (the experiment's `params.json`), `{out}`,
   `{split}`, `{home}`, `{research}`, `{exp}`, `{worktree}`. The same values are
   in the environment as `ARL_PARAMS`, `ARL_OUT`, `ARL_SPLIT`, `ARL_HOME`,
-  `ARL_RESEARCH`, `ARL_EXP`.
+  `ARL_RESEARCH`, `ARL_EXP`, with `ARL_RESUME` and `ARL_CHECKPOINT_EVERY`.
 - `[eval] command`: runs in the home checkout, reads `{out}`, and writes one
   JSON object to `{metrics}` with a number for every `[[metric]]`.
 
@@ -95,33 +167,40 @@ on. Those results are stored and never used for a verdict.
 `[machine]` holds gates for a shared machine: a run does not start above a
 load average, below a free amount of RAM or GPU memory, or while another run
 holds the lock file (one file can be shared by every project on the machine).
-A run in progress is stopped, with everything it started, when it passes its
-time limit, when its processes hold more RAM than `max_run_rss_gb`, or when
-the machine falls below `stop_below_free_ram_gb`. If arl itself is stopped
-(terminal closed, session ended), it takes the job down with it; if it is
-killed outright, the next arl command that touches the experiment stops what
-was left behind before anything else starts.
+A run in progress is stopped, with every process it started, when it passes
+its time limit or when its processes hold more RAM than `max_run_rss_gb`
+(a failure), and paused when the machine falls below `stop_below_free_ram_gb`
+(not a failure: it continues when there is room again).
 
-The budget counts experiments that ran and the hours of every run, reruns
-included. Without `max_run_hours` nothing bounds reruns.
+The budget counts experiments that ran and the hours of every run: failed
+ones, interrupted parts and reruns included. Without `max_run_hours` nothing
+bounds reruns.
+
+Every value in `arl.toml` is checked when the file is read: a wrong type or an
+impossible number is named before the contract is frozen.
 
 ## Layout of `research/`
 
 ```
 arl.toml  PROGRAM.md  eval/      the contract (frozen)
 frozen.lock                      its hashes, versions and history
+KNOWLEDGE.md                     what the work has shown about the problem, distilled
+LESSONS.md                       how to work in this project
 IDEAS.md                         ideas outside the current path
 STATUS.md                        written by arl: tracks, experiments, what is next
+activity.jsonl                   refused commands and notes, read at introspections
+PAUSED                           there while the loop is paused, with the note
 hypotheses/H003-<slug>.md
 tracks/<name>.md                 approach, premises, "stop if"; <name>.params.json
 experiments/E0007-<slug>/
     design.md  params.json       written before the run, locked when it starts
-    record.json                  written by arl: conditions, result, verdict
+    record.json                  written by arl: conditions, parts, result, verdict
     metrics.json                 the evaluator's output
     analysis.md                  written after
     kept/  run.tail.txt          small result files and the end of the log
     artifacts/  logs/            not in git (hashes are in the record)
-reviews/R002.md
+    artifacts/run-1/checkpoint/  the state a job saves to be continued
+introspections/N002.md
 envs/<hash>.txt                  package listings, one per distinct content
 ```
 
@@ -130,19 +209,27 @@ carry a stale copy of `research/` that nothing reads: arl always writes the
 home checkout, also when called from inside a worktree, and refuses experiment
 code that touches `research/`.
 
+Lessons that hold for any project live in this repository, in
+[skill/LESSONS.md](skill/LESSONS.md), next to the skill that agents load. A
+person prunes that file from time to time and moves what has proved itself
+into [PROTOCOL.md](PROTOCOL.md).
+
 ## Commands
 
 ```
 arl init | freeze | status | next | verify
-arl track  new | set | sync | worktree | list
-arl hyp    new | set | list
-arl idea   add | set | list
-arl exp    new | commit | run | judge | abandon | show | list | log | reproduce
-arl review due | new | close | resolve
+arl reload | pause | resume | note
+arl track      new | set | sync | worktree | list
+arl hyp        new | set | list
+arl idea       add | set | list
+arl lesson     add | list
+arl exp        new | commit | run | pause | fail | judge | abandon | show | list | log | reproduce
+arl introspect due | new | close | resolve
 ```
 
 `arl <command> --help` for each. Exit codes of `exp run`: 0 a result, 2 the run
-or the evaluator failed, 75 the machine is busy, 1 a gate refused.
+or the evaluator failed, 3 the run was paused and can be continued, 75 the
+machine is busy, 1 a gate refused.
 
 ## What it does not do
 
@@ -151,6 +238,11 @@ or the evaluator failed, 75 the machine is busy, 1 a gate refused.
 - No judgment about noise. `min_delta` is the project's statement of what
   counts, and a repeat with `--allow-duplicate` or a second split is how to
   check it.
+- No checkpoints of its own. arl tells a job when to save and when to stop;
+  what the state is and how to continue from it is the job's business.
+- No driver. arl does not start the agent or wake it up. A session runs the
+  loop until `next` says STOP, and the next session picks it up from the
+  ledger.
 - No guard against a determined cheat. The hashes and gates stop drift and
   rationalization, not someone who edits `frozen.lock` by hand. Git shows that.
 - No way to stop a `diagnose` command from calling the evaluator itself. That
@@ -167,6 +259,11 @@ skill in `skill/SKILL.md` is the short version.
 python -m pytest
 ```
 
-A toy project in a temporary git repository is driven through the real CLI:
-every stage and every gate has a test (`tests/test_flow.py`), and so has every
-way of breaking one that was found by trying (`tests/test_hardening.py`).
+A toy project in a temporary git repository is driven through the real CLI.
+Every stage and every gate has a test (`tests/test_flow.py`,
+`tests/test_introspection.py`, `tests/test_pause.py`, the last with real jobs
+that are paused, hung up on and killed). Every way of breaking a guarantee
+that was found by trying has one too (`tests/test_hardening.py`). And
+`tests/test_walk.py` walks the loop at random the way an agent would, with
+typed mistakes, cut-off runs, pauses and hand edits in between, and checks
+after every step that nothing is stuck or inconsistent.

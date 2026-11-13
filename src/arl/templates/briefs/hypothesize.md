@@ -1,7 +1,7 @@
 Nothing is in flight. Choose what to test next.
 
-1. Read research/STATUS.md and the analysis of the last few experiments. Look at the open
-   hypotheses and at IDEAS.md before inventing something new.
+1. Read research/STATUS.md, research/KNOWLEDGE.md and the analysis of the last few
+   experiments. Look at the open hypotheses and at IDEAS.md before inventing something new.
 2. Write the hypothesis first: a claim about the problem with an observable consequence,
    not a plan.   {arl} hyp new --title "..."
 3. Then pick the kind of experiment that tests it:

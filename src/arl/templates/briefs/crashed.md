@@ -7,4 +7,5 @@ Read the end of the log:  {arl} exp log {target}
   reference any more:
     {arl} exp judge {target} --verdict crash --reason "<what broke>"
 design.md and params.json are locked from the first run on. A wrong design is judged as a
-crash and replaced by a new experiment.
+crash and replaced by a new experiment. If the failure says something about the way of
+working, note it now:  {arl} note --about work "..."

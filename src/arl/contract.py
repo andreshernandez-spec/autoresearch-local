@@ -18,7 +18,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .ledger import CONTRACT_FILES, Ledger
+from .ledger import CONTRACT_FILES, LOCK, Ledger
 from .util import ArlError, canonical, now, read_json, require_filled, sha256_file, sha256_text, write_json
 
 _SKIP_DIRS = {"__pycache__", ".pytest_cache", ".ipynb_checkpoints"}
@@ -113,16 +113,22 @@ def require(ledger: Ledger) -> dict[str, Any]:
     return lock
 
 
-def freeze(ledger: Ledger, reason: str, interactive: bool) -> dict[str, Any]:
-    """Hash the contract and write frozen.lock. The caller commits."""
+def freeze(ledger: Ledger, reason: str, interactive: bool, shown: list[str] | None = None) -> dict[str, Any]:
+    """Hash the contract and write frozen.lock. The caller commits, and calls unfreeze if that fails.
+
+    shown: the changes a person was asked about. If the files have changed again
+    since, nothing is frozen: a yes covers what was listed and no more.
+    """
     ledger.check_home()
     require_filled(ledger.program_path, "PROGRAM.md")
     old = load(ledger)
-    if old is not None and ledger.experiments() and not interactive:
+    if ledger.experiments() and not interactive:
         raise ArlError(
             "Experiments already depend on this contract, so a new freeze needs a person:\n"
             "run 'arl freeze --reason \"...\"' yourself in a terminal."
         )
+    if shown is not None and problems(ledger) != shown:
+        raise ArlError("the files changed while the question was open. Nothing was frozen: run 'arl freeze' again and read the new list.")
     state = current(ledger)
     if old is not None and old["digest"] == state["digest"]:
         raise ArlError(f"nothing changed since contract v{old['version']}")
@@ -141,7 +147,23 @@ def freeze(ledger: Ledger, reason: str, interactive: bool) -> dict[str, Any]:
     return lock
 
 
+def unfreeze(ledger: Ledger, old: dict[str, Any] | None) -> None:
+    """Put the lock back as it was: a freeze that could not be committed did not happen."""
+    if old is None:
+        ledger.lock_path.unlink(missing_ok=True)
+    else:
+        write_json(ledger.lock_path, old)
+
+
 def commit_paths(ledger: Ledger) -> list[str]:
     """What a freeze commits: all of research/ and any evaluator file kept outside it."""
     outside = [p.rstrip("/") for p in ledger.cfg.frozen if not p.startswith(f"{ledger.name}/")]
     return [ledger.name, *outside]
+
+
+def uncommitted(ledger: Ledger) -> list[str]:
+    """Contract files that differ from what git holds, although they match the lock."""
+    lock = load(ledger) or {"files": {}}
+    known = set(lock["files"]) | {f"{ledger.name}/{LOCK}"}  # what an editor left beside them is not the contract
+    paths = [f"{ledger.name}/{f}" for f in (*CONTRACT_FILES, LOCK)] + [p.rstrip("/") for p in ledger.cfg.frozen]
+    return [path for path in ledger.git.dirty(*paths) if path in known]

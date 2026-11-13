@@ -80,6 +80,10 @@ class Git:
     def head(self, ref: str = "HEAD") -> str:
         return self("rev-parse", "--verify", f"{ref}^{{commit}}").strip()
 
+    def tree(self, ref: str = "HEAD") -> str:
+        """The id of the files at a commit: two commits of the same change share it."""
+        return self("rev-parse", "--verify", f"{ref}^{{tree}}").strip()
+
     def branch(self) -> str:
         """Current branch, empty when the checkout is detached."""
         return self("branch", "--show-current").strip()

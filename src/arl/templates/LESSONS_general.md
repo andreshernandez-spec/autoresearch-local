@@ -1,0 +1,9 @@
+# Lessons: working with arl
+
+What research loops learned about the way an agent works, in any project:
+actions that were wrong, steps that wasted effort, habits that helped. Not
+about any one problem. `arl lesson add --scope general` appends an entry,
+usually at an introspection. `arl reload` prints this file, and every agent
+reads it before it works. A lesson never overrides `PROTOCOL.md` or a project's
+`PROGRAM.md`. A person prunes this file and moves what has proved itself into
+the protocol.

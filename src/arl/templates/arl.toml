@@ -18,6 +18,12 @@ commit_prefix = "research"
 command = "python run.py --params {params} --out {out} --split {split}"
 timeout_s = 1800
 max_attempts = 3
+# A run can be paused and continued. The job is told how often to save its state
+# (ARL_CHECKPOINT_EVERY, in seconds, into {out}/checkpoint/) and whether it
+# continues an earlier part (ARL_RESUME=1). Asked to stop (SIGTERM), it has
+# pause_grace_s to save and end before it is forced.
+checkpoint_every_s = 600
+pause_grace_s = 60
 # Small files copied from {out} into the ledger and committed.
 keep = ["*.json", "*.txt", "*.csv", "*.md"]
 keep_max_kb = 256
@@ -56,11 +62,11 @@ min_delta = 0.0         # smallest change that counts as better or worse
 max_experiments = 100
 max_run_hours = 50
 
-[review]
-every = 8               # judged experiments between reviews
+[introspection]
+every = 8               # judged experiments between introspections
 stagnation = 5          # scored experiments in a row without a keep, on one track
 max_days = 7
-# Decisions the agent may take alone. Any other waits for a person.
+# Decisions about the path the agent may take alone. Any other waits for a person.
 agent_may = ["continue", "adjust", "branch", "pivot"]
 
 [machine]

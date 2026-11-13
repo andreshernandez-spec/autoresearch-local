@@ -3,16 +3,21 @@
     research/
         arl.toml, PROGRAM.md, eval/...   the contract (frozen, see contract.py)
         frozen.lock                      hashes of the contract
+        KNOWLEDGE.md                     what the work has shown about the problem, distilled
+        LESSONS.md                       what was learned about how to work in this project
         IDEAS.md                         ideas outside the current path
         STATUS.md                        generated summary
+        activity.jsonl                   refused commands and notes, read at introspections
+        PAUSED                           there while the loop is paused, with the handoff note
         hypotheses/H003-slug.md
         tracks/<name>.md, <name>.params.json
         experiments/E0007-slug/          record.json, design.md, params.json, analysis.md, ...
-        reviews/R002.md
+        introspections/N002.md
         envs/<hash>.txt                  environment listings, stored once each
 
 The ledger lives in the project's home checkout. Code lives on track branches,
-each with its own worktree.
+each with its own worktree. Lessons that hold for any project live with the
+skill, in this repository (skill/LESSONS.md).
 """
 
 from __future__ import annotations
@@ -37,7 +42,10 @@ from .util import (
     one_line,
     read_front,
     read_json,
+    read_text,
+    sha256_file,
     sha256_text,
+    text_block,
     write_front,
     write_json,
     write_text,
@@ -47,11 +55,16 @@ CONTRACT_FILES = ("arl.toml", "PROGRAM.md")
 LOCK = "frozen.lock"
 IDEA_STATES = ("open", "promoted", "parked", "rejected")
 HYP_STATES = ("open", "supported", "refuted", "inconclusive", "dropped")
+SCOPES = ("general", "project")
+TEMPLATES = Path(__file__).parent / "templates"
+GENERAL_LESSONS = Path(__file__).resolve().parents[2] / "skill" / "LESSONS.md"
 _IDEA_HEAD = re.compile(r"^## (I\d{3}): (.*)$", re.M)
+_IDEA_LIKE = re.compile(r"^## I\S*.*$", re.M)
+_LESSON_HEAD = {"general": re.compile(r"^## (G\d{3}): (.*)$", re.M), "project": re.compile(r"^## (L\d{3}): (.*)$", re.M)}
 _NEEDS = {
     "hypothesis": ("id", "title", "status"),
     "track": ("name", "status", "branch", "head_commit"),
-    "review": ("id", "status"),
+    "introspection": ("id", "status"),
 }
 
 
@@ -61,7 +74,7 @@ def _front(path: Path, kind: str) -> tuple[dict[str, Any], str]:
         meta, body = read_front(path)
         missing = [k for k in _NEEDS[kind] if k not in meta]
         why = f"no {', '.join(missing)}" if missing else ""
-    except (ArlError, tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
+    except (ArlError, tomllib.TOMLDecodeError) as e:
         meta, body, why = {}, "", str(e)
     if why:
         raise ArlError(
@@ -113,6 +126,22 @@ class Ledger:
         return self.dir / "IDEAS.md"
 
     @property
+    def knowledge_path(self) -> Path:
+        return self.dir / "KNOWLEDGE.md"
+
+    @property
+    def lessons_path(self) -> Path:
+        return self.dir / "LESSONS.md"
+
+    @property
+    def activity_path(self) -> Path:
+        return self.dir / "activity.jsonl"
+
+    @property
+    def paused_path(self) -> Path:
+        return self.dir / "PAUSED"
+
+    @property
     def status_path(self) -> Path:
         return self.dir / "STATUS.md"
 
@@ -133,8 +162,8 @@ class Ledger:
         return self.dir / "tracks"
 
     @property
-    def review_root(self) -> Path:
-        return self.dir / "reviews"
+    def intro_root(self) -> Path:
+        return self.dir / "introspections"
 
     @property
     def env_root(self) -> Path:
@@ -185,9 +214,17 @@ class Ledger:
         """Read every record once, so a damaged file stops a command before it changes anything."""
         self.hypotheses()
         self.tracks()
-        self.reviews()
+        self.introspections()
         self.ideas()
         self.experiments()
+        self.lessons("project")
+        self.paused()
+
+    def ensure_files(self) -> None:
+        """The knowledge and lessons files of a project that was set up before they existed."""
+        for path, name in ((self.knowledge_path, "KNOWLEDGE.md"), (self.lessons_path, "LESSONS.md")):
+            if not path.exists():
+                write_text(path, read_text(TEMPLATES / name))
 
     @contextlib.contextmanager
     def locked(self, wait: float = 120.0) -> Generator[None, None, None]:
@@ -205,6 +242,7 @@ class Ledger:
                     if time.monotonic() > deadline:
                         raise ArlError("another arl command is writing this ledger, try again") from e
                     time.sleep(0.2)
+            self.ensure_files()
             self.check_files()
             yield
 
@@ -217,9 +255,9 @@ class Ledger:
         if kind == "H":
             used = [int(p.name[1:4]) for p in self.hyp_root.glob("H[0-9][0-9][0-9]*.md")]
             return f"H{max(used, default=0) + 1:03d}"
-        if kind == "R":
-            used = [int(p.name[1:4]) for p in self.review_root.glob("R[0-9][0-9][0-9]*.md")]
-            return f"R{max(used, default=0) + 1:03d}"
+        if kind == "N":
+            used = [int(p.name[1:4]) for p in self.intro_root.glob("N[0-9][0-9][0-9]*.md")]
+            return f"N{max(used, default=0) + 1:03d}"
         if kind == "I":
             used = [int(i["id"][1:]) for i in self.ideas()]
             return f"I{max(used, default=0) + 1:03d}"
@@ -238,7 +276,7 @@ class Ledger:
     def _read_record(path: Path) -> dict[str, Any]:
         try:
             return read_json(path)
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        except json.JSONDecodeError as e:
             raise ArlError(f"{path} is damaged ({e}). arl writes that file; restore it from git.") from e
 
     def record(self, eid: str) -> dict[str, Any]:
@@ -275,16 +313,25 @@ class Ledger:
             return []
         return [_front(p, "hypothesis")[0] for p in sorted(self.hyp_root.glob("H[0-9][0-9][0-9]*.md"))]
 
-    def set_hypothesis(self, hid: str, status: str, note: str = "") -> None:
+    def set_hypothesis(self, hid: str, status: str, note: str) -> None:
+        """Change a hypothesis's status and say why in its log. Doing it twice changes nothing."""
         if status not in HYP_STATES:
             raise ArlError(f"hypothesis status must be one of {', '.join(HYP_STATES)}")
         path = self.hyp_path(hid)
         meta, body = _front(path, "hypothesis")
-        if meta.get("status") != status or note:
-            meta["status"], meta["updated"] = status, now()
-            if note:
-                body = body.rstrip("\n") + f"\n- {now()[:10]}: {status}. {' '.join(note.split())}\n"
-            write_front(path, meta, body)
+        line = f"{status}. {' '.join(note.split())}"
+        if meta.get("status") == status and line in body:
+            return
+        meta["status"], meta["updated"] = status, now()
+        write_front(path, meta, body.rstrip("\n") + f"\n- {now()[:10]}: {line}\n")
+
+    def log_hypothesis(self, hid: str, text: str) -> None:
+        """A line in a hypothesis's log that leaves its status as it is."""
+        path = self.hyp_path(hid)
+        meta, body = _front(path, "hypothesis")
+        text = " ".join(text.split())
+        if text not in body:
+            write_front(path, meta, body.rstrip("\n") + f"\n- {now()[:10]}: {text}\n")
 
     # --- tracks ------------------------------------------------------------------
 
@@ -340,22 +387,118 @@ class Ledger:
     def worktree_path(self, track: str) -> Path:
         return self.worktree_root() / f"{self.cfg.name}-{track}"
 
-    # --- reviews -----------------------------------------------------------------
+    # --- introspections ----------------------------------------------------------
 
-    def review_path(self, rid: str) -> Path:
-        check_id("R", rid)
-        path = self.review_root / f"{rid}.md"
+    def intro_path(self, nid: str) -> Path:
+        check_id("N", nid)
+        path = self.intro_root / f"{nid}.md"
         if not path.exists():
-            raise ArlError(f"no review {rid}")
+            raise ArlError(f"no introspection {nid}")
         return path
 
-    def review(self, rid: str) -> tuple[dict[str, Any], str]:
-        return _front(self.review_path(rid), "review")
+    def introspection(self, nid: str) -> tuple[dict[str, Any], str]:
+        return _front(self.intro_path(nid), "introspection")
 
-    def reviews(self) -> list[dict[str, Any]]:
-        if not self.review_root.exists():
+    def introspections(self) -> list[dict[str, Any]]:
+        if not self.intro_root.exists():
             return []
-        return [_front(p, "review")[0] for p in sorted(self.review_root.glob("R[0-9][0-9][0-9].md"))]
+        return [_front(p, "introspection")[0] for p in sorted(self.intro_root.glob("N[0-9][0-9][0-9].md"))]
+
+    # --- knowledge ---------------------------------------------------------------
+
+    def knowledge_hash(self) -> str:
+        return sha256_text(read_text(self.knowledge_path)) if self.knowledge_path.exists() else ""
+
+    # --- what was last reloaded ----------------------------------------------------
+
+    def _reload_hashes(self) -> dict[str, str]:
+        files = {"KNOWLEDGE.md": self.knowledge_path, "LESSONS.md": self.lessons_path, "the general lessons": GENERAL_LESSONS}
+        return {name: sha256_file(path) if path.exists() else "" for name, path in files.items()}
+
+    def mark_reloaded(self) -> None:
+        """Remember what 'arl reload' just printed. Kept on this machine, not in git."""
+        self.cache_root.mkdir(parents=True, exist_ok=True)
+        write_json(self.cache_root / "reloaded.json", self._reload_hashes())
+
+    def changed_since_reload(self) -> list[str]:
+        """The knowledge and lessons files that are no longer what the last reload printed:
+        a person corrected one, or another project added a general lesson."""
+        path = self.cache_root / "reloaded.json"
+        try:
+            seen = read_json(path) if path.exists() else {}
+        except (ArlError, json.JSONDecodeError):
+            seen = {}
+        if not isinstance(seen, dict) or not seen:
+            return []  # never reloaded here: the start of a session asks for it, not this check
+        return [name for name, digest in self._reload_hashes().items() if seen.get(name) != digest]
+
+    # --- lessons -----------------------------------------------------------------
+
+    def lessons_file(self, scope: str) -> Path:
+        if scope not in SCOPES:
+            raise ArlError(f"a lesson is 'general' (any project that uses arl) or 'project' (this one), not '{scope}'")
+        return GENERAL_LESSONS if scope == "general" else self.lessons_path
+
+    def lessons(self, scope: str) -> list[dict[str, str]]:
+        path = self.lessons_file(scope)
+        if not path.exists():
+            return []
+        return [{"id": m.group(1), "title": m.group(2).strip()} for m in _LESSON_HEAD[scope].finditer(read_text(path))]
+
+    def add_lesson(self, scope: str, title: str, body: str, source: str) -> str:
+        """Append a lesson to the instructions agents load. Lessons are only added, never edited here."""
+        path = self.lessons_file(scope)
+        title, body = one_line(title, "the title"), text_block(body, "the body")
+        source = one_line(source, "the source") if source else "not given"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path.with_name(f".{path.name}.lock"), "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # the general file is shared by every project on the machine
+            text = read_text(path) if path.exists() else read_text(TEMPLATES / ("LESSONS_general.md" if scope == "general" else "LESSONS.md"))
+            used = [int(m.group(1)[1:]) for m in _LESSON_HEAD[scope].finditer(text)]
+            lid = f"{'G' if scope == 'general' else 'L'}{max(used, default=0) + 1:03d}"
+            entry = f"## {lid}: {title}\nAdded: {now()[:10]}. From: {source}.\n\n{body}\n"
+            write_text(path, text.rstrip("\n") + "\n\n" + entry)
+        return lid
+
+    # --- activity: refused commands and notes -------------------------------------
+
+    def log_activity(self, kind: str, text: str, command: str = "", about: str = "") -> None:
+        """One line in activity.jsonl. Never raises: the log must not break a command."""
+        try:
+            event = {"at": now(), "kind": kind, "text": text[:1200]}
+            if command:
+                event["command"] = command[:300]
+            if about:
+                event["about"] = about
+            with open(self.activity_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except (OSError, ValueError):
+            pass
+
+    def activity(self) -> list[dict[str, Any]]:
+        if not self.activity_path.exists():
+            return []
+        events = []
+        for line in self.activity_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+        return events
+
+    # --- pausing the loop --------------------------------------------------------
+
+    def paused(self) -> dict[str, Any] | None:
+        """Who paused the loop, when, why, and what they left for whoever continues."""
+        if not self.paused_path.exists():
+            return None
+        try:
+            state = read_json(self.paused_path)
+        except json.JSONDecodeError as e:
+            raise ArlError(f"{self.paused_path} is damaged ({e}). Remove it only if the person who paused says so.") from e
+        return state if isinstance(state, dict) else {}
 
     # --- ideas -------------------------------------------------------------------
 
@@ -363,7 +506,7 @@ class Ledger:
         """(text before the first idea, [(id, title, section text)])."""
         if not self.ideas_path.exists():
             return "# Ideas\n\n", []
-        text = self.ideas_path.read_text()
+        text = read_text(self.ideas_path)
         heads = list(_IDEA_HEAD.finditer(text))
         if not heads:
             return text, []
@@ -374,18 +517,33 @@ class Ledger:
         return text[: heads[0].start()], sections
 
     def ideas(self) -> list[dict[str, str]]:
+        """Every idea. One whose Status line arl cannot read counts as open, so it is not lost."""
         out = []
         for iid, title, section in self._idea_sections()[1]:
-            status = re.search(r"^Status:\s*(\w+)", section, re.M)
-            out.append({"id": iid, "title": title, "status": status.group(1) if status else "open"})
+            found = re.search(r"^Status:\s*(\w+)", section, re.M)
+            status = found.group(1).lower() if found else ""
+            out.append({"id": iid, "title": title, "status": status if status in IDEA_STATES else "open"})
         return out
 
+    def idea_problems(self) -> list[str]:
+        """What a hand edit of IDEAS.md left that arl cannot read as meant."""
+        if not self.ideas_path.exists():
+            return []
+        text, problems = read_text(self.ideas_path), []
+        for m in _IDEA_LIKE.finditer(text):
+            if not _IDEA_HEAD.fullmatch(m.group(0)):
+                problems.append(f"IDEAS.md: '{m.group(0)[:60]}' is not read as an idea (a heading is '## I012: title')")
+        ids = [s[0] for s in self._idea_sections()[1]]
+        for iid in sorted({i for i in ids if ids.count(i) > 1}):
+            problems.append(f"IDEAS.md has two entries called {iid}")
+        for iid, _, section in self._idea_sections()[1]:
+            found = re.search(r"^Status:\s*(\w+)", section, re.M)
+            if not found or found.group(1).lower() not in IDEA_STATES:
+                problems.append(f"IDEAS.md: {iid} has no Status line arl can read (one of {', '.join(IDEA_STATES)}); it counts as open")
+        return problems
+
     def add_idea(self, title: str, source: str, kind: str, body: str) -> str:
-        title = one_line(title, "the title")
-        # A heading inside the text would read as another idea: keep it as text.
-        body = re.sub(r"^(\s*)(#+ )", r"\1\\\2", body.strip(), flags=re.M)
-        if not body:
-            raise ArlError("the body is empty: say what the idea is, why it could matter, and the cheapest test")
+        title, body = one_line(title, "the title"), text_block(body, "the body")
         source = one_line(source, "the source") if source else "not given"
         iid = self.next_id("I")
         head, sections = self._idea_sections()
@@ -406,8 +564,11 @@ class Ledger:
         if status not in IDEA_STATES:
             raise ArlError(f"idea status must be one of {', '.join(IDEA_STATES)}")
         head, sections = self._idea_sections()
-        if iid not in [s[0] for s in sections]:
+        ids = [s[0] for s in sections]
+        if iid not in ids:
             raise ArlError(f"no idea {iid} in {self.ideas_path}")
+        if ids.count(iid) > 1:
+            raise ArlError(f"{self.ideas_path} has two entries called {iid}. Give one of them another number first.")
         note = " ".join(note.split())
         out = []
         for sid, _, section in sections:

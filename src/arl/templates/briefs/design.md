@@ -6,4 +6,5 @@
 3. Run it:  {arl} exp run {target}
    Runs can be long: start it in the background and wait for it to end. Output goes to log
    files. Read the end with `{arl} exp log {target}`, never the whole log.
+   A run can be paused (`{arl} exp pause {target}`) and continued later with the same command.
 To drop the draft instead:  {arl} exp abandon {target} --reason "..."

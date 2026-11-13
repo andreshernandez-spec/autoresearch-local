@@ -8,7 +8,7 @@ One line of work, on branch `{branch}`, checked out at `{worktree}`.
 
 ## Premises
 
-> FILL: what has to be true for this track to be worth the time (every review checks these)
+> FILL: what has to be true for this track to be worth the time (every introspection checks these)
 
 ## Stop if
 

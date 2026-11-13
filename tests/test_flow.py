@@ -41,7 +41,7 @@ def test_setup_to_first_reference(project: Project):
     assert rec["status"] == "evaluated" and rec["metrics"]["score"] == pytest.approx(0.3)
     assert rec["code_commit"] == git(wt, "rev-parse", "HEAD")
     assert rec["conditions"]["env"]["host"] and rec["contract"]["version"] == 1
-    assert [a["path"] for a in rec["artifacts"]] == ["prediction.json", "weights.bin"]
+    assert [a["path"] for a in rec["artifacts"]] == ["pid.txt", "prediction.json", "weights.bin"]
     assert rec["kept"] == ["per_instance.csv", "prediction.json"]  # the evaluator's small file too
 
     p.judge(eid, "keep")
@@ -236,60 +236,62 @@ def test_tracks_run_side_by_side(project: Project):
     assert p.arl("verify").strip() == "ok"
 
 
-def test_review_gate_and_new_tracks(project: Project):
+def test_introspection_gate_and_new_tracks(project: Project):
     p = project
     h = p.started(every=5, stagnation=2)
-    assert "No review due" in p.arl("review", "due")
+    assert "No introspection due" in p.arl("introspect", "due")
     p.tune(-0.2, "discard", h)
     p.tune(-0.3, "discard", h)
     blocked = new_exp(p, "tune", h, code=1)
-    assert "A review comes first" in blocked and "2 scored experiments in a row without a keep" in blocked
-    assert "NEXT: review" in p.arl("next")
-    assert "comes out of a review" in p.arl("track", "new", "other", code=1)
+    assert "An introspection comes first" in blocked and "2 scored experiments in a row without a keep" in blocked
+    assert "NEXT: introspect" in p.arl("next")
+    assert "comes out of an introspection" in p.arl("track", "new", "other", code=1)
 
     p.arl("idea", "add", "--title", "Change the basis", "--body", "What: another basis. Cheapest test: one tune.")
-    p.arl("review", "new")
-    review = p.research / "reviews" / "R001.md"
-    text = review.read_text()
+    p.arl("introspect", "new")
+    path = p.research / "introspections" / "N001.md"
+    text = path.read_text()
     assert "## Facts" in text and "E0002" in text and "E0003" in text and "I001 Change the basis" in text
-    assert "is not finished yet" in p.arl("review", "new", code=1)
-    assert "is not written yet" in p.arl("review", "close", "R001", "--decision", "branch", code=1)
-    review.write_text(text.replace("> FILL: results by the next review that would change this decision", "If two more tunes fail, park the track."))
-    p.fill(review)
-    assert "NEXT: review R001" in p.arl("next")
-    p.arl("review", "close", "R001", "--decision", "branch")
+    assert "is not finished yet" in p.arl("introspect", "new", code=1)
+    nothing_new = ("--no-lessons", "nothing went wrong", "--knowledge-unchanged", "nothing new")
+    assert "is not written yet" in p.arl("introspect", "close", "N001", "--decision", "branch", *nothing_new, code=1)
+    path.write_text(text.replace("> FILL: results by the next introspection that would change this decision", "If two more tunes fail, park the track."))
+    p.fill(path)
+    assert "NEXT: introspect N001" in p.arl("next")
+    p.arl("introspect", "close", "N001", "--decision", "branch", *nothing_new)
+    assert "NEXT: reload N001" in p.arl("next")
+    assert "has not been read again" in new_exp(p, "tune", h, code=1)
+    p.arl("reload")
 
-    assert "No review due" in p.arl("review", "due")  # the count of failures starts again
-    p.track("other", "--review", "R001")
-    assert p.ledger.track("other")["opened_by"] == "R001"
+    assert "No introspection due" in p.arl("introspect", "due")  # the count of failures starts again
+    p.track("other", "--introspection", "N001")
+    assert p.ledger.track("other")["opened_by"] == "N001"
     p.tune(-0.4, "discard", h)
-    p.arl("review", "new", "--trigger", "asked")
-    assert "If two more tunes fail, park the track." in (p.research / "reviews" / "R002.md").read_text()
+    p.arl("introspect", "new", "--trigger", "asked")
+    assert "If two more tunes fail, park the track." in (p.research / "introspections" / "N002.md").read_text()
 
 
 def test_some_decisions_wait_for_a_person(project: Project, monkeypatch):
     p = project
     h = p.started()
-    p.arl("review", "new", "--trigger", "asked")
-    p.fill(p.research / "reviews" / "R001.md")
-    assert "may not decide alone" in p.arl("review", "close", "R001", "--decision", "stop")
-    assert "NEXT: wait R001" in p.arl("next")
+    p.introspect("stop")  # not a decision the agent may take alone
+    assert "NEXT: wait N001" in p.arl("next")
     assert "waits for a person" in new_exp(p, "tune", h, code=1)
-    assert "in a terminal" in p.arl("review", "resolve", "R001", "--decision", "continue", "--note", "go on", code=1)
+    assert "in a terminal" in p.arl("introspect", "resolve", "N001", "--decision", "continue", "--note", "go on", code=1)
 
     monkeypatch.setattr(cli, "interactive", lambda: True)
-    p.arl("review", "resolve", "R001", "--decision", "stop", "--note", "enough")
-    assert "NEXT: stopped R001" in p.arl("next")
+    p.arl("introspect", "resolve", "N001", "--decision", "stop", "--note", "enough")
+    assert "NEXT: stopped N001" in p.arl("next")
     assert "decided to stop" in new_exp(p, "tune", h, code=1)
-    # after a stop the agent can write a review, but reopening is the person's decision
+    # after a stop the agent can write an introspection, but reopening is the person's decision
     monkeypatch.setattr(cli, "interactive", lambda: False)
-    p.arl("review", "new", "--trigger", "reopened")
-    p.fill(p.research / "reviews" / "R002.md")
-    assert "Reopening the program is a person's decision" in p.arl("review", "close", "R002", "--decision", "continue")
-    assert "NEXT: wait R002" in p.arl("next")
-    assert "waits for a person" in new_exp(p, "tune", h, code=1)
+    p.introspect("continue")
+    assert p.ledger.introspection("N002")[0]["status"] == "waiting"
+    assert "NEXT: wait N002" in p.arl("next")
     monkeypatch.setattr(cli, "interactive", lambda: True)
-    p.arl("review", "resolve", "R002", "--decision", "continue", "--note", "go on")
+    p.arl("introspect", "resolve", "N002", "--decision", "continue", "--note", "go on")
+    assert "NEXT: reload N002" in p.arl("next")
+    p.arl("reload")
     assert "NEXT: hypothesize" in p.arl("next")
 
 
@@ -403,17 +405,17 @@ def test_track_changed_by_hand_needs_a_new_baseline(project: Project):
     assert "NEXT: baseline main-line" in p.arl("next")
 
 
-def test_interrupted_run_is_picked_up(project: Project):
+def test_run_marked_as_started_that_never_started(project: Project):
     p = project
     h = p.started()
     eid = p.draft("tune", hyps=(h,), params={"x": 0.5})
-    rec = p.record(eid)
+    rec = p.record(eid)  # arl died between marking it and starting the job
     rec.update(status="running", pid=2**22 - 7, attempts=[{"n": 1, "started": "2026-01-01T00:00:00+00:00"}])
     p.ledger.save_record(rec)
     assert "NEXT: interrupted E0002" in p.arl("next")
     p.arl("exp", "run", eid)
     rec = p.record(eid)
-    assert rec["status"] == "evaluated" and rec["attempts"][0]["failed"].startswith("interrupted")
+    assert rec["status"] == "evaluated" and len(rec["attempts"]) == 1 and "failed" not in rec["attempts"][0]
 
 
 def test_wrong_identity_or_branch_is_refused(project: Project):

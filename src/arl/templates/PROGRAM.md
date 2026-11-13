@@ -23,6 +23,6 @@ The agent reads it at the start of every session and never edits it.
 
 > FILL: the situations in which the agent stops and waits for a person
 
-## At every review
+## At every introspection
 
-> FILL: what to look at outside the ledger before deciding (a leaderboard, new papers, a changed rule)
+> FILL: what to look at outside the ledger before deciding on the path (a leaderboard, new papers, a changed rule)

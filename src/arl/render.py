@@ -1,14 +1,16 @@
-"""Text the harness writes: STATUS.md, the facts in a review or an analysis, the briefs."""
+"""Text the harness writes: STATUS.md, the facts in an introspection or an analysis,
+what a reload prints, and the briefs."""
 
 from __future__ import annotations
 
+import collections
 import re
 from pathlib import Path
 from typing import Any
 
 from . import contract, rules
 from .ledger import Ledger
-from .util import fmt, now
+from .util import fmt, now, read_text
 
 ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = ROOT / "bin" / "arl"
@@ -16,7 +18,7 @@ TEMPLATES = Path(__file__).parent / "templates"
 
 
 def template(name: str) -> str:
-    return (TEMPLATES / name).read_text()
+    return read_text(TEMPLATES / name)
 
 
 def fill(text: str, **values: Any) -> str:
@@ -84,7 +86,7 @@ def track_table(ledger: Ledger, lock: dict[str, Any] | None) -> str:
         ref = rules.reference_for(ledger, t, lock["eval_digest"]) if lock else None
         scored = [e for e in mine if e["status"] == "judged" and e["type"] in ("tune", "feature")]
         run = 0
-        for e in sorted(scored, key=lambda e: e["verdict"]["at"]):
+        for e in sorted(scored, key=lambda e: (e["verdict"]["at"], e["id"])):
             run = 0 if e["verdict"]["decision"] == "keep" else run + 1
         rows.append(
             [
@@ -126,10 +128,10 @@ def status(ledger: Ledger) -> str:
     else:
         out.append("- Contract: not frozen.")
     out.append(f"- Budget: {_budget_line(ledger)}.")
-    rs = rules.review_state(ledger)
-    last = f"{rs['last']} decided '{rs['last_decision']}'" if rs["last"] else "none so far"
-    due = "DUE: " + "; ".join(rs["reasons"]) if rs["due"] else f"{rs['judged_since']} of {cfg.review_every} experiments judged since"
-    out.append(f"- Reviews: {last}. {due}.")
+    state = rules.introspection_state(ledger)
+    last = f"{state['last']} decided '{state['last_decision']}'" if state["last"] else "none so far"
+    due = "DUE: " + "; ".join(state["reasons"]) if state["due"] else f"{state['judged_since']} of {cfg.intro_every} experiments judged since"
+    out.append(f"- Introspections: {last}. {due}.")
     action = rules.next_action(ledger)
     target = f" {action['target']}" if action.get("target") else ""
     out.append(f"- Next: {action['stage']}{target} ({action['why']}).")
@@ -153,6 +155,8 @@ def status(ledger: Ledger) -> str:
     counts = ", ".join(f"{sum(i['status'] == s for i in ideas)} {s}" for s in ("open", "promoted", "parked", "rejected"))
     out += ["## Ideas", "", f"{counts}. Full text in IDEAS.md.", ""]
     out += [f"- {i['id']} {i['title']}" for i in ideas if i["status"] == "open"]
+    lessons = f"{len(ledger.lessons('project'))} for this project (LESSONS.md), {len(ledger.lessons('general'))} general ({ledger.lessons_file('general')})"
+    out += ["", "## Knowledge and lessons", "", f"What the work has shown about the problem: KNOWLEDGE.md. Lessons about the way of working: {lessons}."]
     return "\n".join(out).rstrip("\n") + "\n"
 
 
@@ -162,8 +166,9 @@ def state(ledger: Ledger) -> dict[str, Any]:
     return {
         "home": str(ledger.home),
         "contract": {"version": lock["version"], "problems": contract.problems(ledger)} if lock else None,
+        "paused": ledger.paused(),
         "budget": rules.budget(ledger),
-        "review": rules.review_state(ledger),
+        "introspection": rules.introspection_state(ledger),
         "next": rules.next_action(ledger),
         "tracks": ledger.tracks(),
         "experiments": [
@@ -172,19 +177,28 @@ def state(ledger: Ledger) -> dict[str, Any]:
         ],
         "hypotheses": ledger.hypotheses(),
         "ideas": ledger.ideas(),
+        "lessons": {scope: ledger.lessons(scope) for scope in ("general", "project")},
     }
 
 
 # --- facts written into records ---------------------------------------------------
 
 
-def analysis_facts(ledger: Ledger, rec: dict[str, Any]) -> str:
-    cfg = ledger.cfg
+def _took(rec: dict[str, Any]) -> str:
     attempt = rec["attempts"][-1]
-    where = f"Code {rec['code_commit'][:10]} on `{rec['branch']}`, contract v{rec['contract']['version']}."
     took = f"Run {attempt.get('run_seconds', 0):.0f} s"
+    parts = len(attempt.get("segments", []))
+    if parts > 1:
+        took += f" in {parts} parts (paused and continued)"
     if "eval_seconds" in attempt:
         took += f", evaluation {attempt['eval_seconds']:.0f} s"
+    return took
+
+
+def analysis_facts(ledger: Ledger, rec: dict[str, Any]) -> str:
+    cfg = ledger.cfg
+    where = f"Code {rec['code_commit'][:10]} on `{rec['branch']}`, contract v{rec['contract']['version']}."
+    took = _took(rec)
     if rec["type"] not in rules.SCORED:
         kept = ", ".join(f"kept/{k}" for k in rec.get("kept", [])) or "none"
         return f"Written by arl. Not scored. {took}. {where}\nSmall result files: {kept}. Everything else is under artifacts/."
@@ -201,7 +215,9 @@ def analysis_facts(ledger: Ledger, rec: dict[str, Any]) -> str:
             row += [fmt(before) if before is not None else "", f"{m.gain(metrics[m.name], before):+.6g}" if before is not None else ""]
         rows.append(row)
     lines = [f"Written by arl. Outcome: **{comp['outcome']}**.", "", table(head, rows)]
-    if ref:
+    if comp["outcome"] == "repeat":
+        lines.append("A repeat of the reference: it shows the noise of the measurement and does not replace the reference.")
+    elif ref:
         lines.append(f"A change of at least {fmt(comp['min_delta'])} on {comp['metric']} counts as better or worse.")
     if comp["gate_failures"]:
         lines.append("Constraints not met: " + "; ".join(comp["gate_failures"]) + ".")
@@ -210,16 +226,50 @@ def analysis_facts(ledger: Ledger, rec: dict[str, Any]) -> str:
 
 
 def _section(body: str, heading: str) -> str:
-    match = re.search(rf"^## {re.escape(heading)}.*?\n(.*?)(?=^## |\Z)", body, re.M | re.S)
+    match = re.search(rf"^## {re.escape(heading)}.*?\n(.*?)(?=^#+ |\Z)", body, re.M | re.S)
     return match.group(1).strip() if match else ""
 
 
-def review_facts(ledger: Ledger, trigger: str, rs: dict[str, Any]) -> str:
+def _activity_facts(ledger: Ledger, events: list[dict[str, Any]], window: list[dict[str, Any]]) -> list[str]:
+    """Part 2 and part 3 start from this: what was refused, what failed, what was noted."""
+    out = ["How the work went in this window (for part 2):", ""]
+    refused = collections.Counter()
+    example: dict[str, str] = {}
+    for ev in events:
+        if ev.get("kind") == "refused":
+            first = str(ev.get("text", "")).splitlines()[0][:150] if ev.get("text") else "no message"
+            key = re.sub(r"(/[\w.\-]+)+", "<path>", re.sub(r"\b[EHNI]\d{3,4}\b", "<id>", first))
+            refused[key] += 1
+            example.setdefault(key, str(ev.get("command", ""))[:100])
+    if refused:
+        out.append(f"Commands arl refused: {sum(refused.values())}.")
+        out += [f"- {count} x {key}  (for example: `arl {example[key]}`)" for key, count in refused.most_common(15)]
+    else:
+        out.append("Commands arl refused: none.")
+    failures = []
+    for e in window:
+        for a in e.get("attempts", []):
+            if a.get("failed"):
+                failures.append(f"- {e['id']} attempt {a['n']}: {str(a['failed']).splitlines()[0][:200]}")
+            for seg in a.get("segments", []):
+                if seg.get("ended_by") not in (None, "finished", "failed"):
+                    failures.append(f"- {e['id']} attempt {a['n']}: a part of the run ended early ({seg['ended_by']})")
+    out += ["", "Runs that failed or were cut short:" if failures else "Runs that failed or were cut short: none."] + failures
+    for about, label in (("work", "Notes about the way of working"), ("problem", "Notes about the problem (for part 3)")):
+        notes = [ev for ev in events if ev.get("kind") == "note" and ev.get("about") == about]
+        out += ["", f"{label}:" if notes else f"{label}: none."]
+        out += [f"- {str(ev.get('at', ''))[:10]}: {ev.get('text', '')}" for ev in notes]
+    lessons = f"{len(ledger.lessons('project'))} for this project, {len(ledger.lessons('general'))} general"
+    out += ["", f"Lessons on file: {lessons}."]
+    return out
+
+
+def introspection_facts(ledger: Ledger, trigger: str, state_: dict[str, Any], activity_from: int) -> str:
     lock = contract.load(ledger)
     by_id = {e["id"]: e for e in ledger.experiments()}
-    window = [by_id[i] for i in rs["window"]]
+    window = [by_id[i] for i in state_["window"]]
     out = ["## Facts", "", f"Written by arl on {now()[:10]}. Trigger: {trigger}.", ""]
-    out.append(f"Window: {len(window)} experiments judged since {rs['last'] or 'the start'}.")
+    out.append(f"Window: {len(window)} experiments judged since {state_['last'] or 'the start'}.")
     out += ["", exp_table(ledger, window), "Tracks:", "", track_table(ledger, lock)]
     out.append(f"Budget: {_budget_line(ledger)}.")
     hyps = [h for h in ledger.hypotheses() if h["status"] == "open"]
@@ -227,13 +277,46 @@ def review_facts(ledger: Ledger, trigger: str, rs: dict[str, Any]) -> str:
     ideas = [i for i in ledger.ideas() if i["status"] == "open"]
     out.append("Open ideas: " + ("; ".join(f"{i['id']} {i['title']}" for i in ideas) or "none") + ".")
     first = ledger.cfg.splits[0]
-    others = sum(1 for e in by_id.values() for r in e.get("reruns", []) if r["split"] != first)
+    others = sum(1 for e in by_id.values() for r in e.get("reruns", []) if r.get("split") != first)
     if len(ledger.cfg.splits) > 1:
         out.append(f"Runs on a confirmation split so far: {others}.")
-    if rs["last"]:
-        tripwires = _section(ledger.review(rs["last"])[1], "6. Tripwires")
-        out += ["", f"Tripwires set by {rs['last']}:", "", tripwires or "none written"]
+    if state_["last"]:
+        tripwires = _section(ledger.introspection(state_["last"])[1], "6. Tripwires")
+        out += ["", f"Tripwires set by {state_['last']}:", "", tripwires or "none written"]
+    out += [""] + _activity_facts(ledger, ledger.activity()[activity_from:], window)
     return "\n".join(out)
+
+
+# --- what a reload prints ---------------------------------------------------------
+
+
+def reload_text(ledger: Ledger, handoff: dict[str, Any] | None = None) -> str:
+    """The knowledge and the lessons as they are now, in full, with the notes left at a pause."""
+    out = []
+    if handoff and (handoff.get("note") or handoff.get("reason")):
+        out += [
+            "==> Left by whoever paused the loop" + (f" ({str(handoff.get('at', ''))[:16]})" if handoff.get("at") else ""),
+            "",
+            f"Reason: {handoff.get('reason') or 'not given'}",
+            f"Where things were: {handoff.get('note') or 'no note was left'}",
+            "",
+        ]
+    for path, label in (
+        (ledger.knowledge_path, "what the work has shown about the problem"),
+        (ledger.lessons_path, "how to work in this project"),
+        (ledger.lessons_file("general"), "how to work with arl, in any project"),
+    ):
+        out += [f"==> {path}  ({label})", "", read_text(path).rstrip("\n") if path.exists() else "(not written yet)", ""]
+    tracks = ", ".join(f"{ledger.name}/tracks/{t['name']}.md" for t in ledger.tracks() if t["status"] == "active") or "none yet"
+    out += [
+        "==> Also part of your instructions. Read them again if this session has not, or has been cut short since:",
+        f"  {ROOT / 'PROTOCOL.md'}",
+        f"  {ledger.program_path}",
+        f"  {ledger.status_path}",
+        f"  the active tracks: {tracks}",
+        f"  {ledger.ideas_path}",
+    ]
+    return "\n".join(out) + "\n"
 
 
 # --- briefs -----------------------------------------------------------------------
@@ -262,7 +345,8 @@ def next_text(ledger: Ledger, action: dict[str, Any]) -> str:
         "target": action.get("target", ""),
         "why": action.get("why", ""),
     }
-    if stage in ("judge", "design", "crashed", "outdated", "interrupted"):
+    name = stage
+    if stage in ("judge", "design", "crashed", "outdated", "interrupted", "resume", "unfinished", "running"):
         rec = ledger.record(action["target"])
         ctx["track"] = rec["track"]
         ctx["exp"] = ledger.exp_dir(rec["id"])
@@ -277,8 +361,7 @@ def next_text(ledger: Ledger, action: dict[str, Any]) -> str:
         ctx["hyp_flags"] = flags
         if stage == "crashed" and rec.get("attempts"):
             ctx["why"] = f"{ctx['why']}. Last failure: {rec['attempts'][-1].get('failed', 'not recorded')}"
-    name = stage
-    if stage == "judge" and ledger.record(action["target"])["type"] == "diagnose":
-        name = "judge_diagnose"
+        if stage == "judge" and (rec["type"] == "diagnose" or ctx["outcome"] == "repeat"):
+            name = "judge_diagnose"
     head = f"NEXT: {stage}" + (f" {action['target']}" if action.get("target") else "")
     return f"{head}\nWhy: {action.get('why', '')}\n\n" + fill(template(f"briefs/{name}.md"), **ctx)

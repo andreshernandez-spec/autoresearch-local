@@ -22,6 +22,7 @@ class ArlError(Exception):
 
 # Exit codes of `arl exp run` beyond the plain 1.
 EXIT_CRASH = 2  # the run or the evaluator failed
+EXIT_PAUSED = 3  # the run was paused and can be continued
 EXIT_BUSY = 75  # the machine is busy or another run holds the lock
 
 
@@ -59,16 +60,24 @@ def slugify(text: str, max_len: int = 36) -> str:
     return slug[:max_len].rstrip("-") or "x"
 
 
+def read_text(path: Path) -> str:
+    """A text file of the ledger. One that is not UTF-8 is named, not raised."""
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        raise ArlError(f"{path} is not UTF-8 text (byte {e.start}). Save it as UTF-8.") from e
+
+
 def write_text(path: Path, text: str) -> None:
     """Write through a temporary file, so a reader never sees half a file."""
     path = Path(path)
     tmp = path.with_name(f".{path.name}.arltmp")
-    tmp.write_text(text)
+    tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
 
 
 def read_json(path: Path) -> Any:
-    return json.loads(Path(path).read_text())
+    return json.loads(read_text(path))
 
 
 def write_json(path: Path, obj: Any) -> None:
@@ -77,8 +86,12 @@ def write_json(path: Path, obj: Any) -> None:
 
 # --- what a person or an agent types ---------------------------------------------
 
-_IDS = {"E": (r"E\d{4}", "an experiment id like E0007"), "H": (r"H\d{3}", "a hypothesis id like H003"),
-        "R": (r"R\d{3}", "a review id like R002"), "I": (r"I\d{3}", "an idea id like I012")}
+_IDS = {
+    "E": (r"E\d{4}", "an experiment id like E0007"),
+    "H": (r"H\d{3}", "a hypothesis id like H003"),
+    "N": (r"N\d{3}", "an introspection id like N002"),
+    "I": (r"I\d{3}", "an idea id like I012"),
+}
 
 
 def check_id(kind: str, value: str) -> str:
@@ -97,8 +110,16 @@ def check_text(value: str, what: str) -> str:
 
 
 def one_line(value: str, what: str) -> str:
-    """A title: valid text, on one line, not empty."""
+    """A title, a reason, a note: valid text, on one line, not empty."""
     value = " ".join(check_text(value, what).split())
+    if not value:
+        raise ArlError(f"{what} is empty")
+    return value
+
+
+def text_block(value: str, what: str) -> str:
+    """Several lines of typed text. A heading in it would read as a new entry: keep it as text."""
+    value = re.sub(r"^(\s*)(#+ )", r"\1\\\2", check_text(value, what).strip(), flags=re.M)
     if not value:
         raise ArlError(f"{what} is empty")
     return value
@@ -118,7 +139,7 @@ def unfilled(text: str) -> list[str]:
 def require_filled(path: Path, what: str) -> None:
     if not path.exists():
         raise ArlError(f"{what} is missing: {path}")
-    left = unfilled(path.read_text())
+    left = unfilled(read_text(path))
     if left:
         lines = "\n  ".join(left[:6])
         raise ArlError(f"{what} is not written yet ({path}). Still to fill:\n  {lines}")
@@ -155,7 +176,7 @@ def join_front(meta: dict[str, Any], body: str) -> str:
 
 
 def read_front(path: Path) -> tuple[dict[str, Any], str]:
-    return split_front(Path(path).read_text())
+    return split_front(read_text(path))
 
 
 def write_front(path: Path, meta: dict[str, Any], body: str) -> None:

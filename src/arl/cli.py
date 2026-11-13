@@ -1,12 +1,22 @@
 """Command line. Every change of the ledger goes through one of these commands.
 
-Each command checks everything it can before it changes anything, so a refusal
-leaves the ledger, the worktrees and git as they were.
+Three habits hold throughout:
+
+- A command checks everything it can before it changes anything, so a refusal
+  leaves the ledger, the worktrees and git as they were.
+- Where a change takes several steps (a verdict moves a branch, a track and a
+  record), the intent is written first and the steps can be finished later by
+  any command, so a process that dies in the middle leaves nothing stuck.
+- A run is made of parts. A part that is interrupted (a pause, a closed
+  terminal, a killed process) is not a failure: the run continues later in the
+  same folder, from the state the job last saved.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import datetime as dt
 import hashlib
 import json
 import os
@@ -14,16 +24,18 @@ import re
 import shutil
 import signal
 import sys
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator
 
 from . import contract, render, rules, runner
 from .config import DECISIONS
 from .gitops import Git
-from .ledger import HYP_STATES, IDEA_STATES, Ledger
+from .ledger import HYP_STATES, IDEA_STATES, SCOPES, Ledger
 from .util import (
     EXIT_BUSY,
     EXIT_CRASH,
+    EXIT_PAUSED,
     ArlError,
     canonical,
     check_id,
@@ -31,6 +43,7 @@ from .util import (
     fmt,
     now,
     one_line,
+    parse_time,
     read_front,
     read_json,
     require_filled,
@@ -44,6 +57,7 @@ from .util import (
 
 ARL = render.LAUNCHER
 HYP_VERDICTS = ("supported", "refuted", "inconclusive", "open")
+AT_TERMINAL = "a person at a terminal"
 
 
 def interactive() -> bool:
@@ -83,18 +97,43 @@ def _require_design_unchanged(ledger: Ledger, rec: dict[str, Any]) -> None:
         )
 
 
+def _data(ledger: Ledger) -> tuple[list[dict[str, Any]], str]:
+    fingerprint = runner.data_fingerprint(ledger)
+    return fingerprint, runner.data_digest(fingerprint)
+
+
+def _data_digest_or_none(ledger: Ledger) -> str | None:
+    """For commands that only read: a missing data file must not stop them."""
+    try:
+        return _data(ledger)[1]
+    except ArlError:
+        return None
+
+
 # --- gates ------------------------------------------------------------------------
+
+
+def _gate_paused(ledger: Ledger) -> None:
+    paused = ledger.paused()
+    if paused is not None:
+        raise ArlError(
+            f"The loop is paused ({paused.get('reason') or 'no reason given'}). Nothing starts, runs or is judged.\n"
+            f"Continue only when the person says so: {ARL} resume"
+        )
 
 
 def _gate_new_work(ledger: Ledger) -> None:
     """Reasons no new experiment may be drafted now."""
-    rs = rules.review_state(ledger)
-    if rs["due"]:
+    _gate_paused(ledger)
+    state = rules.introspection_state(ledger)
+    if state["due"]:
         raise ArlError(
-            "A review comes first:\n  " + "\n  ".join(rs["reasons"]) + f"\nRun '{ARL} next' for the steps."
+            "An introspection comes first:\n  " + "\n  ".join(state["reasons"]) + f"\nRun '{ARL} next' for the steps."
         )
-    if rs["last_decision"] == "stop":
-        raise ArlError(f"{rs['last']} decided to stop the program. Only a person can reopen it.")
+    if state["last_decision"] == "stop":
+        raise ArlError(f"{state['last']} decided to stop the program. Only a person can reopen it.")
+    if state["reload"]:
+        raise ArlError(f"{state['reload']} is closed, but what it changed has not been read again. Run '{ARL} reload' first.")
     hit = rules.target_met(ledger)
     if hit:
         raise ArlError(f"{hit['id']} reached the target. Run '{ARL} next'.")
@@ -105,37 +144,46 @@ def _gate_new_work(ledger: Ledger) -> None:
 
 def _gate_running(ledger: Ledger, first_attempt: bool) -> None:
     """Reasons nothing may be run now, even a draft that already exists."""
-    rs = rules.review_state(ledger)
-    if rs["waiting"]:
-        raise ArlError(f"{rs['waiting']} waits for a person to decide. Nothing runs until then.")
-    if rs["last_decision"] == "stop":
-        raise ArlError(f"{rs['last']} decided to stop the program. Nothing runs until a person reopens it.")
+    _gate_paused(ledger)
+    state = rules.introspection_state(ledger)
+    if state["waiting"]:
+        raise ArlError(f"{state['waiting']} waits for a person to decide. Nothing runs until then.")
+    if state["last_decision"] == "stop":
+        raise ArlError(f"{state['last']} decided to stop the program. Nothing runs until a person reopens it.")
+    if state["reload"]:
+        raise ArlError(f"{state['reload']} is closed, but what it changed has not been read again. Run '{ARL} reload' first.")
     b = rules.budget(ledger)
     if b["hours_spent"] or (first_attempt and b["count_spent"]):
         raise ArlError("The budget is spent: " + "; ".join(b["spent"]))
 
 
-def _authorized(ledger: Ledger, review_id: str | None, decisions: tuple[str, ...], what: str) -> str:
+def _authorized(ledger: Ledger, nid: str | None, decisions: tuple[str, ...], what: str) -> str:
     """Who allows a change of direction: nobody is needed before the first verdict,
-    after it the latest closed review, or a person at a terminal."""
+    after it the latest closed introspection, or a person at a terminal."""
     if not any(e["status"] == "judged" for e in ledger.experiments()):
         return "setup"
-    if review_id:
-        meta, _ = ledger.review(review_id)
-        last = rules.review_state(ledger)["last"]
-        if meta["status"] != "closed" or review_id != last:
-            raise ArlError(f"{review_id} is not the latest closed review ({last or 'there is none yet'}). An older review does not decide today.")
+    if nid:
+        meta, _ = ledger.introspection(nid)
+        state = rules.introspection_state(ledger)
+        pending = state["open"] or state["waiting"]
+        if pending:
+            raise ArlError(f"{pending} is not decided yet, so the one before it does not decide today. Finish {pending} first.")
+        if meta["status"] != "closed" or nid != state["last"]:
+            raise ArlError(f"{nid} is not the latest closed introspection ({state['last'] or 'there is none yet'}). An older one does not decide today.")
         if decisions and meta.get("decision") not in decisions:
-            raise ArlError(f"{review_id} decided '{meta.get('decision')}', not {' or '.join(decisions)}")
-        return review_id
+            raise ArlError(f"{nid} decided '{meta.get('decision')}', not {' or '.join(decisions)}")
+        return nid
     if interactive():
         return "person"
     raise ArlError(
-        f"Once experiments have been judged, {what} comes out of a review:\n"
-        "pass --review <id> of the latest closed review"
+        f"Once experiments have been judged, {what} comes out of an introspection:\n"
+        "pass --introspection <id> of the latest closed one"
         + (f" (it must have decided {' or '.join(decisions)})" if decisions else "")
         + ",\nor let a person do it in a terminal."
     )
+
+
+# --- worktrees ----------------------------------------------------------------------
 
 
 def _worktree(ledger: Ledger, track: dict[str, Any]) -> tuple[Path, Git]:
@@ -148,39 +196,192 @@ def _worktree(ledger: Ledger, track: dict[str, Any]) -> tuple[Path, Git]:
     return path, Git(path)
 
 
+def _park(ledger: Ledger, track: dict[str, Any], path: Path, wgit: Git) -> None:
+    """A worktree left on a branch that no experiment in flight owns (a draft that was cut
+    off, a folder removed by hand): bring it back to the track's branch. The branch stays."""
+    here = wgit.branch()
+    if here == track["branch"]:
+        return
+    if any(e["branch"] == here for e in rules.in_flight(ledger, track["name"])):
+        return
+    dirty = wgit.dirty()
+    if dirty:
+        raise ArlError(
+            f"{path} is on '{here}', a branch no experiment in flight owns, and has uncommitted changes:\n  "
+            + "\n  ".join(dirty[:10])
+            + f"\nSave what you need elsewhere and put the files back (git -C {path} restore <file>), then try again."
+        )
+    wgit.switch(track["branch"])
+
+
 def _exp_worktree(ledger: Ledger, rec: dict[str, Any]) -> tuple[Path, Git]:
-    path, wgit = _worktree(ledger, ledger.track(rec["track"]))
-    if wgit.branch() != rec["branch"]:
-        raise ArlError(f"{path} is on '{wgit.branch()}', but {rec['id']} lives on '{rec['branch']}'")
+    track = ledger.track(rec["track"])
+    path, wgit = _worktree(ledger, track)
+    here = wgit.branch()
+    if here != rec["branch"]:
+        # A draft whose branch was never made or never entered: finish what 'exp new' started.
+        fresh = rec["status"] == "draft" and not rec["attempts"] and here == track["branch"]
+        if fresh and wgit.head() == rec["base_commit"] and not wgit.dirty():
+            if ledger.git.branch_exists(rec["branch"]):
+                wgit.switch(rec["branch"])
+            else:
+                wgit.switch_new(rec["branch"], rec["base_commit"])
+        else:
+            raise ArlError(f"{path} is on '{here}', but {rec['id']} lives on '{rec['branch']}'")
     return path, wgit
 
 
+# --- what a dead or interrupted process left ------------------------------------------
+
+
 def _fail(rec: dict[str, Any], reason: str) -> None:
+    """The attempt failed: it counts, and the next one starts from nothing."""
     attempt = rec["attempts"][-1]
     attempt.setdefault("ended", now())
     attempt["failed"] = reason
+    attempt.pop("paused", None)
     rec["status"] = "crashed"
     for key in ("pid", "pid_start", "child", "metrics", "comparison"):
         rec.pop(key, None)
 
 
-def _settle(ledger: Ledger, rec: dict[str, Any], certain: bool = False) -> bool:
-    """A record says 'running' but the arl that ran it is gone.
+def _pause_run(rec: dict[str, Any], how: str) -> None:
+    """A part of the run ended early without failing: the run can be continued."""
+    attempt = rec["attempts"][-1]
+    attempt["paused"] = how
+    attempt["run_seconds"] = round(sum(s.get("seconds", 0) for s in attempt.get("segments", [])), 2)
+    rec["status"] = "paused"
+    for key in ("pid", "pid_start", "child"):
+        rec.pop(key, None)
 
-    Stop whatever the run left behind and count the attempt as failed.
+
+def _seconds_since(started: str, log: Path) -> float:
+    """How long a part ran that nobody saw end: until its log was last written."""
+    try:
+        end = dt.datetime.fromtimestamp(log.stat().st_mtime).astimezone()
+        return max(0.0, round((end - parse_time(started)).total_seconds(), 2))
+    except (OSError, ValueError):
+        return 0.0
+
+
+def _settle(ledger: Ledger, rec: dict[str, Any], certain: bool = False) -> bool:
+    """A record says a job is going, but the arl that ran it is gone.
+
+    Stop whatever it left behind, and leave the run where it can be continued.
     certain: the caller holds the run lock, so nothing can be running.
     """
-    if rec["status"] != "running" or not (certain or rules.stale(rec)):
-        return False
-    note = "interrupted: arl died during the run"
-    if rec.get("child") and runner.stop_session(rec["child"]):
-        note += ", the processes it left behind were stopped"
-    if not rec.get("attempts"):
-        rec["attempts"] = [{"n": 1, "started": now()}]
-    _fail(rec, note)
+    changed = False
+    exp = ledger.exp_dir(rec["id"])
+    gone = rec["status"] == "running" and (certain or rules.stale(rec))
+    if gone:
+        sid = runner.session_of(rec.get("child"))
+        left = bool(sid and runner.stop_session(sid, ledger.cfg.pause_grace))
+    if gone and not ("code_commit" in rec and "contract" in rec):
+        # It was marked as running and never got as far as starting: back to where it was.
+        rec["attempts"] = [a for a in rec.get("attempts", []) if a.get("code_commit")]
+        rec["status"] = "crashed" if rec["attempts"] else "draft"
+        for key in ("pid", "pid_start", "child"):
+            rec.pop(key, None)
+        changed = True
+    elif gone:
+        attempt = rec["attempts"][-1]
+        parts = attempt.setdefault("segments", [])
+        if parts and "ended" not in parts[-1]:
+            n = attempt["n"]
+            log = exp / "logs" / (f"eval-{n}.log" if attempt.get("run_done") else f"run-{n}.log")
+            parts[-1].update(ended=now(), ended_by="interrupted", seconds=_seconds_since(parts[-1]["started"], log))
+            if left:
+                parts[-1]["note"] = "the job it left behind was stopped"
+        _pause_run(rec, "interrupted: the arl that ran it was gone" + (", the job it left behind was stopped" if left else ""))
+        changed = True
+    rerun = rec.get("rerun")
+    if rerun and (certain or not runner.alive(rerun.get("pid"), rerun.get("pid_start"))):
+        sid = runner.session_of(rerun.get("child"))
+        left = bool(sid and runner.stop_session(sid))
+        tree = Path(rerun.get("tree", ""))
+        if rerun.get("tree") and tree.exists():
+            _drop_tree(ledger, tree)
+        seconds = _seconds_since(rerun["started"], exp / "logs" / f"rerun-{rerun['n']}.log")
+        entry = {"n": rerun["n"], "at": now(), "split": rerun["split"], "run_seconds": seconds}
+        entry["failed"] = "interrupted: the arl that ran it was gone" + (", its job was stopped" if left else "")
+        rec.setdefault("reruns", []).append(entry)
+        rec.pop("rerun")
+        changed = True
+    if changed:
+        ledger.save_record(rec)
+        finish(ledger, f"{rec['id']} interrupted")
+    return changed
+
+
+def _settle_all(ledger: Ledger) -> None:
+    """Holding the run lock: every job a record still names is a leftover. Stop them all
+    before anything starts, whichever experiment the command is about."""
+    for rec in ledger.experiments():
+        if rec["status"] == "running" or rec.get("rerun"):
+            _settle(ledger, rec, certain=True)
+
+
+def _drop_tree(ledger: Ledger, tree: Path) -> None:
+    """Remove one of arl's own throwaway trees."""
+    try:
+        ledger.git.remove_worktree(tree)
+    except ArlError:
+        shutil.rmtree(tree, ignore_errors=True)
+    ledger.git.prune_worktrees()
+
+
+def _finish_judge(ledger: Ledger, rec: dict[str, Any]) -> None:
+    """Apply a recorded verdict: branch, track, hypotheses, then the record.
+
+    Every step looks at what is already done, so it can be run again after a
+    process died in the middle, and a different verdict can no longer be given.
+    """
+    eid, verdict = rec["id"], rec["verdict"]
+    decision = verdict["decision"]
+    track = ledger.track(rec["track"])
+    path, wgit = _worktree(ledger, track)
+    exp = ledger.exp_dir(eid)
+    if rec["branch"] != track["branch"]:
+        here = wgit.branch()
+        if here == rec["branch"]:
+            changed = wgit.tracked_changes()
+            if changed:
+                raise ArlError(f"tracked files in {path} were edited while the verdict of {eid} was being recorded:\n  " + "\n  ".join(changed[:10]) + f"\nPut them back (git -C {path} restore <file>), then run '{ARL} exp judge {eid}'.")
+            wgit.switch(track["branch"])
+        elif here != track["branch"]:
+            raise ArlError(f"{path} is on '{here}', neither the branch of {eid} nor the track's. Put it on '{track['branch']}' and run '{ARL} exp judge {eid}'.")
+    if decision == "keep":
+        code = rec["code_commit"]
+        if rec["branch"] != track["branch"] and not wgit.is_ancestor(code, "HEAD"):
+            wgit.fast_forward(code)
+        if wgit.head() != code:
+            raise ArlError(f"track {rec['track']} is at {wgit.head()[:10]}, not at the commit {eid} measured ({code[:10]}). The branch was moved by hand: put it back, then run '{ARL} exp judge {eid}'.")
+        track["head_commit"], track["head_experiment"] = code, eid
+        ledger.write_track_params(track, _load_params(exp / "params.json"))
+        line = f"{eid} kept ({rec['type']}): {rec['title']}"
+        if line not in read_front(ledger.track_path(track["name"]))[1]:
+            _track_log(ledger, track, line)
+        else:
+            ledger.save_track(track)
+    for hid, state in verdict.get("hypotheses", {}).items():
+        if state == "open":
+            ledger.log_hypothesis(hid, f"{eid} ({decision}): left as it is")
+        else:
+            ledger.set_hypothesis(hid, state, f"{eid} ({decision})")
+    verdict["track_head"] = {"before": verdict.get("track_head", {}).get("before", track["head_commit"]), "after": track["head_commit"]}
+    rec["status"] = "judged"
     ledger.save_record(rec)
-    finish(ledger, f"{rec['id']} interrupted")
-    return True
+    finish(ledger, f"{eid} {decision}")
+
+
+@contextlib.contextmanager
+def writing(ledger: Ledger, wait: float = 120.0) -> Generator[None, None, None]:
+    """The ledger lock, after finishing any verdict an earlier command left half applied."""
+    with ledger.locked(wait):
+        for rec in ledger.experiments():
+            if rec["status"] == "judging":
+                _finish_judge(ledger, rec)
+        yield
 
 
 # --- setup ------------------------------------------------------------------------
@@ -190,11 +391,13 @@ def cmd_init(args: argparse.Namespace) -> int:
     ledger = Ledger.locate()
     if ledger.exists():
         raise ArlError(f"{ledger.config_path} already exists")
-    for sub in ("eval", "hypotheses", "tracks", "experiments", "reviews"):
+    for sub in ("eval", "hypotheses", "tracks", "experiments", "introspections"):
         (ledger.dir / sub).mkdir(parents=True, exist_ok=True)
     branch = ledger.git.branch() or "main"
     files = {
         ledger.program_path: render.template("PROGRAM.md"),
+        ledger.knowledge_path: render.template("KNOWLEDGE.md"),
+        ledger.lessons_path: render.template("LESSONS.md"),
         ledger.ideas_path: render.template("IDEAS.md"),
         ledger.dir / ".gitignore": render.template("gitignore"),
         ledger.dir / "eval" / "README.md": render.template("eval_README.md"),
@@ -205,9 +408,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         if path.exists():
             kept.append(path.name)  # never overwrite what is already there
         else:
-            path.write_text(text)
+            write_text(path, text)
     print(f"Created {ledger.dir}" + (f" (left as they were: {', '.join(kept)})" if kept else ""))
-    print("Next: write PROGRAM.md and arl.toml, put the evaluator under eval/, then")
+    print("Next: write PROGRAM.md and arl.toml, put the evaluator under eval/, say what is already")
+    print("known about the problem in KNOWLEDGE.md, then")
     print(f"  {ARL} freeze --reason \"initial\"")
     return 0
 
@@ -216,17 +420,25 @@ def cmd_freeze(args: argparse.Namespace) -> int:
     ledger = Ledger.locate()
     person = interactive()
     old = contract.load(ledger) if ledger.exists() else None
+    shown = None
     if old and person and not args.yes:
-        # Ask before taking the ledger lock: a run that ends meanwhile must be able to write.
+        # Ask before taking the ledger lock, so a run that ends meanwhile can write.
+        # The answer covers this list only: it is compared again under the lock.
+        shown = contract.problems(ledger)
         print("Changes since contract v%d:" % old["version"])
-        for line in contract.problems(ledger):
+        for line in shown:
             print(f"  {line}")
         if input(f"Freeze these as contract v{old['version'] + 1}? [y/N] ").strip().lower() != "y":
             raise ArlError("not frozen")
     with ledger.locked():
-        lock = contract.freeze(ledger, args.reason, person)
-        write_text(ledger.status_path, render.status(ledger))
-        ledger.git.commit_paths(f"{ledger.cfg.commit_prefix}: freeze contract v{lock['version']}", contract.commit_paths(ledger))
+        before = contract.load(ledger)
+        lock = contract.freeze(ledger, args.reason, person, shown)
+        try:
+            write_text(ledger.status_path, render.status(ledger))
+            ledger.git.commit_paths(f"{ledger.cfg.commit_prefix}: freeze contract v{lock['version']}", contract.commit_paths(ledger))
+        except BaseException:
+            contract.unfreeze(ledger, before)  # a freeze that is not in git did not happen
+            raise
     print(f"Contract v{lock['version']} frozen ({len(lock['files'])} files).")
     if old and old["eval_digest"] != lock["eval_digest"]:
         print("The evaluator or the metrics changed: every track needs a new baseline.")
@@ -244,9 +456,11 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_next(args: argparse.Namespace) -> int:
     ledger = Ledger.locate()
+    data = None
     if ledger.exists():
         ledger.check_files()  # a damaged record is the first thing to say
-    action = rules.next_action(ledger)
+        data = _data_digest_or_none(ledger)
+    action = rules.next_action(ledger, data)
     if args.json:
         print(json.dumps(action, indent=2))
     else:
@@ -259,6 +473,10 @@ def cmd_verify(args: argparse.Namespace) -> int:
     ledger = Ledger.locate()
     ledger.check_files()  # a record that cannot be read is reported on its own, first
     bad = list(contract.problems(ledger))
+    if not bad:
+        left = contract.uncommitted(ledger)
+        if left:
+            bad.append("the frozen contract is not committed: " + ", ".join(left[:6]) + ". A person runs 'arl freeze' again, or commits these files.")
     git = ledger.git
     for t in ledger.tracks():
         if not git.branch_exists(t["branch"]):
@@ -269,11 +487,20 @@ def cmd_verify(args: argparse.Namespace) -> int:
             ledger.track_params(t)
         except ArlError as e:
             bad.append(f"track {t['name']}: {str(e).splitlines()[0]}")
+        if t.get("head_experiment"):
+            try:
+                head = ledger.record(t["head_experiment"])
+                if not rules.kept(head) and head["status"] != "judging":  # a verdict cut off is named below
+                    bad.append(f"track {t['name']}: its reference {t['head_experiment']} was not kept")
+            except ArlError as e:
+                bad.append(f"track {t['name']}: {str(e).splitlines()[0]}")
     for folder in sorted(ledger.exp_root.glob("E[0-9][0-9][0-9][0-9]*")) if ledger.exp_root.exists() else []:
         if not (folder / "record.json").exists():
             bad.append(f"{ledger.rel(folder)} has no record.json: a leftover, not an experiment")
     for e in ledger.experiments():
         exp = ledger.exp_dir(e["id"])
+        if e["status"] == "judging":
+            bad.append(f"{e['id']}: its verdict ({e['verdict']['decision']}) was cut off before it was complete. '{ARL} exp judge {e['id']}' finishes it.")
         if "design" in e:
             try:
                 design_hash, params_hash = _design_hashes(exp)
@@ -290,16 +517,166 @@ def cmd_verify(args: argparse.Namespace) -> int:
             if git.branch_exists(track["branch"]) and not git.is_ancestor(e["code_commit"], track["branch"]):
                 bad.append(f"{e['id']}: kept, but its commit is not in {track['branch']}")
         if "metrics" in e:
-            stored = read_json(exp / "metrics.json") if (exp / "metrics.json").exists() else {}
+            try:
+                stored = read_json(exp / "metrics.json") if (exp / "metrics.json").exists() else {}
+            except (ArlError, json.JSONDecodeError):
+                stored = {}
             if any(stored.get(k) != v for k, v in e["metrics"].items()):
                 bad.append(f"{e['id']}: metrics.json differs from the record")
-    ids = [i["id"] for i in ledger.ideas()]
-    for iid in sorted({i for i in ids if ids.count(i) > 1}):
-        bad.append(f"IDEAS.md has two entries called {iid}")
+    bad += ledger.idea_problems()
     if bad:
         print("\n".join(bad))
         return 1
     print("ok")
+    return 0
+
+
+# --- pausing the loop, and loading what it knows --------------------------------------
+
+
+def _ask_runs_to_pause(ledger: Ledger, only: str | None = None) -> list[tuple[str, str]]:
+    """Leave a request for every job that is going. Returns (experiment, "run" or "rerun")."""
+    asked = []
+    for rec in ledger.experiments():
+        if only not in (None, rec["id"]):
+            continue
+        rerun = rec.get("rerun")
+        if rec["status"] == "running" and not rules.stale(rec):
+            kind = "run"
+        elif rerun and runner.alive(rerun.get("pid"), rerun.get("pid_start")):
+            kind = "rerun"
+        else:
+            continue
+        request = ledger.exp_dir(rec["id"]) / "logs" / "pause.request"
+        request.parent.mkdir(parents=True, exist_ok=True)
+        request.write_text(now())
+        asked.append((rec["id"], kind))
+    return asked
+
+
+def _say_asked(ledger: Ledger, asked: list[tuple[str, str]]) -> None:
+    grace = f"{ledger.cfg.pause_grace:.0f} s"
+    for eid, kind in asked:
+        if kind == "run":
+            print(f"{eid} was asked to save its state and stop; it has {grace} before it is forced.")
+            print(f"  It continues later, from what it saved:  {ARL} exp run {eid}")
+        else:
+            print(f"The rerun of {eid} was asked to stop; it has {grace}. A rerun is not continued: run it again later.")
+
+
+def cmd_pause(args: argparse.Namespace) -> int:
+    """Stop the loop where it is, to be continued later."""
+    ledger = Ledger.locate()
+    with ledger.locked():
+        state = ledger.paused()
+        if state is not None:
+            if not args.note:
+                raise ArlError(
+                    f"the loop is paused already. To add to the note for whoever continues: {ARL} pause --note \"...\"\n"
+                    f"To continue, when the person says so: {ARL} resume"
+                )
+            state["note"] = f"{state['note']} {args.note}" if state.get("note") else args.note
+            write_json(ledger.paused_path, state)
+            ledger.log_activity("paused", f"note added: {args.note}")
+            if ledger.lock_path.exists():
+                finish(ledger, "pause, note added")
+            print("The note is kept with the pause and printed again at 'arl resume'.")
+            return 0
+        # A stop is never refused for a missing word: what is not said is recorded as such.
+        reason = args.reason or "not given"
+        state = {"at": now(), "by": AT_TERMINAL if interactive() else "the agent", "reason": reason, "note": args.note or ""}
+        write_json(ledger.paused_path, state)
+        asked = _ask_runs_to_pause(ledger)
+        ledger.log_activity("paused", f"{reason}. {args.note or ''}".strip())
+        if ledger.lock_path.exists():
+            finish(ledger, "pause")
+    print("The loop is paused. Nothing starts, runs or is judged until 'arl resume'.")
+    _say_asked(ledger, asked)
+    if not args.note:
+        print("No note was left. If you were in the middle of something, say where, now. The next session starts")
+        print(f"from the files and that note:  {ARL} pause --note \"where I was, what comes next\"")
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    """Continue a paused loop: print what was left behind and what there is to read again."""
+    ledger = Ledger.locate()
+    with ledger.locked():
+        state = ledger.paused()
+        if state is None:
+            raise ArlError("the loop is not paused")
+        if state.get("by") == AT_TERMINAL and not interactive():
+            raise ArlError(
+                "The loop was paused by a person at a terminal, and it is continued the same way:\n"
+                f"they run '{ARL} resume' there. Until then nothing starts, runs or is judged.\n"
+                "Notes, ideas and lessons can still be written down."
+            )
+        ledger.paused_path.unlink()
+        ledger.log_activity("resumed", f"paused {state.get('at', '')} ({state.get('reason', '')}). Note: {state.get('note', '')}")
+        _mark_reloaded(ledger)
+        if ledger.lock_path.exists():
+            finish(ledger, "resume")
+    print(render.reload_text(ledger, state), end="")
+    print()
+    print(render.next_text(ledger, rules.next_action(ledger, _data_digest_or_none(ledger))), end="")
+    return 0
+
+
+def _mark_reloaded(ledger: Ledger) -> str | None:
+    nid = rules.introspection_state(ledger)["reload"]
+    if nid:
+        meta, body = ledger.introspection(nid)
+        meta["reloaded"] = now()
+        write_front(ledger.intro_path(nid), meta, body)
+    ledger.mark_reloaded()
+    return nid
+
+
+def cmd_reload(args: argparse.Namespace) -> int:
+    """Print the knowledge and the lessons as they are now. Part 4 of an introspection."""
+    ledger = Ledger.locate()
+    with ledger.locked():
+        nid = _mark_reloaded(ledger)
+        if nid:
+            finish(ledger, f"{nid} reloaded")
+    print(render.reload_text(ledger), end="")
+    return 0
+
+
+def cmd_note(args: argparse.Namespace) -> int:
+    """Write down, when it happens, something an introspection should take up."""
+    ledger = Ledger.locate()
+    if not ledger.exists():
+        raise ArlError(f"no {ledger.config_path}. Run 'arl init' in the project first.")
+    text = one_line(" ".join(args.text), "the note")
+    ledger.log_activity("note", text, about=args.about)
+    where = "part 2 (how the work went)" if args.about == "work" else "part 3 (what we know about the problem)"
+    print(f"Noted for the next introspection, {where}.")
+    return 0
+
+
+def cmd_lesson_add(args: argparse.Namespace) -> int:
+    ledger = Ledger.locate()
+    with ledger.locked():
+        lid = ledger.add_lesson(args.scope, args.title, args.body, args.source or "")
+        path = ledger.lessons_file(args.scope)
+        if args.scope == "project":
+            if ledger.lock_path.exists():
+                finish(ledger, f"lesson {lid}")
+        else:
+            try:  # the general file lives with the skill: commit it there when that is a repository
+                top = Git(path.parent).top()
+                Git(top).commit_paths(f"lessons: {lid} {args.title[:48]}", [path.relative_to(top).as_posix()])
+            except (ArlError, OSError, ValueError):
+                pass
+    print(f"{lid} added to {path}")
+    return 0
+
+
+def cmd_lesson_list(args: argparse.Namespace) -> int:
+    ledger = Ledger.locate()
+    rows = [[l["id"], scope, l["title"]] for scope in SCOPES if args.scope in (None, scope) for l in ledger.lessons(scope)]
+    print(render.table(["id", "scope", "title"], rows), end="")
     return 0
 
 
@@ -311,22 +688,28 @@ def cmd_track_new(args: argparse.Namespace) -> int:
     name = args.name
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,30}", name):
         raise ArlError("a track name is lower case letters, digits and dashes")
-    with ledger.locked():
+    with writing(ledger):
         contract.require(ledger)
+        _gate_paused(ledger)
         if ledger.track_path(name).exists():
             raise ArlError(f"track {name} already exists")
-        opened_by = _authorized(ledger, args.review, ("branch", "pivot"), "a new track")
+        opened_by = _authorized(ledger, args.introspection, ("branch", "pivot"), "a new track")
         git, branch = ledger.git, f"track/{name}"
-        if git.branch_exists(branch):
-            raise ArlError(f"branch {branch} already exists")
         start = git.head(args.from_ref or "HEAD")
         path = ledger.worktree_path(name)
-        if path.exists():
-            raise ArlError(f"{path} already exists")
         params = _load_params(Path(args.params)) if args.params else {}
+        # A branch or a worktree without a track file is what an earlier try left when it was cut off.
+        if git.branch_exists(branch) and git.head(branch) != start:
+            raise ArlError(f"branch {branch} exists already and is not at {start[:10]}. Pick another name.")
+        registered = {w["path"]: w.get("branch") for w in git.worktrees()}
+        if path.exists() and registered.get(str(path)) != branch:
+            raise ArlError(f"{path} exists already and is not a worktree of {branch}")
         path.parent.mkdir(parents=True, exist_ok=True)
-        git.create_branch(branch, start)
-        git.add_worktree(path, branch)
+        if not git.branch_exists(branch):
+            git.create_branch(branch, start)
+        if not path.exists():
+            git.prune_worktrees()
+            git.add_worktree(path, branch)
         ledger.track_root.mkdir(parents=True, exist_ok=True)
         meta = {
             "name": name,
@@ -344,7 +727,7 @@ def cmd_track_new(args: argparse.Namespace) -> int:
         write_front(ledger.track_path(name), meta, body)
         finish(ledger, f"open track {name}")
     print(f"Track {name}: branch {branch} at {start[:10]}, worktree {path}")
-    print(f"Now write {ledger.track_path(name)} (approach, premises, stop if).")
+    print(f"Now write {ledger.track_path(name)} (approach, premises, stop if), below the +++ block.")
     return 0
 
 
@@ -355,15 +738,16 @@ def _track_log(ledger: Ledger, meta: dict[str, Any], line: str) -> None:
 
 def cmd_track_set(args: argparse.Namespace) -> int:
     ledger = Ledger.locate()
-    with ledger.locked():
+    with writing(ledger):
         contract.require(ledger)
+        _gate_paused(ledger)
         track = ledger.track(args.name)
         if track["status"] == args.status:
             raise ArlError(f"track {args.name} is already {args.status}")
         flying = rules.in_flight(ledger, args.name)
         if args.status != "active" and flying:
             raise ArlError(f"{flying[0]['id']} is still in flight on track {args.name}")
-        by = _authorized(ledger, args.review, (), "parking, closing or reopening a track")
+        by = _authorized(ledger, args.introspection, (), "parking, closing or reopening a track")
         track["status"] = args.status
         _track_log(ledger, track, f"{args.status} (by {by}). {args.note}")
         finish(ledger, f"track {args.name} {args.status}")
@@ -374,8 +758,9 @@ def cmd_track_set(args: argparse.Namespace) -> int:
 def cmd_track_sync(args: argparse.Namespace) -> int:
     """The branch was changed by hand. Record the new head; the track needs a new baseline."""
     ledger = Ledger.locate()
-    with ledger.locked():
+    with writing(ledger):
         contract.require(ledger)
+        _gate_paused(ledger)
         track = ledger.track(args.name)
         if rules.in_flight(ledger, args.name):
             raise ArlError(f"an experiment is in flight on track {args.name}")
@@ -398,7 +783,7 @@ def cmd_track_worktree(args: argparse.Namespace) -> int:
         path = ledger.worktree_path(args.name)
         if path.exists():
             raise ArlError(f"{path} is there already")
-        flying = rules.in_flight(ledger, args.name)
+        flying = [e for e in rules.in_flight(ledger, args.name) if e["status"] != "judging"]
         branch = flying[0]["branch"] if flying else track["branch"]
         ledger.git.prune_worktrees()  # git still lists the folder that is gone
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -479,7 +864,7 @@ def cmd_idea_list(args: argparse.Namespace) -> int:
 def cmd_exp_new(args: argparse.Namespace) -> int:
     ledger = Ledger.locate()
     typ, hyps = args.type, [check_id("H", h) for h in (args.hyp or [])]
-    with ledger.locked():
+    with writing(ledger):
         lock = contract.require(ledger)
         cfg = ledger.cfg
         _gate_new_work(ledger)
@@ -494,8 +879,7 @@ def cmd_exp_new(args: argparse.Namespace) -> int:
                 "One experiment at a time per track: finish it first."
             )
         path, wgit = _worktree(ledger, track)
-        if wgit.branch() != track["branch"]:
-            raise ArlError(f"{path} is on '{wgit.branch()}', expected '{track['branch']}'")
+        _park(ledger, track, path, wgit)
         dirty = wgit.dirty()
         if dirty:
             raise ArlError(f"{path} has uncommitted changes:\n  " + "\n  ".join(dirty[:10]))
@@ -506,9 +890,6 @@ def cmd_exp_new(args: argparse.Namespace) -> int:
                 f"Record it with '{ARL} track sync {args.track} --note \"...\"', then run a baseline."
             )
         params = ledger.track_params(track)
-        if "params_sha256" not in track:  # a track from before the hash was kept: trust it once
-            ledger.write_track_params(track, params)
-            ledger.save_track(track)
         if typ == "baseline" and hyps:
             raise ArlError("a baseline measures the track as it is. It tests no hypothesis: leave --hyp out.")
         for h in hyps:
@@ -519,16 +900,19 @@ def cmd_exp_new(args: argparse.Namespace) -> int:
         if typ in ("tune", "feature"):
             if not hyps:
                 raise ArlError(f"a {typ} experiment tests a hypothesis: write one with 'arl hyp new' and pass --hyp")
-            if rules.reference_for(ledger, track, lock["eval_digest"]) is None:
-                raise ArlError(f"track {args.track} has no reference under contract v{lock['version']}: run a baseline first")
+            if rules.reference_for(ledger, track, lock["eval_digest"], _data(ledger)[1]) is None:
+                raise ArlError(f"track {args.track} has no reference under contract v{lock['version']} and the data as it is: run a baseline first")
         if args.command and typ != "diagnose":
             raise ArlError("--command is for diagnose experiments. Scored runs use the command in arl.toml.")
 
         eid, slug = ledger.next_id("E"), slugify(args.title)
         exp = ledger.exp_root / f"{eid}-{slug}"
         branch = f"exp/{eid}-{slug}" if typ in ("feature", "diagnose") else track["branch"]
-        if exp.exists() or (branch != track["branch"] and ledger.git.branch_exists(branch)):
-            raise ArlError(f"{exp.name} or branch {branch} exists already: a leftover. Remove the folder, or pick another title.")
+        if exp.exists():
+            raise ArlError(f"{exp} exists already: a leftover. Remove the folder.")
+        leftover = branch != track["branch"] and ledger.git.branch_exists(branch)
+        if leftover and ledger.git.head(branch) != head:
+            raise ArlError(f"branch {branch} exists already with commits of its own. Pick another title.")
         rec = {
             "id": eid,
             "title": args.title,
@@ -554,15 +938,24 @@ def cmd_exp_new(args: argparse.Namespace) -> int:
         kind = typ if typ in ("baseline", "diagnose") else "scored"
         design = render.fill(render.template(f"design_{kind}.md"), **ctx)
         # Everything is checked. From here on, undo on failure.
+        if "params_sha256" not in track:  # a track from before the hash was kept: trust it once
+            ledger.write_track_params(track, params)
+            ledger.save_track(track)
         exp.mkdir(parents=True)
         try:
             write_text(exp / "design.md", design)
             write_json(exp / "params.json", params)
             write_json(exp / "record.json", rec)
             if branch != track["branch"]:
-                wgit.switch_new(branch, head)
+                if leftover:
+                    wgit.switch(branch)  # an empty branch a cut-off try left: use it
+                else:
+                    wgit.switch_new(branch, head)
         except BaseException:
             shutil.rmtree(exp, ignore_errors=True)
+            with contextlib.suppress(ArlError):
+                if wgit.branch() != track["branch"] and not wgit.dirty():
+                    wgit.switch(track["branch"])
             raise
         write_text(ledger.status_path, render.status(ledger))
     print(render.next_text(ledger, {"stage": "design", "target": eid, "why": f"{eid} drafted on track {args.track}"}), end="")
@@ -577,11 +970,19 @@ def _blob_id(path: Path) -> str:
 
 def cmd_exp_commit(args: argparse.Namespace) -> int:
     ledger = Ledger.locate()
-    with ledger.locked():
+    with writing(ledger):
+        _gate_paused(ledger)
         rec = ledger.record(args.id)
         if rec["type"] not in ("feature", "diagnose"):
             raise ArlError(f"{rec['id']} is a {rec['type']} experiment: it does not change code")
         _settle(ledger, rec)
+        if rec["status"] == "paused":
+            raise ArlError(
+                f"{rec['id']} is paused in the middle of its run, and a run continues the code it started with.\n"
+                f"Continue it as it is:  {ARL} exp run {rec['id']}\n"
+                f"Or give that run up, so the code can change and the next run starts from nothing:\n"
+                f"  {ARL} exp fail {rec['id']} --reason \"...\""
+            )
         if rec["status"] not in ("draft", "crashed"):
             raise ArlError(f"{rec['id']} is {rec['status']}: its code is fixed")
         path, wgit = _exp_worktree(ledger, rec)
@@ -606,7 +1007,7 @@ def cmd_exp_commit(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_env(ledger: Ledger, rec: dict[str, Any], values: dict[str, Any]) -> dict[str, str]:
+def _run_env(ledger: Ledger, rec: dict[str, Any], values: dict[str, Any], resume: bool) -> dict[str, str]:
     env = dict(os.environ)
     env.update(
         ARL_HOME=str(ledger.home),
@@ -617,6 +1018,8 @@ def _run_env(ledger: Ledger, rec: dict[str, Any], values: dict[str, Any]) -> dic
         ARL_SPLIT=str(values["split"]),
         ARL_ID=rec["id"],
         ARL_TRACK=rec["track"],
+        ARL_RESUME="1" if resume else "0",
+        ARL_CHECKPOINT_EVERY=f"{ledger.cfg.checkpoint_every:g}",
     )
     return env
 
@@ -625,17 +1028,18 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
     ledger = Ledger.locate()
     eid = check_id("E", args.id)
     # The run lock is held from the checks to the end: no second run can start in
-    # between, and a record that says "running" while we hold it is a leftover.
+    # between, and whatever a record still calls "running" is a leftover.
     with runner.run_lock(ledger):
-        with ledger.locked():
+        with writing(ledger):
             lock = contract.require(ledger)
+            _settle_all(ledger)
             rec = ledger.record(eid)
             cfg = ledger.cfg
-            _settle(ledger, rec, certain=True)
-            if rec["status"] not in ("draft", "crashed"):
+            if rec["status"] not in ("draft", "crashed", "paused"):
                 raise ArlError(f"{eid} is {rec['status']}. To run it again use '{ARL} exp reproduce {eid}'.")
+            resuming = rec["status"] == "paused"
             attempts = rec["attempts"]
-            if len(attempts) >= cfg.max_attempts:
+            if not resuming and len(attempts) >= cfg.max_attempts:
                 raise ArlError(
                     f"{eid} has failed {len(attempts)} times, the limit. Judge it:\n"
                     f"  {ARL} exp judge {eid} --verdict crash --reason \"...\""
@@ -648,17 +1052,27 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
                 require_filled(ledger.hyp_path(h), f"hypothesis {h}")
             track = ledger.track(rec["track"])
             path, wgit = _exp_worktree(ledger, rec)
+            typ = rec["type"]
             dirty = wgit.dirty()
             if dirty:
-                how = f"Commit them with '{ARL} exp commit {eid} -m \"...\"' or undo them." if rec["type"] in ("feature", "diagnose") else "Undo them: this kind of experiment does not change code."
+                how = f"Commit them with '{ARL} exp commit {eid} -m \"...\"' or undo them." if typ in ("feature", "diagnose") and not resuming else "Undo them."
                 raise ArlError(
                     f"{path} has uncommitted changes, so the run would not be the committed code:\n  "
                     + "\n  ".join(dirty[:10])
                     + f"\n{how}"
                 )
-            code, base, typ = wgit.head(), rec["base_commit"], rec["type"]
-            again = "Judge it as a crash and draft again." if attempts else f"Abandon it ('{ARL} exp abandon {eid} --reason \"...\"') and draft again."
-            if typ in ("baseline", "tune"):
+            code, base = wgit.head(), rec["base_commit"]
+            give_up = f"Judge it as a crash ('{ARL} exp judge {eid} --verdict crash --reason \"...\"') and draft it again."
+            again = give_up if attempts else f"Abandon it ('{ARL} exp abandon {eid} --reason \"...\"') and draft again."
+            fingerprint, data = _data(ledger)
+            if resuming:
+                if code != rec["code_commit"]:
+                    raise ArlError(f"{path} is at {code[:10]}, but {eid} was paused while running {rec['code_commit'][:10]}. A run continues the code it started with. {give_up}")
+                if lock["digest"] != rec["contract"]["digest"]:
+                    raise ArlError(f"the contract was frozen anew since {eid} started (v{rec['contract']['version']} to v{lock['version']}), so it cannot be continued. {give_up}")
+                if rec["conditions"].get("data_digest") not in (None, data):
+                    raise ArlError(f"the data files changed since {eid} started, so it cannot be continued. {give_up}")
+            elif typ in ("baseline", "tune"):
                 if code != track["head_commit"]:
                     raise ArlError(f"track {rec['track']} moved since {eid} was drafted. {again}")
             else:
@@ -684,22 +1098,23 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
             scored = typ in rules.SCORED
             split = cfg.splits[0]
             command = rec.get("command") or cfg.run_command
-            what = {"track": rec["track"], "code": code, "params": params_hash, "command": command, "eval": lock["eval_digest"] if scored else "", "split": split}
+            # The files, not the commit: the same change committed twice is the same experiment.
+            what = {"track": rec["track"], "tree": wgit.tree(code), "params": params_hash, "command": command, "eval": lock["eval_digest"] if scored else "", "split": split, "data": data}
             key = sha256_text(canonical(what))
-            for other in ledger.experiments():
-                same = other["id"] != eid and other.get("dedup") == key and other["status"] in ("evaluated", "judged")
-                if same and other.get("verdict", {}).get("decision") != "crash":
-                    if not args.allow_duplicate:
-                        raise ArlError(
-                            f"{eid} has the same code, params and evaluator as {other['id']}: the result is already known.\n"
-                            "To repeat it on purpose (to see the noise), pass --allow-duplicate \"why\"."
-                        )
-                    rec["duplicate_of"], rec["duplicate_reason"] = other["id"], args.allow_duplicate
-            reference = None
-            if typ in ("tune", "feature"):
-                reference = rules.reference_for(ledger, track, lock["eval_digest"])
-                if reference is None:
-                    raise ArlError(f"track {rec['track']} has no reference under contract v{lock['version']}. {again} Then run a baseline first.")
+            reference = rules.reference_for(ledger, track, lock["eval_digest"], data)
+            repeat = typ == "baseline" and reference is not None  # the track has a reference: this one shows the noise
+            if not resuming:
+                for other in ledger.experiments():
+                    same = other["id"] != eid and other.get("dedup") == key and other["status"] in ("evaluated", "judging", "judged")
+                    if same and other.get("verdict", {}).get("decision") != "crash":
+                        if not args.allow_duplicate:
+                            raise ArlError(
+                                f"{eid} has the same code, params, data and evaluator as {other['id']}: the result is already known.\n"
+                                "To repeat it on purpose (to see the noise), pass --allow-duplicate \"why\"."
+                            )
+                        rec["duplicate_of"], rec["duplicate_reason"] = other["id"], args.allow_duplicate
+            if typ in ("tune", "feature") and reference is None:
+                raise ArlError(f"track {rec['track']} has no reference under contract v{lock['version']} and the data as it is. {again} Then run a baseline first.")
             reasons = runner.busy(cfg)
             if reasons:
                 raise ArlError(
@@ -708,61 +1123,96 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
                 )
 
             # All checks passed. Mark it as running and lock the design; if that
-            # cannot be committed, nothing ran and no attempt is counted.
+            # cannot be committed, nothing ran and nothing is counted.
             before = json.dumps(rec)
-            n = len(attempts) + 1
-            out, logs = exp / "artifacts" / f"run-{n}", exp / "logs"
-            values = {"params": exp / "params.json", "out": out, "split": split, "home": ledger.home, "research": ledger.dir, "exp": exp, "worktree": path, "metrics": exp / "metrics.json"}
             try:
+                if resuming:
+                    attempt = attempts[-1]
+                    attempt.pop("paused", None)
+                else:
+                    attempt = {"n": len(attempts) + 1, "started": now(), "code_commit": code, "segments": []}
+                    attempts.append(attempt)
+                    rec["contract"] = {k: lock[k] for k in ("version", "digest", "eval_digest")}
+                    rec["conditions"] = {"command": command, "split": split, "worktree": str(path), "data": fingerprint, "data_digest": data}
+                n = attempt["n"]
+                part = {"started": now()}
+                attempt.setdefault("segments", []).append(part)
+                # A pause is asked of a record that says "running": clear an old request before it does.
+                (exp / "logs" / "pause.request").unlink(missing_ok=True)
                 rec.update(status="running", pid=os.getpid(), pid_start=runner.proc_start(os.getpid()), code_commit=code, dedup=key)
-                rec["contract"] = {k: lock[k] for k in ("version", "digest", "eval_digest")}
                 rec.setdefault("design", {"design_sha256": design_hash, "params_sha256": params_hash, "locked_at": now()})
-                rec["conditions"] = {
-                    "command": command,
-                    "split": split,
-                    "worktree": str(path),
-                    "env": runner.environment(ledger),
-                    "data": runner.data_fingerprint(ledger),
-                }
-                attempts.append({"n": n, "started": now(), "code_commit": code})
+                part["env"] = runner.environment(ledger)
+                rec["conditions"].setdefault("env", part["env"])
                 ledger.save_record(rec)
-                finish(ledger, f"{eid} design, {typ} on {rec['track']}" if n == 1 else f"{eid} attempt {n}")
+                parts = len(attempt["segments"])
+                finish(ledger, f"{eid} continued, part {parts}" if parts > 1 else (f"{eid} design, {typ} on {rec['track']}" if n == 1 else f"{eid} attempt {n}"))
             except BaseException:
                 ledger.save_record(json.loads(before))
                 raise
 
+        out, logs = exp / "artifacts" / f"run-{n}", exp / "logs"
         out.mkdir(parents=True, exist_ok=True)
-        attempt, env, failed = attempts[-1], _run_env(ledger, rec, values), ""
+        values = {"params": exp / "params.json", "out": out, "split": split, "home": ledger.home, "research": ledger.dir, "exp": exp, "worktree": path, "metrics": exp / "metrics.json"}
+        env = _run_env(ledger, rec, values, resume=len(attempt["segments"]) > 1)
         limits = {"max_rss_gb": cfg.max_run_rss_gb, "min_free_ram_gb": cfg.stop_below_free_ram_gb}
+        pausing = {"pause_file": logs / "pause.request", "pause_grace": cfg.pause_grace}
+        failed = paused = ""
+        clock = time.monotonic()
 
         def started(pid: int) -> None:
-            rec["child"] = pid  # so a later arl can stop the job if this one is killed
+            rec["child"] = runner.child_ref(pid)  # so a later arl can stop the job if this one is killed
             ledger.save_record(rec)
 
+        def close_part(how: str, seconds: float) -> None:
+            part.update(ended=now(), ended_by=how, seconds=round(part.get("seconds", 0) + seconds, 2))
+            attempt["run_seconds"] = round(sum(s.get("seconds", 0) for s in attempt["segments"]), 2)
+
         try:
-            res = runner.execute(runner.substitute(command, values), path, env, cfg.run_timeout, logs / f"run-{n}.log", on_start=started, **limits)
-            attempt.update(run_seconds=res["seconds"], exit_code=res["exit_code"])
-            write_text(exp / "run.tail.txt", runner.tail(logs / f"run-{n}.log"))
-            if res["stopped"]:
-                failed = f"the run was stopped: {res['stopped']}"
-            elif res["exit_code"] != 0:
-                failed = f"the run exited with code {res['exit_code']}"
-            elif wgit.branch() != rec["branch"] or wgit.head() != code or wgit.tracked_changes():
-                failed = "the code in the worktree changed while the run was going, so the result does not belong to the recorded commit"
-            if not failed:
+            if not attempt.get("run_done"):
+                used = sum(s.get("seconds", 0) for s in attempt["segments"][:-1])
+                left = cfg.run_timeout - used
+                if left <= 0:
+                    close_part("failed", 0)
+                    failed = f"the run passed its limit of {cfg.run_timeout:.0f} s over all its parts"
+                else:
+                    res = runner.execute(runner.substitute(command, values), path, env, left, logs / f"run-{n}.log", on_start=started, **limits, **pausing)
+                    attempt["exit_code"] = res["exit_code"]
+                    write_text(exp / "run.tail.txt", runner.tail(logs / f"run-{n}.log"))
+                    saved = runner.last_checkpoint(out)
+                    if saved:
+                        attempt["last_checkpoint"] = dt.datetime.fromtimestamp(saved).astimezone().isoformat(timespec="seconds")
+                    elif cfg.checkpoint_every and res["seconds"] > 3 * cfg.checkpoint_every:
+                        attempt["warning"] = f"this part ran {res['seconds']:.0f} s and saved no state under {{out}}/checkpoint: a pause loses that work"
+                    if res["paused"]:
+                        paused = res["paused"]
+                        close_part("paused", res["seconds"])
+                    elif res["stopped"]:
+                        failed = f"the run was stopped: {res['stopped']}"
+                    elif res["exit_code"] != 0:
+                        failed = f"the run exited with code {res['exit_code']}"
+                    elif wgit.branch() != rec["branch"] or wgit.head() != code or wgit.tracked_changes():
+                        failed = "the code in the worktree changed while the run was going, so the result does not belong to the recorded commit"
+                    if failed:
+                        close_part("failed", res["seconds"])
+                    elif not paused:
+                        close_part("finished", res["seconds"])
+                        attempt["run_done"] = True
+            if not failed and not paused:
                 rec["artifacts"] = runner.manifest(out)  # what the run left, before the evaluator adds to it
-                if scored and not rec["artifacts"]:
+                if scored and not [a for a in rec["artifacts"] if not a["path"].startswith("checkpoint/")]:
                     failed = "the run wrote nothing into its output folder"
-            if not failed and scored:
+            if not failed and not paused and scored:
                 lock_now = contract.require(ledger)  # the run itself must not have touched the evaluator
                 if lock_now["digest"] != rec["contract"]["digest"]:
                     failed = f"the contract was frozen anew while the run was going (v{rec['contract']['version']} to v{lock_now['version']}), so this run cannot be scored"
-            if not failed and scored:
+            if not failed and not paused and scored:
                 (exp / "metrics.json").unlink(missing_ok=True)
-                ev = runner.execute(runner.substitute(cfg.eval_command, values), ledger.home, env, cfg.eval_timeout, logs / f"eval-{n}.log", on_start=started, **limits)
-                attempt["eval_seconds"] = ev["seconds"]
+                ev = runner.execute(runner.substitute(cfg.eval_command, values), ledger.home, env, cfg.eval_timeout, logs / f"eval-{n}.log", on_start=started, **limits, **pausing)
+                attempt["eval_seconds"] = round(attempt.get("eval_seconds", 0) + ev["seconds"], 2)
                 write_text(exp / "eval.tail.txt", runner.tail(logs / f"eval-{n}.log"))
-                if ev["stopped"]:
+                if ev["paused"]:
+                    paused = f"{ev['paused']} (during the evaluation; the run itself is complete)"
+                elif ev["stopped"]:
                     failed = f"the evaluator was stopped: {ev['stopped']}"
                 elif ev["exit_code"] != 0:
                     failed = f"the evaluator exited with code {ev['exit_code']}"
@@ -770,17 +1220,21 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
                     failed = "the contract was frozen anew while the evaluator was running, so this score cannot be trusted"
                 else:
                     rec["metrics"] = runner.read_metrics(exp / "metrics.json", cfg)
-                    rec["comparison"] = rules.compare(cfg, rec["metrics"], reference)
+                    rec["comparison"] = rules.compare(cfg, rec["metrics"], reference, repeat=repeat)
         except ArlError as e:
             failed = str(e)
+            if "ended" not in part:
+                close_part("failed", time.monotonic() - clock)
         except BaseException:
-            _fail(rec, "interrupted")
+            # arl itself is being stopped (a closed terminal, Ctrl-C). The job was given the
+            # time to save its state. This is an interruption, not a failure.
+            if "ended" not in part:
+                close_part("interrupted", time.monotonic() - clock)
+            _pause_run(rec, "interrupted: arl was stopped while the run was going")
             ledger.save_record(rec)
-            try:
+            with contextlib.suppress(ArlError):
                 with ledger.locked():
                     finish(ledger, f"{eid} interrupted")
-            except ArlError:
-                pass  # the record is saved; the next arl command commits it
             raise
 
         def write_outcome() -> str:
@@ -791,19 +1245,27 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
                 _fail(rec, failed)
                 ledger.save_record(rec)
                 return f"{eid} failed, attempt {n}"
+            if paused:
+                attempt.pop("ended")
+                _pause_run(rec, paused)
+                ledger.save_record(rec)
+                return f"{eid} paused"
             rec["status"] = "evaluated"
             rec["kept"] = runner.keep_small(out, exp / "kept", cfg.keep, cfg.keep_max_kb)
+            ledger.save_record(rec)  # the result is safe before anything else is written about it
             kind = "scored" if scored else "diagnose"
-            facts = render.analysis_facts(ledger, rec)
+            try:
+                facts = render.analysis_facts(ledger, rec)
+            except (ArlError, KeyError) as e:
+                facts = f"Written by arl. The table of results could not be written ({e}). The numbers are in metrics.json and record.json."
             write_text(exp / "analysis.md", render.fill(render.template(f"analysis_{kind}.md"), id=eid, facts=facts))
-            ledger.save_record(rec)
             return f"{eid} result" + (f", {cfg.primary.name} {fmt(rec['metrics'][cfg.primary.name])}" if scored else "")
 
         try:
             with ledger.locked(wait=900):
                 finish(ledger, write_outcome())
         except ArlError as e:
-            # The run is over and its result must not be lost because git or the home
+            # The run is over and its outcome must not be lost because git or the home
             # checkout is in the way: save the record, leave the commit for later.
             if rec["status"] == "running":
                 write_outcome()
@@ -813,9 +1275,48 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
         print(f"{eid} FAILED (attempt {n} of {cfg.max_attempts}): {failed}")
         print(f"Log: {ARL} exp log {eid}")
         return EXIT_CRASH
+    if paused:
+        print(f"{eid} PAUSED after {attempt['run_seconds']:.0f} s of running: {paused}")
+        print(f"It continues from the state it last saved:  {ARL} exp run {eid}")
+        return EXIT_PAUSED
     print(_summary(ledger, rec))
+    if attempt.get("warning"):
+        print(f"  note: {attempt['warning']}")
     print()
     print(render.next_text(ledger, {"stage": "judge", "target": eid, "why": f"{eid} has a result and no verdict"}), end="")
+    return 0
+
+
+def cmd_exp_pause(args: argparse.Namespace) -> int:
+    """Ask a run that is going to save its state and stop. It continues later with 'exp run'."""
+    ledger = Ledger.locate()
+    asked = _ask_runs_to_pause(ledger, check_id("E", args.id) if args.id else None)
+    if not asked:
+        raise ArlError("nothing is running" + (f" under {args.id}" if args.id else ""))
+    _say_asked(ledger, asked)
+    return 0
+
+
+def cmd_exp_fail(args: argparse.Namespace) -> int:
+    """Give up the saved state of a paused run. The attempt counts as failed."""
+    ledger = Ledger.locate()
+    eid = check_id("E", args.id)
+    with writing(ledger):
+        _gate_paused(ledger)
+        rec = ledger.record(eid)
+        _settle(ledger, rec)
+        if rec["status"] != "paused":
+            raise ArlError(f"{eid} is {rec['status']}. Only a paused run is given up this way.")
+        n = rec["attempts"][-1]["n"]
+        _fail(rec, f"not continued: {args.reason}")
+        ledger.save_record(rec)
+        finish(ledger, f"{eid} attempt {n} given up")
+    left = ledger.cfg.max_attempts - len(rec["attempts"])
+    print(f"{eid}: attempt {n} counts as failed. Its saved state stays in artifacts/run-{n} and is not used again.")
+    if left > 0:
+        print(f"The next run starts from nothing ({left} attempt(s) left):  {ARL} exp run {eid}")
+    else:
+        print(f"That was the last attempt. Judge it:  {ARL} exp judge {eid} --verdict crash --reason \"...\"")
     return 0
 
 
@@ -835,7 +1336,7 @@ def _summary(ledger: Ledger, rec: dict[str, Any]) -> str:
         for g in comp["gate_failures"]:
             lines.append(f"  constraint not met: {g}")
         lines.append(f"  outcome: {comp['outcome']}")
-    if rec["status"] in ("judged", "abandoned"):
+    if rec["status"] in ("judged", "judging", "abandoned"):
         v = rec["verdict"]
         lines.append(f"  verdict: {v['decision']}. {v['reason']}")
     return "\n".join(lines)
@@ -844,11 +1345,20 @@ def _summary(ledger: Ledger, rec: dict[str, Any]) -> str:
 def cmd_exp_judge(args: argparse.Namespace) -> int:
     ledger = Ledger.locate()
     eid, verdict = check_id("E", args.id), args.verdict
-    with ledger.locked():
+    cut_off = ledger.record(eid)["status"] == "judging"
+    with writing(ledger):  # finishes a verdict that was cut off, this one's included
         contract.require(ledger)
+        _gate_paused(ledger)
         rec = ledger.record(eid)
+        if cut_off:
+            given = rec["verdict"]["decision"]
+            print(f"The verdict of {eid} ({given}) was recorded before and cut off. It is complete now" + (f"; '{verdict}' was not applied." if verdict and verdict != given else "."))
+            print(_summary(ledger, rec))
+            return 0
+        if verdict is None or args.reason is None:
+            raise ArlError("say what the verdict is and why: --verdict <keep|discard|finding|crash> --reason \"...\"")
         _settle(ledger, rec)
-        if rec["status"] not in ("evaluated", "crashed"):
+        if rec["status"] not in ("evaluated", "crashed", "paused"):
             raise ArlError(f"{eid} is {rec['status']}: there is nothing to judge")
         allowed = rules.allowed_verdicts(rec)
         outcome = rec.get("comparison", {}).get("outcome")
@@ -868,7 +1378,9 @@ def cmd_exp_judge(args: argparse.Namespace) -> int:
             hid, _, state = item.partition("=")
             if hid not in rec["hypotheses"] or state not in HYP_VERDICTS:
                 raise ArlError(f"--hyp takes <id>=<{'|'.join(HYP_VERDICTS)}> for a hypothesis of {eid}, got '{item}'")
-            ledger.hypothesis(hid)  # it must still be there, before anything is changed
+            meta, _ = ledger.hypothesis(hid)  # it must still be there, before anything is changed
+            if meta["status"] == "dropped" and state != "open":
+                raise ArlError(f"{hid} was dropped. Pass {hid}=open, or reopen it first with 'arl hyp set'.")
             updates[hid] = state
         if verdict == "crash" and any(state != "open" for state in updates.values()):
             raise ArlError("a crash says nothing about a hypothesis: leave --hyp out, or pass <id>=open")
@@ -887,47 +1399,44 @@ def cmd_exp_judge(args: argparse.Namespace) -> int:
                 + "\nThese edits are not part of what was measured. Copy what you want to keep somewhere else,\n"
                 + f"then put the files back: git -C {path} restore <file>"
             )
-        code_branch = rec["type"] in ("feature", "diagnose")
-        if code_branch and wgit.branch() != rec["branch"]:
+        if rec["branch"] != track["branch"] and wgit.branch() != rec["branch"]:
             raise ArlError(f"{path} is on '{wgit.branch()}', expected '{rec['branch']}'")
-        if verdict == "keep" and wgit.head() != rec["code_commit"]:
-            raise ArlError(f"{rec['branch']} moved after the run ({rec['code_commit'][:10]} was measured). Keep needs the measured commit.")
-        kept_params = _load_params(exp / "params.json") if verdict == "keep" else None
-
-        # Everything is checked: move the branch, then write.
-        moved = {"before": track["head_commit"]}
-        if code_branch:
-            wgit.switch(track["branch"])
-            if verdict == "keep":
-                wgit.fast_forward(rec["branch"])
         if verdict == "keep":
-            assert kept_params is not None
-            track["head_commit"], track["head_experiment"] = rec["code_commit"], eid
-            ledger.write_track_params(track, kept_params)
-            _track_log(ledger, track, f"{eid} kept ({rec['type']}): {rec['title']}")
-        moved["after"] = track["head_commit"]
-        rec["verdict"] = {"decision": verdict, "reason": " ".join(args.reason.split()), "at": now(), "track_head": moved}
+            if wgit.head() != rec["code_commit"]:
+                raise ArlError(f"{rec['branch']} moved after the run ({rec['code_commit'][:10]} was measured). Keep needs the measured commit.")
+            _load_params(exp / "params.json")
+
+        # Everything is checked. Write the verdict first: from here on it is decided, and
+        # the branch, the track and the hypotheses follow, now or when the next command runs.
+        rec["verdict"] = {
+            "decision": verdict,
+            "reason": args.reason,
+            "at": now(),
+            "hypotheses": updates,
+            "track_head": {"before": track["head_commit"]},
+        }
         if args.simpler:
             rec["verdict"]["simpler"] = True
-        rec["status"] = "judged"
+        for key in ("pid", "pid_start", "child"):
+            rec.pop(key, None)
+        rec["status"] = "judging"
         ledger.save_record(rec)
-        for hid, state in updates.items():
-            ledger.set_hypothesis(hid, state, f"{eid} ({verdict})")
-        finish(ledger, f"{eid} {verdict}")
+        _finish_judge(ledger, rec)
     print(_summary(ledger, rec))
     print()
-    print(render.next_text(ledger, rules.next_action(ledger)), end="")
+    print(render.next_text(ledger, rules.next_action(ledger, _data_digest_or_none(ledger))), end="")
     return 0
 
 
 def cmd_exp_abandon(args: argparse.Namespace) -> int:
     ledger = Ledger.locate()
     eid = check_id("E", args.id)
-    with ledger.locked():
+    with writing(ledger):
+        _gate_paused(ledger)
         rec = ledger.record(eid)
         _settle(ledger, rec)
         if rec["status"] != "draft" or rec["attempts"]:
-            how = f" It ran: judge it ('{ARL} exp judge {eid} --verdict crash --reason \"...\"')." if rec["status"] == "crashed" else ""
+            how = f" It ran: judge it ('{ARL} exp judge {eid} --verdict crash --reason \"...\"')." if rec["status"] in ("crashed", "paused") else ""
             raise ArlError(f"only a draft that never ran can be abandoned. {eid} is {rec['status']}.{how}")
         track = ledger.track(rec["track"])
         path, wgit = _worktree(ledger, track)
@@ -936,7 +1445,7 @@ def cmd_exp_abandon(args: argparse.Namespace) -> int:
                 raise ArlError(f"{path} has uncommitted changes. Commit them to {rec['branch']} ('{ARL} exp commit {eid} -m \"...\"') or undo them first.")
             wgit.switch(track["branch"])
         rec["status"] = "abandoned"
-        rec["verdict"] = {"decision": "abandoned", "reason": " ".join(args.reason.split()), "at": now()}
+        rec["verdict"] = {"decision": "abandoned", "reason": args.reason, "at": now()}
         ledger.save_record(rec)
         finish(ledger, f"{eid} abandoned")
     print(f"{eid} abandoned. Its branch, if any, stays in git.")
@@ -959,11 +1468,20 @@ def cmd_exp_show(args: argparse.Namespace) -> int:
         print(f"  params: {e}")
     for a in rec["attempts"]:
         took = f"run {a.get('run_seconds', 0):.0f} s" + (f", evaluation {a['eval_seconds']:.0f} s" if "eval_seconds" in a else "")
-        print(f"  attempt {a['n']}: {took}" + (f", FAILED: {a['failed']}" if a.get("failed") else ""))
+        parts = len(a.get("segments", []))
+        took += f", in {parts} parts" if parts > 1 else ""
+        state = f", FAILED: {a['failed']}" if a.get("failed") else (f", PAUSED: {a['paused']}" if a.get("paused") else "")
+        saved = f", state last saved {a['last_checkpoint'][:16]}" if a.get("last_checkpoint") else ""
+        print(f"  attempt {a['n']}: {took}{state}{saved}")
+        if a.get("warning"):
+            print(f"    note: {a['warning']}")
     name = ledger.cfg.primary.name
     for r in rec.get("reruns", []):
-        value = fmt(r["metrics"][name]) if name in r["metrics"] else "not reported"
-        print(f"  rerun on {r['split']}: {name} {value}" + (f", reproduced: {r['reproduced']}" if "reproduced" in r else ""))
+        if r.get("failed"):
+            print(f"  rerun {r['n']} on {r['split']}: FAILED: {r['failed']}")
+        else:
+            value = fmt(r["metrics"][name]) if name in r.get("metrics", {}) else "not reported"
+            print(f"  rerun {r['n']} on {r['split']}: {name} {value}" + (f", reproduced: {r['reproduced']}" if "reproduced" in r else ""))
     print(f"  files: {exp}")
     return 0
 
@@ -996,8 +1514,9 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
     ledger = Ledger.locate()
     eid = check_id("E", args.id)
     with runner.run_lock(ledger):
-        with ledger.locked():
+        with writing(ledger):
             lock = contract.require(ledger)
+            _settle_all(ledger)
             rec = ledger.record(eid)
             cfg = ledger.cfg
             if rec["type"] not in rules.SCORED or "metrics" not in rec:
@@ -1010,58 +1529,98 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
             reasons = runner.busy(cfg)
             if reasons:
                 raise ArlError("The machine is busy, not starting:\n  " + "\n  ".join(reasons), EXIT_BUSY)
-        exp = ledger.exp_dir(eid)
-        n = len(rec.get("reruns", [])) + 1
-        tree = ledger.worktree_root() / f"{cfg.name}-rerun-{eid}-{n}"
-        out, logs = exp / "artifacts" / f"rerun-{n}-{split}", exp / "logs"
-        out.mkdir(parents=True, exist_ok=True)
-        metrics_path = out / "metrics.json"
-        metrics_path.unlink(missing_ok=True)
-        values = {"params": exp / "params.json", "out": out, "split": split, "home": ledger.home, "research": ledger.dir, "exp": exp, "worktree": tree, "metrics": metrics_path}
-        env = _run_env(ledger, rec, values)
-        tree.parent.mkdir(parents=True, exist_ok=True)
-        if tree.exists():  # left by a rerun that was killed: it is arl's own throwaway tree
-            try:
-                ledger.git.remove_worktree(tree)
-            except ArlError:
-                shutil.rmtree(tree, ignore_errors=True)
-        ledger.git.prune_worktrees()
-        ledger.git.add_detached(tree, rec["code_commit"])
-        limits = {"max_rss_gb": cfg.max_run_rss_gb, "min_free_ram_gb": cfg.stop_below_free_ram_gb}
-        try:
-            command = rec.get("command") or cfg.run_command
-            res = runner.execute(runner.substitute(command, values), tree, env, cfg.run_timeout, logs / f"rerun-{n}.log", **limits)
-            if res["stopped"] or res["exit_code"] != 0:
-                why = res["stopped"] or f"exit {res['exit_code']}"
-                raise ArlError(f"the rerun failed ({why}). Log: {logs / f'rerun-{n}.log'}", EXIT_CRASH)
-            ev = runner.execute(runner.substitute(cfg.eval_command, values), ledger.home, env, cfg.eval_timeout, logs / f"rerun-eval-{n}.log", **limits)
-            if ev["stopped"] or ev["exit_code"] != 0:
-                why = ev["stopped"] or f"exit {ev['exit_code']}"
-                raise ArlError(f"the evaluator failed on the rerun ({why}). Log: {logs / f'rerun-eval-{n}.log'}", EXIT_CRASH)
-            if contract.require(ledger)["digest"] != lock["digest"]:
-                raise ArlError("the contract was frozen anew during the rerun: run it again", EXIT_CRASH)
-            metrics = runner.read_metrics(metrics_path, cfg)
-        finally:
-            ledger.git.remove_worktree(tree)
-        entry: dict[str, Any] = {
-            "n": n,
-            "at": now(),
-            "split": split,
-            "metrics": metrics,
-            "run_seconds": res["seconds"],
-            "eval_seconds": ev["seconds"],
-            "eval_digest": lock["eval_digest"],
-        }
-        primary = cfg.primary
-        if split == cfg.splits[0] and rec["contract"]["eval_digest"] == lock["eval_digest"]:
-            diff = abs(metrics[primary.name] - rec["metrics"][primary.name])
-            entry["difference"] = diff
-            entry["reproduced"] = bool(diff <= max(primary.min_delta, 1e-12))
-        with ledger.locked(wait=900):
-            rec = ledger.record(eid)
-            rec.setdefault("reruns", []).append(entry)
+            exp = ledger.exp_dir(eid)
+            n = max([r["n"] for r in rec.get("reruns", [])], default=0) + 1  # failed reruns keep their number
+            tree = ledger.worktree_root() / f"{cfg.name}-rerun-{eid}-{n}"
+            out, logs = exp / "artifacts" / f"rerun-{n}-{split}", exp / "logs"
+            if out.exists():
+                shutil.rmtree(out)  # nothing recorded owns it: a rerun starts in an empty folder
+            if tree.exists():
+                _drop_tree(ledger, tree)
+            (logs / "pause.request").unlink(missing_ok=True)  # an old request is not meant for this rerun
+            rec["rerun"] = {"n": n, "split": split, "started": now(), "pid": os.getpid(), "pid_start": runner.proc_start(os.getpid()), "tree": str(tree)}
             ledger.save_record(rec)
-            finish(ledger, f"{eid} rerun on {split}")
+
+        out.mkdir(parents=True)
+        metrics_path = out / "metrics.json"
+        values = {"params": exp / "params.json", "out": out, "split": split, "home": ledger.home, "research": ledger.dir, "exp": exp, "worktree": tree, "metrics": metrics_path}
+        env = _run_env(ledger, rec, values, resume=False)
+        limits = {"max_rss_gb": cfg.max_run_rss_gb, "min_free_ram_gb": cfg.stop_below_free_ram_gb, "pause_file": logs / "pause.request", "pause_grace": cfg.pause_grace}
+        entry: dict[str, Any] = {"n": n, "at": now(), "split": split, "eval_digest": lock["eval_digest"]}
+
+        def why(res: dict[str, Any]) -> str:
+            if res["paused"]:
+                return f"stopped: {res['paused']}. A rerun is not continued, run it again"
+            return res["stopped"] or f"exit {res['exit_code']}"
+        clock, failed, metrics = time.monotonic(), "", {}
+
+        def started(pid: int) -> None:
+            rec["rerun"]["child"] = runner.child_ref(pid)
+            ledger.save_record(rec)
+
+        try:
+            tree.parent.mkdir(parents=True, exist_ok=True)
+            ledger.git.prune_worktrees()
+            ledger.git.add_detached(tree, rec["code_commit"])
+            command = rec.get("command") or cfg.run_command
+            res = runner.execute(runner.substitute(command, values), tree, env, cfg.run_timeout, logs / f"rerun-{n}.log", on_start=started, **limits)
+            entry["run_seconds"] = res["seconds"]
+            if res["stopped"] or res["paused"] or res["exit_code"] != 0:
+                failed = f"the rerun failed ({why(res)})"
+            elif not runner.manifest(out):
+                failed = "the rerun wrote nothing into its output folder"
+            if not failed:
+                ev = runner.execute(runner.substitute(cfg.eval_command, values), ledger.home, env, cfg.eval_timeout, logs / f"rerun-eval-{n}.log", on_start=started, **limits)
+                entry["eval_seconds"] = ev["seconds"]
+                if ev["stopped"] or ev["paused"] or ev["exit_code"] != 0:
+                    failed = f"the evaluator failed on the rerun ({why(ev)})"
+                elif contract.require(ledger)["digest"] != lock["digest"]:
+                    failed = "the contract was frozen anew during the rerun"
+                else:
+                    metrics = runner.read_metrics(metrics_path, cfg)
+        except ArlError as e:
+            failed = str(e).splitlines()[0]
+        except BaseException:
+            entry.setdefault("run_seconds", round(time.monotonic() - clock, 2))
+            entry["failed"] = "interrupted"
+            rec.setdefault("reruns", []).append(entry)
+            rec.pop("rerun", None)
+            ledger.save_record(rec)
+            with contextlib.suppress(ArlError):
+                _drop_tree(ledger, tree)
+            raise
+        finally:
+            if tree.exists():
+                with contextlib.suppress(ArlError):
+                    _drop_tree(ledger, tree)
+        entry.setdefault("run_seconds", round(time.monotonic() - clock, 2))
+        primary = cfg.primary
+        if failed:
+            entry["failed"] = failed
+        else:
+            entry["metrics"] = metrics
+            if split == cfg.splits[0] and rec["contract"]["eval_digest"] == lock["eval_digest"]:
+                diff = abs(metrics[primary.name] - rec["metrics"][primary.name])
+                entry["difference"] = diff
+                entry["reproduced"] = bool(diff <= max(primary.min_delta, 1e-12))
+
+        def store() -> None:
+            now_rec = ledger.record(eid)
+            now_rec.setdefault("reruns", []).append(entry)
+            now_rec.pop("rerun", None)
+            ledger.save_record(now_rec)
+
+        try:
+            with ledger.locked(wait=900):
+                store()
+                finish(ledger, f"{eid} rerun on {split}" + (" failed" if failed else ""))
+        except ArlError as e:
+            if "rerun" in ledger.record(eid):
+                store()  # the result is kept even if it cannot be committed now
+            print(f"{eid}: the rerun is saved but could not be committed:\n  {e}", file=sys.stderr)
+    if failed:
+        print(f"{eid} rerun on split '{split}' FAILED: {failed}. Log: {logs / f'rerun-{n}.log'}")
+        return EXIT_CRASH
     print(f"{eid} rerun on split '{split}': {primary.name} = {fmt(metrics[primary.name])}")
     if "reproduced" in entry:
         print(f"  recorded {fmt(rec['metrics'][primary.name])}, difference {entry['difference']:.3g}, reproduced: {entry['reproduced']}")
@@ -1070,62 +1629,97 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
     return 0
 
 
-# --- reviews ----------------------------------------------------------------------
+# --- introspections ---------------------------------------------------------------
 
 
-def cmd_review_due(args: argparse.Namespace) -> int:
+def cmd_introspect_due(args: argparse.Namespace) -> int:
     ledger = Ledger.locate()
-    rs = rules.review_state(ledger)
+    state = rules.introspection_state(ledger)
     if args.json:
-        print(json.dumps(rs, indent=2))
-    elif rs["due"]:
-        print("A review is due:\n  " + "\n  ".join(rs["reasons"]))
+        print(json.dumps(state, indent=2))
+    elif state["due"]:
+        print("An introspection is due:\n  " + "\n  ".join(state["reasons"]))
     else:
-        print(f"No review due: {rs['judged_since']} of {ledger.cfg.review_every} experiments judged since {rs['last'] or 'the start'}.")
+        print(f"No introspection due: {state['judged_since']} of {ledger.cfg.intro_every} experiments judged since {state['last'] or 'the start'}.")
     return 0
 
 
-def cmd_review_new(args: argparse.Namespace) -> int:
+def cmd_introspect_new(args: argparse.Namespace) -> int:
     ledger = Ledger.locate()
-    with ledger.locked():
+    with writing(ledger):
         contract.require(ledger)
-        rs = rules.review_state(ledger)
-        if rs["open"] or rs["waiting"]:
-            raise ArlError(f"{rs['open'] or rs['waiting']} is not finished yet")
-        pending = [e["id"] for e in ledger.experiments() if e["status"] in ("running", "evaluated")]
+        _gate_paused(ledger)
+        state = rules.introspection_state(ledger)
+        if state["open"] or state["waiting"]:
+            raise ArlError(f"{state['open'] or state['waiting']} is not finished yet")
+        pending = [e["id"] for e in ledger.experiments() if e["status"] in ("running", "evaluated", "judging")]
         if pending:
-            raise ArlError(f"finish {', '.join(pending)} first: a review needs their verdicts")
-        rid = ledger.next_id("R")
-        trigger = one_line(args.trigger, "--trigger") if args.trigger else "; ".join(rs["reasons"]) or "asked for"
-        ledger.review_root.mkdir(parents=True, exist_ok=True)
-        meta = {"id": rid, "status": "open", "trigger": trigger, "opened": now(), "window": rs["window"]}
-        body = render.fill(render.template("review.md"), id=rid, facts=render.review_facts(ledger, trigger, rs))
-        write_front(ledger.review_root / f"{rid}.md", meta, body)
+            raise ArlError(f"finish {', '.join(pending)} first: an introspection needs their verdicts")
+        nid = ledger.next_id("N")
+        trigger = one_line(args.trigger, "--trigger") if args.trigger else "; ".join(state["reasons"]) or "asked for"
+        ledger.intro_root.mkdir(parents=True, exist_ok=True)
+        events = ledger.activity()
+        earlier = [n for n in ledger.introspections() if "activity_upto" in n]
+        activity_from = earlier[-1]["activity_upto"] if earlier else 0
+        meta = {
+            "id": nid,
+            "status": "open",
+            "trigger": trigger,
+            "opened": now(),
+            "window": state["window"],
+            "activity_upto": len(events),
+            "knowledge_sha256": ledger.knowledge_hash(),
+            "lessons_general": len(ledger.lessons("general")),
+            "lessons_project": len(ledger.lessons("project")),
+        }
+        facts = render.introspection_facts(ledger, trigger, state, activity_from)
+        write_front(ledger.intro_root / f"{nid}.md", meta, render.fill(render.template("introspection.md"), id=nid, facts=facts))
         write_text(ledger.status_path, render.status(ledger))
-    print(f"{rid} opened: {ledger.review_root / f'{rid}.md'}")
-    print("The facts are filled in. Write sections 1 to 7 with fresh eyes, below the +++ block, then:")
-    print(f"  {ARL} review close {rid} --decision <{'|'.join(DECISIONS)}>")
+    print(f"{nid} opened: {ledger.intro_root / f'{nid}.md'}")
+    print("The facts are filled in. Write its parts with fresh eyes, below the +++ block:")
+    print("  part 1, the path; part 2, lessons about the way of working ('arl lesson add');")
+    print(f"  part 3, what is now known about the problem (edit {ledger.knowledge_path}).")
+    print(f"Then:  {ARL} introspect close {nid} --decision <{'|'.join(DECISIONS)}>")
     print(f"'{ARL} next' prints the full steps.")
     return 0
 
 
-def cmd_review_close(args: argparse.Namespace) -> int:
+def cmd_introspect_close(args: argparse.Namespace) -> int:
     ledger = Ledger.locate()
-    with ledger.locked():
+    with writing(ledger):
         contract.require(ledger)  # who may decide what is in arl.toml: it has to be the frozen one
-        meta, body = ledger.review(args.id)
+        _gate_paused(ledger)
+        meta, body = ledger.introspection(args.id)
         if meta["status"] != "open":
             raise ArlError(f"{args.id} is {meta['status']}")
-        require_filled(ledger.review_path(args.id), f"review {args.id}")
-        reopening = rules.review_state(ledger)["last_decision"] == "stop" and args.decision != "stop"
+        require_filled(ledger.intro_path(args.id), f"introspection {args.id}")
+        added = len(ledger.lessons("general")) - meta.get("lessons_general", 0) + len(ledger.lessons("project")) - meta.get("lessons_project", 0)
+        if added <= 0 and not args.no_lessons:
+            raise ArlError(
+                f"Part 2 of {args.id} is not done: no lesson was recorded since it was opened.\n"
+                f"Record what deserves a standing instruction ('{ARL} lesson add --scope general|project ...'),\n"
+                "or pass --no-lessons \"why\" if this window taught nothing about the way of working."
+            )
+        same_knowledge = ledger.knowledge_hash() == meta.get("knowledge_sha256")
+        if same_knowledge and not args.knowledge_unchanged:
+            raise ArlError(
+                f"Part 3 of {args.id} is not done: {ledger.knowledge_path} is as it was when the introspection was opened.\n"
+                "Bring it up to date with what this window showed about the problem (revise and merge, do not append),\n"
+                "or pass --knowledge-unchanged \"why\" if the window showed nothing new."
+            )
+        reopening = rules.introspection_state(ledger)["last_decision"] == "stop" and args.decision != "stop"
         alone = args.decision in ledger.cfg.agent_may and not reopening
-        meta.update(status="closed" if alone else "waiting", decision=args.decision, note=" ".join((args.note or "").split()))
+        meta.update(status="closed" if alone else "waiting", decision=args.decision, note=args.note or "", lessons_added=max(added, 0), knowledge_changed=not same_knowledge)
+        if args.no_lessons:
+            meta["no_lessons"] = args.no_lessons
+        if args.knowledge_unchanged:
+            meta["knowledge_unchanged"] = args.knowledge_unchanged
         if alone:
             meta.update(closed=now(), decided_by="agent")
         else:
             meta["proposed"] = now()
-        write_front(ledger.review_path(args.id), meta, body)
-        finish(ledger, f"{args.id} review, {args.decision}" + ("" if alone else " proposed"))
+        write_front(ledger.intro_path(args.id), meta, body)
+        finish(ledger, f"{args.id} introspection, {args.decision}" + ("" if alone else " proposed"))
     if alone:
         print(f"{args.id} closed: {args.decision}.")
     elif reopening:
@@ -1133,22 +1727,21 @@ def cmd_review_close(args: argparse.Namespace) -> int:
     else:
         print(f"{args.id} proposes '{args.decision}', which the agent may not decide alone.")
     print()
-    print(render.next_text(ledger, rules.next_action(ledger)), end="")
+    print(render.next_text(ledger, rules.next_action(ledger, _data_digest_or_none(ledger))), end="")
     return 0
 
 
-def cmd_review_resolve(args: argparse.Namespace) -> int:
+def cmd_introspect_resolve(args: argparse.Namespace) -> int:
     if not interactive():
-        raise ArlError("a waiting review is resolved by a person, in a terminal")
+        raise ArlError("a waiting introspection is resolved by a person, in a terminal")
     ledger = Ledger.locate()
-    with ledger.locked():
+    with writing(ledger):
         contract.require(ledger)
-        meta, body = ledger.review(args.id)
+        meta, body = ledger.introspection(args.id)
         if meta["status"] != "waiting":
             raise ArlError(f"{args.id} is {meta['status']}, not waiting")
-        note = " ".join(args.note.split())
-        meta.update(status="closed", proposed_decision=meta["decision"], decision=args.decision, closed=now(), decided_by="person", note=note)
-        write_front(ledger.review_path(args.id), meta, body.rstrip("\n") + f"\n\n## Resolved\n\n{now()[:10]}: {args.decision}. {note}\n")
+        meta.update(status="closed", proposed_decision=meta["decision"], decision=args.decision, closed=now(), decided_by="person", note=args.note)
+        write_front(ledger.intro_path(args.id), meta, body.rstrip("\n") + f"\n\n# Resolved\n\n{now()[:10]}: {args.decision}. {args.note}\n")
         finish(ledger, f"{args.id} resolved, {args.decision}")
     print(f"{args.id} closed: {args.decision}.")
     return 0
@@ -1175,18 +1768,26 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add(sub, "next", cmd_next, "The one thing to do now, with instructions.")
     sp.add_argument("--json", action="store_true")
     add(sub, "verify", cmd_verify, "Check that ledger, contract and git agree.")
+    add(sub, "reload", cmd_reload, "Print the knowledge and the lessons as they are now. Read them.")
+    sp = add(sub, "pause", cmd_pause, "Stop the loop where it is: a run saves its state and stops, nothing new starts.")
+    sp.add_argument("--reason", help="why it is paused")
+    sp.add_argument("--note", help="where you were and what you were about to do, for whoever continues. Can be added after the pause")
+    add(sub, "resume", cmd_resume, "Continue a paused loop, when the person says so.")
+    sp = add(sub, "note", cmd_note, "Write down now what the next introspection should take up.")
+    sp.add_argument("--about", required=True, choices=["work", "problem"], help="work: a slip or waste in the way of working. problem: something seen about the problem")
+    sp.add_argument("text", nargs="+")
 
     track = sub.add_parser("track", help="Code tracks: one branch and worktree each.").add_subparsers(dest="action", required=True)
     sp = add(track, "new", cmd_track_new, "Open a track.")
     sp.add_argument("name")
     sp.add_argument("--from", dest="from_ref", help="commit or branch to start from (default: the home branch)")
-    sp.add_argument("--review", help="the latest closed review, which decided to open it")
+    sp.add_argument("--introspection", help="the latest closed introspection, which decided to open it")
     sp.add_argument("--params", help="JSON file with the track's starting params")
     sp = add(track, "set", cmd_track_set, "Park, close or reactivate a track.")
     sp.add_argument("name")
     sp.add_argument("--status", required=True, choices=["active", "parked", "closed"])
     sp.add_argument("--note", required=True)
-    sp.add_argument("--review", help="the latest closed review, which decided it")
+    sp.add_argument("--introspection", help="the latest closed introspection, which decided it")
     sp = add(track, "sync", cmd_track_sync, "Record that a track branch was changed by hand.")
     sp.add_argument("name")
     sp.add_argument("--note", required=True)
@@ -1197,7 +1798,7 @@ def build_parser() -> argparse.ArgumentParser:
     hyp = sub.add_parser("hyp", help="Hypotheses: claims, separate from the experiments that test them.").add_subparsers(dest="action", required=True)
     sp = add(hyp, "new", cmd_hyp_new, "Start a hypothesis file.")
     sp.add_argument("--title", required=True)
-    sp.add_argument("--from", dest="source", help="where it comes from (an experiment, an idea, a review)")
+    sp.add_argument("--from", dest="source", help="where it comes from (an experiment, an idea, an introspection)")
     sp = add(hyp, "set", cmd_hyp_set, "Change a hypothesis's status.")
     sp.add_argument("id")
     sp.add_argument("--status", required=True, choices=HYP_STATES)
@@ -1205,7 +1806,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add(hyp, "list", cmd_hyp_list, "List hypotheses.")
     sp.add_argument("--status", choices=HYP_STATES)
 
-    idea = sub.add_parser("idea", help="IDEAS.md: what could change the path, read at every review.").add_subparsers(dest="action", required=True)
+    idea = sub.add_parser("idea", help="IDEAS.md: what could change the path, read at every introspection.").add_subparsers(dest="action", required=True)
     sp = add(idea, "add", cmd_idea_add, "Write an idea down.")
     sp.add_argument("--title", required=True)
     sp.add_argument("--body", required=True, help="what it is, why it could matter, the cheapest test")
@@ -1218,6 +1819,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add(idea, "list", cmd_idea_list, "List ideas.")
     sp.add_argument("--status", choices=IDEA_STATES)
 
+    lesson = sub.add_parser("lesson", help="Lessons about the way of working, kept in the instructions agents load.").add_subparsers(dest="action", required=True)
+    sp = add(lesson, "add", cmd_lesson_add, "Record a lesson.")
+    sp.add_argument("--scope", required=True, choices=SCOPES, help="general: any project that uses arl. project: only this one")
+    sp.add_argument("--title", required=True, help="the instruction, in a few words")
+    sp.add_argument("--body", required=True, help="what happened, and what to do instead")
+    sp.add_argument("--from", dest="source", help="the introspection or experiment it comes from")
+    sp = add(lesson, "list", cmd_lesson_list, "List lessons.")
+    sp.add_argument("--scope", choices=SCOPES)
+
     exp = sub.add_parser("exp", help="Experiments: design, run, judge.").add_subparsers(dest="action", required=True)
     sp = add(exp, "new", cmd_exp_new, "Draft an experiment.")
     sp.add_argument("--type", required=True, choices=rules.TYPES)
@@ -1228,13 +1838,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add(exp, "commit", cmd_exp_commit, "Commit the code of a feature or diagnose experiment.")
     sp.add_argument("id")
     sp.add_argument("-m", "--message", required=True)
-    sp = add(exp, "run", cmd_exp_run, "Lock the design, run, evaluate.")
+    sp = add(exp, "run", cmd_exp_run, "Lock the design, run, evaluate. Continues a run that was paused.")
     sp.add_argument("id")
     sp.add_argument("--allow-duplicate", metavar="WHY", help="repeat a known result on purpose")
+    sp = add(exp, "pause", cmd_exp_pause, "Ask the run that is going to save its state and stop.")
+    sp.add_argument("id", nargs="?")
+    sp = add(exp, "fail", cmd_exp_fail, "Give up a paused run: the attempt counts as failed, the next run starts from nothing.")
+    sp.add_argument("id")
+    sp.add_argument("--reason", required=True)
     sp = add(exp, "judge", cmd_exp_judge, "Record the verdict.")
     sp.add_argument("id")
-    sp.add_argument("--verdict", required=True, choices=["keep", "discard", "finding", "crash"])
-    sp.add_argument("--reason", required=True)
+    sp.add_argument("--verdict", choices=["keep", "discard", "finding", "crash"])
+    sp.add_argument("--reason")
     sp.add_argument("--hyp", action="append", metavar="ID=STATE", help="what the run did to a hypothesis (repeatable)")
     sp.add_argument("--simpler", action="store_true", help="keep a neutral result because it simplifies")
     sp = add(exp, "abandon", cmd_exp_abandon, "Drop a draft that never ran.")
@@ -1254,30 +1869,36 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("id")
     sp.add_argument("--split", help="score on another split named in arl.toml")
 
-    review = sub.add_parser("review", help="The periodic reconsideration of the path.").add_subparsers(dest="action", required=True)
-    sp = add(review, "due", cmd_review_due, "Is a review due, and why.")
+    intro = sub.add_parser("introspect", help="The periodic introspection: the path, the way of working, what is known.").add_subparsers(dest="action", required=True)
+    sp = add(intro, "due", cmd_introspect_due, "Is an introspection due, and why.")
     sp.add_argument("--json", action="store_true")
-    sp = add(review, "new", cmd_review_new, "Open a review with the facts filled in.")
+    sp = add(intro, "new", cmd_introspect_new, "Open an introspection with the facts filled in.")
     sp.add_argument("--trigger", help="why now, when it is not one of the counters")
-    sp = add(review, "close", cmd_review_close, "Record the decision.")
+    sp = add(intro, "close", cmd_introspect_close, "Record the decision, once all parts are done.")
     sp.add_argument("id")
     sp.add_argument("--decision", required=True, choices=DECISIONS)
     sp.add_argument("--note")
-    sp = add(review, "resolve", cmd_review_resolve, "A person decides a waiting review (terminal only).")
+    sp.add_argument("--no-lessons", metavar="WHY", help="part 2 found nothing worth a standing instruction")
+    sp.add_argument("--knowledge-unchanged", metavar="WHY", help="part 3 found nothing new about the problem")
+    sp = add(intro, "resolve", cmd_introspect_resolve, "A person decides a waiting introspection (terminal only).")
     sp.add_argument("id")
     sp.add_argument("--decision", required=True, choices=DECISIONS)
     sp.add_argument("--note", required=True)
     return p
 
 
+_ONE_LINE = ("title", "reason", "note", "trigger", "no_lessons", "knowledge_unchanged", "allow_duplicate", "message", "source")
+
+
 def _clean(args: argparse.Namespace) -> None:
-    """Everything typed has to be text that can be stored; a title is one line."""
+    """Everything typed has to be text that can be stored. What is one line is made one line,
+    and what was asked for cannot be blank."""
     for name, value in vars(args).items():
         for item in value if isinstance(value, list) else [value]:
             if isinstance(item, str):
                 check_text(item, f"--{name.replace('_', '-')}")
-    if isinstance(getattr(args, "title", None), str):
-        args.title = one_line(args.title, "the title")
+        if name in _ONE_LINE and isinstance(value, str):
+            setattr(args, name, one_line(value, f"--{name.replace('_', '-')}"))
 
 
 def _on_signal(signum: int, frame: Any) -> None:
@@ -1285,9 +1906,10 @@ def _on_signal(signum: int, frame: Any) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(argv)
     try:
-        # Asked to stop in any of these ways, a run takes its job down with it.
+        # Asked to stop in any of these ways, a run saves its state and takes its job down with it.
         for sig in (signal.SIGTERM, signal.SIGHUP):
             signal.signal(sig, _on_signal)
     except ValueError:
@@ -1297,6 +1919,11 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args) or 0
     except ArlError as e:
         print(f"arl: {e}", file=sys.stderr)
+        if e.code != EXIT_BUSY:
+            with contextlib.suppress(Exception):  # what was refused is material for the next introspection
+                ledger = Ledger.locate()
+                if ledger.exists():
+                    ledger.log_activity("refused", str(e), command=" ".join(argv))
         return e.code
     except KeyboardInterrupt:
         print("arl: interrupted", file=sys.stderr)

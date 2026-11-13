@@ -6,4 +6,5 @@ Write up {target}. It was an observation: nothing is scored and nothing is merge
    come from, and where it differs from what you expected.
 3. Record it:
      {arl} exp judge {target} --verdict finding --reason "<the answer in one sentence>"
-4. Turn the answer into the next hypothesis (`{arl} hyp new`) or an idea (`{arl} idea add`).
+4. Turn the answer into the next hypothesis (`{arl} hyp new`) or an idea (`{arl} idea add`),
+   and note what it shows about the problem:  {arl} note --about problem "..."

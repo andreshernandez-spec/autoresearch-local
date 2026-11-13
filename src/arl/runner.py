@@ -1,4 +1,10 @@
-"""Run a command with a time limit and write down the conditions it ran under."""
+"""Run a job with limits, stop it cleanly, and write down the conditions it ran under.
+
+A job runs in a session of its own, so that everything it starts can be found
+and stopped together, whatever process groups it makes. A job is stopped by
+asking first (SIGTERM, so it can save its state) and forcing after a grace
+period.
+"""
 
 from __future__ import annotations
 
@@ -23,9 +29,10 @@ from typing import Any, Callable, Generator
 
 from .config import Config
 from .ledger import Ledger
-from .util import EXIT_BUSY, ArlError, read_json, sha256_file, sha256_text, write_json
+from .util import EXIT_BUSY, ArlError, canonical, read_json, read_text, sha256_file, sha256_text, write_json
 
 _PLACEHOLDER = re.compile(r"\{(params|out|metrics|split|home|research|exp|worktree)\}")
+QUICK_GRACE = 10.0  # seconds a job gets to end when it is stopped for a limit
 
 
 def substitute(template: str, values: dict[str, Any]) -> str:
@@ -114,21 +121,7 @@ def run_lock(ledger: Ledger) -> Generator[None, None, None]:
             f.truncate()
 
 
-# --- running ----------------------------------------------------------------------
-
-
-def _stop(proc: subprocess.Popen) -> None:
-    """End the whole process group: ask, then force."""
-    for sig, wait in ((signal.SIGTERM, 10), (signal.SIGKILL, 10)):
-        try:
-            os.killpg(proc.pid, sig)
-        except (ProcessLookupError, PermissionError):
-            pass
-        try:
-            proc.wait(timeout=wait)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+# --- processes ----------------------------------------------------------------------
 
 
 def _stat_fields(pid: int | str) -> list[str] | None:
@@ -140,52 +133,12 @@ def _stat_fields(pid: int | str) -> list[str] | None:
         return None
 
 
-def session_pids(sid: int) -> list[int]:
-    """Every process of the session a run started (each run starts its own)."""
+def boot_id() -> str:
+    """Changes with every start of the machine: pids from before it mean nothing."""
     try:
-        entries = [e.name for e in os.scandir("/proc") if e.name.isdigit()]
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     except OSError:
-        return []
-    out = []
-    for pid in entries:
-        fields = _stat_fields(pid)
-        try:
-            if fields and int(fields[3]) == sid:
-                out.append(int(pid))
-        except (ValueError, IndexError):
-            continue
-    return out
-
-
-def _session_rss_gb(sid: int) -> float:
-    """Resident memory of every process in the run's session."""
-    page, total = os.sysconf("SC_PAGE_SIZE"), 0
-    for pid in session_pids(sid):
-        fields = _stat_fields(pid)
-        try:
-            total += int(fields[21]) * page if fields else 0
-        except (ValueError, IndexError):
-            continue
-    return total / 1024**3
-
-
-def stop_session(sid: int, patience: float = 10.0) -> bool:
-    """Stop what is left of a run whose arl died: ask, then force. True if anything was alive."""
-    found = False
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        pids = session_pids(sid)
-        if not pids:
-            return found
-        found = True
-        for pid in pids:
-            try:
-                os.kill(pid, sig)
-            except (ProcessLookupError, PermissionError):
-                pass
-        end = time.monotonic() + patience
-        while time.monotonic() < end and session_pids(sid):
-            time.sleep(0.1)
-    return found
+        return ""
 
 
 def proc_start(pid: int | None) -> int | None:
@@ -205,6 +158,94 @@ def alive(pid: int | None, start: int | None = None) -> bool:
     return start is None or now_start == start
 
 
+def session_pids(sid: int) -> list[int]:
+    """Every process of the session a job started, whatever its process group."""
+    try:
+        entries = [e.name for e in os.scandir("/proc") if e.name.isdigit()]
+    except OSError:
+        return []
+    out = []
+    for pid in entries:
+        fields = _stat_fields(pid)
+        try:
+            if fields and int(fields[3]) == sid and fields[0] != "Z":
+                out.append(int(pid))
+        except (ValueError, IndexError):
+            continue
+    return out
+
+
+def _memory_kb(pid: int) -> int:
+    """Memory a process holds, shared pages counted once across those that share them."""
+    try:
+        for line in Path(f"/proc/{pid}/smaps_rollup").read_text().splitlines():
+            if line.startswith("Pss:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    fields = _stat_fields(pid)  # no smaps_rollup: fall back to the resident size
+    try:
+        return int(fields[21]) * os.sysconf("SC_PAGE_SIZE") // 1024 if fields else 0
+    except (ValueError, IndexError):
+        return 0
+
+
+def _session_memory_gb(sid: int) -> float:
+    return sum(_memory_kb(pid) for pid in session_pids(sid)) / 1024**2
+
+
+def child_ref(pid: int) -> dict[str, Any]:
+    """What it takes to find a job again later and be sure it is the same one."""
+    return {"sid": pid, "start": proc_start(pid), "boot": boot_id()}
+
+
+def session_of(ref: dict[str, Any] | None) -> int | None:
+    """The session id of a recorded job if it can still be the same job, else None."""
+    if not ref or ref.get("boot") != boot_id():
+        return None  # the machine restarted: the job died with it
+    sid = ref.get("sid")
+    start = proc_start(sid)
+    if start is not None and start != ref.get("start"):
+        return None  # the number was given to another process, so the old session is gone
+    return sid
+
+
+def stop_session(sid: int, grace: float = QUICK_GRACE) -> bool:
+    """Stop every process of a session: ask, wait, then force. True if anything was alive.
+
+    Signals that would interrupt arl itself are held off while this runs, so a
+    second Ctrl-C or a hangup cannot leave the job half stopped.
+    """
+    held = {}
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            held[sig] = signal.signal(sig, signal.SIG_IGN)
+    except ValueError:
+        pass  # not the main thread
+    try:
+        found = False
+        for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, QUICK_GRACE)):
+            pids = session_pids(sid)
+            if not pids:
+                return found
+            found = True
+            for pid in pids:
+                try:
+                    os.kill(pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            end = time.monotonic() + wait
+            while time.monotonic() < end and session_pids(sid):
+                time.sleep(0.1)
+        return found
+    finally:
+        for sig, handler in held.items():
+            signal.signal(sig, handler)
+
+
+# --- running ----------------------------------------------------------------------
+
+
 def execute(
     command: str,
     cwd: Path,
@@ -214,16 +255,20 @@ def execute(
     max_rss_gb: float | None = None,
     min_free_ram_gb: float | None = None,
     on_start: Callable[[int], None] | None = None,
+    pause_file: Path | None = None,
+    pause_grace: float = QUICK_GRACE,
 ) -> dict[str, Any]:
-    """Run through bash in its own session, output to a file.
+    """Run through bash in a session of its own, output to a file.
 
-    The run is stopped, whole process group, when it passes its time limit,
-    when its processes hold more memory than allowed, or when the machine runs
-    low on memory. "stopped" then says why.
+    Returns exit_code, seconds and two texts of which at most one is set:
+    "stopped" when a limit ended the job (its time, its memory), and "paused"
+    when it was asked to save and stop (a pause request, the machine running
+    low on memory, or arl itself being interrupted). A paused job can be
+    continued later; a stopped one failed.
     """
     log.parent.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
-    stopped = ""
+    stopped = paused = ""
     with open(log, "ab") as f:
         f.write(f"$ cd {cwd} && {command}\n".encode())
         f.flush()
@@ -238,26 +283,47 @@ def execute(
         )
         try:
             if on_start:
-                on_start(proc.pid)  # the session id of everything the run starts
+                on_start(proc.pid)  # the session id of everything the job starts
+            ticks = 0
             while True:
                 try:
                     proc.wait(timeout=1.0)
                     break
                 except subprocess.TimeoutExpired:
                     pass
+                ticks += 1
                 if time.monotonic() - start > timeout:
                     stopped = f"it passed its limit of {timeout:.0f} s"
-                elif max_rss_gb is not None and (held := _session_rss_gb(proc.pid)) > max_rss_gb:
+                elif pause_file is not None and pause_file.exists():
+                    paused = "a pause was asked for"
+                elif ticks % 2 == 0 and max_rss_gb is not None and (held := _session_memory_gb(proc.pid)) > max_rss_gb:
                     stopped = f"its processes held {held:.1f} GB of RAM, the limit is {max_rss_gb}"
                 elif min_free_ram_gb is not None and (free := _mem_available_gb()) is not None and free < min_free_ram_gb:
-                    stopped = f"the machine was down to {free:.1f} GB of free RAM, the floor is {min_free_ram_gb}"
-                if stopped:
-                    _stop(proc)
+                    paused = f"the machine was down to {free:.1f} GB of free RAM, the floor is {min_free_ram_gb}"
+                if stopped or paused:
+                    stop_session(proc.pid, pause_grace if paused else QUICK_GRACE)
+                    proc.wait()
                     break
         except BaseException:
-            _stop(proc)  # interrupted: do not leave the job running behind us
+            # arl itself is being stopped: give the job the time to save, and take it down.
+            stop_session(proc.pid, pause_grace)
+            proc.wait()
             raise
-    return {"exit_code": proc.returncode, "seconds": round(time.monotonic() - start, 2), "stopped": stopped}
+        finally:
+            if pause_file is not None:
+                pause_file.unlink(missing_ok=True)
+        if not (stopped or paused) and session_pids(proc.pid):
+            stop_session(proc.pid)  # the job ended and left something running: nothing outlives a run
+    return {"exit_code": proc.returncode, "seconds": round(time.monotonic() - start, 2), "stopped": stopped, "paused": paused}
+
+
+def last_checkpoint(out: Path) -> float | None:
+    """When the job last wrote into {out}/checkpoint, as a time stamp."""
+    folder = out / "checkpoint"
+    if not folder.is_dir():
+        return None
+    times = [p.stat().st_mtime for p in folder.rglob("*") if p.is_file()]
+    return max(times) if times else None
 
 
 def tail(path: Path, lines: int = 120, max_bytes: int = 48_000) -> str:
@@ -304,7 +370,10 @@ def data_fingerprint(ledger: Ledger) -> list[dict[str, Any]]:
     if not patterns:
         return []
     cache_path = ledger.cache_root / "hashes.json"
-    cache = read_json(cache_path) if cache_path.exists() else {}
+    try:
+        cache = read_json(cache_path) if cache_path.exists() else {}
+    except (ArlError, json.JSONDecodeError):
+        cache = {}
     out = []
     for pattern in patterns:
         expanded = os.path.expanduser(pattern)
@@ -325,6 +394,11 @@ def data_fingerprint(ledger: Ledger) -> list[dict[str, Any]]:
     ledger.cache_root.mkdir(parents=True, exist_ok=True)
     write_json(cache_path, cache)
     return out
+
+
+def data_digest(fingerprint: list[dict[str, Any]]) -> str:
+    """One hash for the data a run read. Results are compared only on the same data."""
+    return sha256_text(canonical([(d["path"], d["sha256"]) for d in fingerprint]))
 
 
 def manifest(out_dir: Path, hash_up_to: int = 1 << 31) -> list[dict[str, Any]]:
@@ -348,6 +422,8 @@ def keep_small(out_dir: Path, kept_dir: Path, patterns: list[str], max_kb: int) 
         if not path.is_file() or path.stat().st_size > max_kb * 1024:
             continue
         rel = path.relative_to(out_dir).as_posix()
+        if rel.startswith("checkpoint/"):
+            continue  # saved state is for continuing a run, not a result
         if any(fnmatch.fnmatch(path.name, p) or fnmatch.fnmatch(rel, p) for p in patterns):
             target = kept_dir / rel
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -357,11 +433,14 @@ def keep_small(out_dir: Path, kept_dir: Path, patterns: list[str], max_kb: int) 
 
 
 def read_metrics(path: Path, cfg: Config) -> dict[str, float]:
-    """The evaluator's numbers. A missing or non-finite metric is a failed evaluation."""
+    """The evaluator's numbers. A missing or non-finite metric is a failed evaluation.
+
+    Other numbers the evaluator reports are kept when they are finite.
+    """
     if not path.exists():
         raise ArlError(f"the evaluator wrote no metrics file ({path})")
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(read_text(path))
     except json.JSONDecodeError as e:
         raise ArlError(f"the evaluator's metrics file is not JSON: {e}") from e
     if not isinstance(data, dict):
@@ -372,4 +451,4 @@ def read_metrics(path: Path, cfg: Config) -> dict[str, float]:
             raise ArlError(f"the evaluator did not report '{m.name}'")
         if not math.isfinite(numbers[m.name]):
             raise ArlError(f"the evaluator reported {m.name} = {numbers[m.name]}")
-    return {k: float(v) for k, v in numbers.items()}
+    return {k: float(v) for k, v in numbers.items() if math.isfinite(v)}

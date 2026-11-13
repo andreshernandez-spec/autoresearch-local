@@ -1,5 +1,5 @@
 """The mechanical decisions: how a result compares, which verdicts it allows,
-when a review is due, when the budget is spent, and what comes next."""
+when an introspection is due, when the budget is spent, and what comes next."""
 
 from __future__ import annotations
 
@@ -13,7 +13,10 @@ from .util import now, parse_time
 
 SCORED = ("baseline", "tune", "feature")
 TYPES = (*SCORED, "diagnose")
-IN_FLIGHT = ("draft", "running", "evaluated", "crashed")
+# draft: written, not run. running: a job is going. paused: a run was interrupted
+# and can be continued. evaluated: has a result. judging: a verdict is being
+# applied. crashed: a run failed.
+IN_FLIGHT = ("draft", "running", "paused", "evaluated", "crashed", "judging")
 
 
 # --- comparing a result -------------------------------------------------------------
@@ -38,10 +41,12 @@ def gate_failures(cfg: Config, metrics: dict[str, float], reference: dict[str, f
     return fails
 
 
-def compare(cfg: Config, metrics: dict[str, float], reference: dict[str, Any] | None) -> dict[str, Any]:
+def compare(cfg: Config, metrics: dict[str, float], reference: dict[str, Any] | None, repeat: bool = False) -> dict[str, Any]:
     """Outcome of a scored run against the track's reference experiment.
 
-    With a reference: improve, neutral, worse or gate_fail. Without one, this run is the reference.
+    No reference: this run is the reference. A baseline on a track that has one
+    is a repeat: it shows the noise and never replaces the reference. Otherwise
+    improve, neutral, worse or gate_fail.
     """
     primary = cfg.primary
     value = metrics[primary.name]
@@ -65,7 +70,10 @@ def compare(cfg: Config, metrics: dict[str, float], reference: dict[str, Any] | 
         min_delta=primary.min_delta,
     )
     ref_failed = bool(reference.get("comparison", {}).get("gate_failures"))
-    if fails:
+    if repeat:
+        out["outcome"] = "repeat"
+        out["target_met"] = False
+    elif fails:
         out["outcome"] = "gate_fail"
     elif ref_failed:
         out["outcome"] = "improve"  # inside the constraints beats outside them
@@ -80,11 +88,15 @@ def compare(cfg: Config, metrics: dict[str, float], reference: dict[str, Any] | 
 
 def allowed_verdicts(rec: dict[str, Any]) -> list[str]:
     """What the agent may decide. The first entry is the default."""
-    if rec["status"] == "crashed":
+    if rec["status"] in ("crashed", "paused"):
         return ["crash"]
+    if rec["status"] != "evaluated":
+        return []
     if rec["type"] == "diagnose":
         return ["finding"]
     outcome = rec.get("comparison", {}).get("outcome")
+    if outcome == "repeat":
+        return ["finding"]  # a measurement of the noise, not a new reference
     if outcome == "reference":
         return ["keep", "discard"]
     if outcome == "improve":
@@ -97,13 +109,16 @@ def allowed_verdicts(rec: dict[str, Any]) -> list[str]:
 # --- tracks -----------------------------------------------------------------------
 
 
-def reference_for(ledger: Ledger, track: dict[str, Any], eval_digest: str) -> dict[str, Any] | None:
-    """The experiment that measured the track head under the current evaluator."""
+def reference_for(ledger: Ledger, track: dict[str, Any], eval_digest: str, data: str | None = None) -> dict[str, Any] | None:
+    """The experiment that measured the track head under the current evaluator, on the current data."""
     eid = track.get("head_experiment")
     if not eid:
         return None
     rec = ledger.record(eid)
     if rec.get("contract", {}).get("eval_digest") != eval_digest:
+        return None
+    measured_on = rec.get("conditions", {}).get("data_digest")
+    if data is not None and measured_on is not None and measured_on != data:
         return None
     return rec
 
@@ -129,6 +144,7 @@ def stale(rec: dict[str, Any]) -> bool:
 
 
 def budget(ledger: Ledger) -> dict[str, Any]:
+    """Experiments that ran, and the hours of every run: failed ones, interrupted ones, reruns."""
     cfg = ledger.cfg
     exps = ledger.experiments()
     ran = [e for e in exps if e.get("attempts")]
@@ -140,7 +156,7 @@ def budget(ledger: Ledger) -> dict[str, Any]:
     if count_spent:
         reasons.append(f"{len(ran)} experiments run, the budget is {cfg.max_experiments}")
     if hours_spent:
-        reasons.append(f"{hours:.1f} run hours used, the budget is {cfg.max_run_hours}")
+        reasons.append(f"{hours:.2f} run hours used, the budget is {cfg.max_run_hours}")
     return {
         "experiments": len(ran),
         "max_experiments": cfg.max_experiments,
@@ -163,23 +179,24 @@ def target_met(ledger: Ledger) -> dict[str, Any] | None:
     return None
 
 
-# --- reviews ----------------------------------------------------------------------
+# --- introspections ---------------------------------------------------------------
 
 
-def review_state(ledger: Ledger) -> dict[str, Any]:
-    """Whether the periodic reconsideration is due, and why.
+def introspection_state(ledger: Ledger) -> dict[str, Any]:
+    """Whether the periodic introspection is due, and why.
 
-    An experiment belongs to the review that listed it when it was opened. The
-    ones no closed review has listed are "since the last review", whatever the
-    clock says: two things in the same second cannot fall between reviews.
+    An experiment belongs to the introspection that listed it when it was
+    opened. The ones no closed introspection has listed are "since the last
+    one", whatever the clock says: two things in the same second cannot fall
+    between two introspections.
     """
     cfg = ledger.cfg
-    reviews = ledger.reviews()
-    waiting = next((r for r in reviews if r["status"] == "waiting"), None)
-    opened = next((r for r in reviews if r["status"] == "open"), None)
-    closed = [r for r in reviews if r["status"] == "closed"]
+    all_ = ledger.introspections()
+    waiting = next((n for n in all_ if n["status"] == "waiting"), None)
+    opened = next((n for n in all_ if n["status"] == "open"), None)
+    closed = [n for n in all_ if n["status"] == "closed"]
     last = closed[-1] if closed else None
-    covered = {eid for r in closed for eid in r.get("window", [])}
+    covered = {eid for n in closed for eid in n.get("window", [])}
 
     exps = ledger.experiments()
     recent = [e for e in exps if e["status"] == "judged" and e["id"] not in covered]
@@ -190,24 +207,25 @@ def review_state(ledger: Ledger) -> dict[str, Any]:
         reasons.append(f"{waiting['id']} waits for a person to decide")
     if opened:
         reasons.append(f"{opened['id']} is open")
-    if len(recent) >= cfg.review_every:
+    if len(recent) >= cfg.intro_every:
         start = last["id"] if last else "the start"
-        reasons.append(f"{len(recent)} experiments judged since {start}, a review is due every {cfg.review_every}")
+        reasons.append(f"{len(recent)} experiments judged since {start}, an introspection is due every {cfg.intro_every}")
     stagnant = {}
-    for track in ledger.tracks():  # parked ones too: parking a stalled track does not skip the review
+    for track in ledger.tracks():  # parked ones too: parking a stalled track does not skip the introspection
         run = 0
         for e in recent:
             if e["track"] != track["name"] or e["type"] not in ("tune", "feature"):
                 continue
             run = 0 if e["verdict"]["decision"] == "keep" else run + 1
         stagnant[track["name"]] = run
-        if run >= cfg.review_stagnation:
+        if run >= cfg.intro_stagnation:
             reasons.append(f"track {track['name']}: {run} scored experiments in a row without a keep")
-    if cfg.review_max_days is not None and recent:
+    if cfg.intro_max_days is not None and recent:
         anchor = parse_time(last["closed"]) if last else parse_time(min(e["created"] for e in exps))
         days = (parse_time(now()) - anchor).total_seconds() / 86400
-        if days > cfg.review_max_days:
-            reasons.append(f"{days:.1f} days since the last review, the limit is {cfg.review_max_days}")
+        if days > cfg.intro_max_days:
+            since = f"{last['id']}" if last else "the first experiment"
+            reasons.append(f"{days:.1f} days since {since}, the limit is {cfg.intro_max_days}")
     return {
         "due": bool(reasons),
         "reasons": reasons,
@@ -215,6 +233,7 @@ def review_state(ledger: Ledger) -> dict[str, Any]:
         "waiting": waiting["id"] if waiting else None,
         "last": last["id"] if last else None,
         "last_decision": last.get("decision") if last else None,
+        "reload": last["id"] if last and not last.get("reloaded") else None,
         "judged_since": len(recent),
         "window": [e["id"] for e in recent],
         "stagnant": stagnant,
@@ -224,32 +243,48 @@ def review_state(ledger: Ledger) -> dict[str, Any]:
 # --- what comes next --------------------------------------------------------------
 
 
-def next_action(ledger: Ledger) -> dict[str, Any]:
-    """The one thing to do now. Unfinished work first, then the gates, then new work."""
+def next_action(ledger: Ledger, data: str | None = None) -> dict[str, Any]:
+    """The one thing to do now.
+
+    A person's word first (the contract, a pause, a decision that waits for
+    them), then work that is unfinished, then the gates, then new work.
+    data: the digest of the data files, when the caller has it at hand.
+    """
     if not ledger.exists():
         return {"stage": "setup", "why": f"no {ledger.name}/arl.toml in {ledger.home}"}
+    lock = contract.load(ledger)
+    exps = ledger.experiments()
+    if lock is None:
+        if exps:  # experiments but no lock: not a new project, something removed the lock
+            return {"stage": "contract", "why": f"missing: {ledger.name}/frozen.lock, although experiments exist", "stop": True}
+        return {"stage": "freeze", "why": "the contract is not frozen yet"}
     bad = contract.problems(ledger)
     if bad:
-        stage = "freeze" if contract.load(ledger) is None else "contract"
-        return {"stage": stage, "why": "; ".join(bad), "stop": stage == "contract"}
-    lock = contract.load(ledger)
-    assert lock is not None
+        return {"stage": "contract", "why": "; ".join(bad), "stop": True}
     cfg = ledger.cfg
-    rs = review_state(ledger)
-    if rs["waiting"]:
-        return {"stage": "wait", "target": rs["waiting"], "why": rs["reasons"][0], "stop": True}
+    paused = ledger.paused()
+    if paused is not None:
+        why = f"paused {str(paused.get('at', ''))[:16]} by {paused.get('by', 'someone')}: {paused.get('reason') or 'no reason given'}"
+        return {"stage": "paused", "why": why, "stop": True}
+    state = introspection_state(ledger)
+    if state["waiting"]:
+        return {"stage": "wait", "target": state["waiting"], "why": state["reasons"][0], "stop": True}
 
-    exps = ledger.experiments()
     tracks = {t["name"]: t for t in ledger.tracks()}
 
     def no_reference(e: dict[str, Any]) -> bool:
-        return e["type"] in ("tune", "feature") and reference_for(ledger, tracks[e["track"]], lock["eval_digest"]) is None
+        if e["type"] not in ("tune", "feature") or e["track"] not in tracks:
+            return False
+        return reference_for(ledger, tracks[e["track"]], lock["eval_digest"], data) is None
 
+    for e in exps:
+        if e["status"] == "judging":
+            return {"stage": "unfinished", "target": e["id"], "why": f"the verdict of {e['id']} was cut off before it was complete"}
     for e in exps:
         if e["status"] == "running":
             if not stale(e):
                 return {"stage": "running", "target": e["id"], "why": f"{e['id']} is running (pid {e.get('pid')})"}
-            return {"stage": "interrupted", "target": e["id"], "why": f"the run of {e['id']} died without a result"}
+            return {"stage": "interrupted", "target": e["id"], "why": f"the run of {e['id']} ended without a result"}
     for e in exps:
         if e["status"] == "evaluated":
             return {"stage": "judge", "target": e["id"], "why": f"{e['id']} has a result and no verdict"}
@@ -262,33 +297,44 @@ def next_action(ledger: Ledger) -> dict[str, Any]:
             elif no_reference(e):
                 why += f" and track {e['track']} has no reference any more: judge it as a crash"
             return {"stage": "crashed", "target": e["id"], "why": why}
-    if rs["open"]:
-        return {"stage": "review", "target": rs["open"], "why": f"{rs['open']} is open"}
-    if rs["last_decision"] == "stop":
-        return {"stage": "stopped", "target": rs["last"], "why": f"{rs['last']} decided to stop", "stop": True}
+    if state["open"]:
+        return {"stage": "introspect", "target": state["open"], "why": f"{state['open']} is open"}
+    if state["last_decision"] == "stop":
+        return {"stage": "stopped", "target": state["last"], "why": f"{state['last']} decided to stop", "stop": True}
+    if state["reload"]:
+        return {"stage": "reload", "target": state["reload"], "why": f"{state['reload']} is closed and what it changed has not been read again"}
+    changed = ledger.changed_since_reload()
+    if changed:
+        return {"stage": "reload", "why": f"{', '.join(changed)} changed since the last reload"}
     hit = target_met(ledger)
     if hit:
         return {"stage": "target", "target": hit["id"], "why": f"{hit['id']} reached the target", "stop": True}
-    spent = budget(ledger)["spent"]
-    if spent:
-        return {"stage": "budget", "why": "; ".join(spent), "stop": True}
+    spent = budget(ledger)
+    for e in exps:
+        if e["status"] == "paused":
+            if spent["hours_spent"]:
+                break
+            how = (e.get("attempts") or [{}])[-1].get("paused", "it was interrupted")
+            return {"stage": "resume", "target": e["id"], "why": how}
+    if spent["spent"]:
+        return {"stage": "budget", "why": "; ".join(spent["spent"]), "stop": True}
     for e in exps:
         if e["status"] == "draft":
             if no_reference(e):
-                why = f"{e['id']} was drafted against a reference that no longer counts under contract v{lock['version']}"
+                why = f"{e['id']} was drafted against a reference that no longer counts"
                 return {"stage": "outdated", "target": e["id"], "why": why}
             return {"stage": "design", "target": e["id"], "why": f"{e['id']} is drafted and has not run"}
-    if rs["due"]:
-        return {"stage": "review", "why": "; ".join(rs["reasons"])}
+    if state["due"]:
+        return {"stage": "introspect", "why": "; ".join(state["reasons"])}
 
     active = [t for t in tracks.values() if t["status"] == "active"]
     if not active:
         return {"stage": "track", "why": "no active track"}
     for t in active:
-        if reference_for(ledger, t, lock["eval_digest"]) is None:
+        if reference_for(ledger, t, lock["eval_digest"], data) is None:
             return {
                 "stage": "baseline",
                 "target": t["name"],
-                "why": f"track {t['name']} has no reference under contract v{lock['version']}",
+                "why": f"track {t['name']} has no reference under contract v{lock['version']} and the data as it is",
             }
     return {"stage": "hypothesize", "why": "nothing in flight, no gate closed"}

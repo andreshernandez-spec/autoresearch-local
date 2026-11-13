@@ -5,3 +5,4 @@ experiments/*/logs/
 .arl.lock
 .run.lock
 .*.arltmp
+.*.lock

@@ -10,5 +10,7 @@ Judge {target}. This step is separate from the design: work from the files, not 
    - a neutral result can be kept only when it makes things simpler (--simpler, and say how).
 4. Record it, and say what this run did to each linked hypothesis:
      {arl} exp judge {target} --verdict <verdict> --reason "<one sentence>"{hyp_flags}
-5. Whatever this result suggests beyond the next step goes into IDEAS.md:
-     {arl} idea add --title "..." --body "..." --from {target}
+5. Whatever this result suggests beyond the next step is written down now, to be taken up at
+   the next introspection:
+     {arl} idea add --title "..." --body "..." --from {target}      (what could be tried)
+     {arl} note --about problem "..."                          (what it shows about the problem)
