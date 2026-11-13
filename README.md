@@ -245,6 +245,8 @@ machine is busy, 1 a gate refused.
   ledger.
 - No guard against a determined cheat. The hashes and gates stop drift and
   rationalization, not someone who edits `frozen.lock` by hand. Git shows that.
+  "A person at a terminal" is a check that the command runs in a terminal; a
+  program can fake one. The protocol forbids it, nothing prevents it.
 - No way to stop a `diagnose` command from calling the evaluator itself. That
   is rule 2 of the protocol, not a gate.
 

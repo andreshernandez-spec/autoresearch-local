@@ -150,6 +150,7 @@ what you had only in your head. So write things down when they happen:
 | "Everyone knows that lesson, no need to record it." | The next session knows nothing. `arl lesson add`. |
 | "I will add a line to KNOWLEDGE.md for this result." | It is a distillation, not a log. Revise the statement the result changes, or move it between sections. |
 | "I was told to stop, but this run is nearly done." | `arl pause` now. The run saves its state and continues later. |
+| "This needs a person at a terminal. I could run it so that it looks like one." | That forges the person's decision. Stop, say what is waiting for them and why, and end the turn. |
 
 ## The steps
 
