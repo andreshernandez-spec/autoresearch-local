@@ -8,10 +8,15 @@ enforced. `PROTOCOL.md` is what an agent reads before using it.
 
 - Standard library only. A project runs `bin/arl` from whatever Python 3.11+ it
   has, with nothing installed.
-- `python -m pytest` runs everything (about a minute). The tests drive a toy
+- `python -m pytest` runs everything (under two minutes). The tests drive a toy
   project in a temporary git repository through the real CLI.
 - Every gate has a test in `tests/test_flow.py` that hits it through the CLI
   and checks the message. A new gate comes with one.
+- `tests/test_hardening.py` holds the sequences that once broke a guarantee,
+  dead-ended or ended in a traceback. A new one found by trying goes there
+  with its fix.
+- A command checks everything before it changes anything. A refusal leaves the
+  ledger, the worktrees and git as they were.
 - The briefs in `src/arl/templates/briefs/` and the `ArlError` texts are the
   interface to the agent. Write them as instructions to a colleague: what
   happened, what to do next, the exact command.

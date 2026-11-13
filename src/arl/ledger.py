@@ -19,21 +19,58 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import json
 import os
 import re
 import time
+import tomllib
 from pathlib import Path
 from typing import Any, Generator
 
 from . import config as config_mod
 from .gitops import Git
-from .util import ArlError, now, read_front, read_json, write_front, write_json
+from .util import (
+    ArlError,
+    canonical,
+    check_id,
+    now,
+    one_line,
+    read_front,
+    read_json,
+    sha256_text,
+    write_front,
+    write_json,
+    write_text,
+)
 
 CONTRACT_FILES = ("arl.toml", "PROGRAM.md")
 LOCK = "frozen.lock"
 IDEA_STATES = ("open", "promoted", "parked", "rejected")
 HYP_STATES = ("open", "supported", "refuted", "inconclusive", "dropped")
 _IDEA_HEAD = re.compile(r"^## (I\d{3}): (.*)$", re.M)
+_NEEDS = {
+    "hypothesis": ("id", "title", "status"),
+    "track": ("name", "status", "branch", "head_commit"),
+    "review": ("id", "status"),
+}
+
+
+def _front(path: Path, kind: str) -> tuple[dict[str, Any], str]:
+    """Front matter of a ledger file, or a message that says how to mend it."""
+    try:
+        meta, body = read_front(path)
+        missing = [k for k in _NEEDS[kind] if k not in meta]
+        why = f"no {', '.join(missing)}" if missing else ""
+    except (ArlError, tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
+        meta, body, why = {}, "", str(e)
+    if why:
+        raise ArlError(
+            f"the block between the +++ lines at the top of {path} is missing or damaged ({why}).\n"
+            "arl keeps its fields there; write only below it. If the file was committed,\n"
+            f"'git diff -- {path}' shows the block that was lost. If it was new, remove the\n"
+            "file, create it again with arl and paste your text back."
+        )
+    return meta, body
 
 
 class Ledger:
@@ -46,20 +83,20 @@ class Ledger:
 
     @classmethod
     def locate(cls, start: Path | None = None) -> "Ledger":
-        """ARL_HOME if set, else the main worktree of the repository around the cwd.
+        """The main worktree of the repository around the current directory.
 
         Called from inside a track worktree it still finds the home checkout, so
         the stale copy of research/ on a track branch is never written.
         """
-        name = os.environ.get("ARL_DIR", "research")
-        if os.environ.get("ARL_HOME"):
-            return cls(Path(os.environ["ARL_HOME"]), name)
-        start = Path(start or Path.cwd())
+        try:
+            start = Path(start or Path.cwd())
+        except FileNotFoundError as e:
+            raise ArlError("the current directory no longer exists (a branch switch removed it). cd to the project first.") from e
         try:
             home = Git(start).main_worktree()
-        except (ArlError, IndexError) as e:
+        except (ArlError, IndexError, OSError) as e:
             raise ArlError(f"{start} is not inside a git repository") from e
-        return cls(home, name)
+        return cls(home)
 
     # --- paths -------------------------------------------------------------------
 
@@ -144,6 +181,14 @@ class Ledger:
         self.check_home()
         return self.git.commit_paths(f"{self.cfg.commit_prefix}: {message}", self.pathspecs())
 
+    def check_files(self) -> None:
+        """Read every record once, so a damaged file stops a command before it changes anything."""
+        self.hypotheses()
+        self.tracks()
+        self.reviews()
+        self.ideas()
+        self.experiments()
+
     @contextlib.contextmanager
     def locked(self, wait: float = 120.0) -> Generator[None, None, None]:
         """One writer at a time. Waits a while for the other one."""
@@ -160,6 +205,7 @@ class Ledger:
                     if time.monotonic() > deadline:
                         raise ArlError("another arl command is writing this ledger, try again") from e
                     time.sleep(0.2)
+            self.check_files()
             yield
 
     # --- ids ---------------------------------------------------------------------
@@ -182,13 +228,26 @@ class Ledger:
     # --- experiments -------------------------------------------------------------
 
     def exp_dir(self, eid: str) -> Path:
+        check_id("E", eid)
         matches = sorted(self.exp_root.glob(f"{eid}-*")) + sorted(self.exp_root.glob(eid))
         if not matches:
             raise ArlError(f"no experiment {eid}")
         return matches[0]
 
+    @staticmethod
+    def _read_record(path: Path) -> dict[str, Any]:
+        try:
+            return read_json(path)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise ArlError(f"{path} is damaged ({e}). arl writes that file; restore it from git.") from e
+
     def record(self, eid: str) -> dict[str, Any]:
-        return read_json(self.exp_dir(eid) / "record.json")
+        path = self.exp_dir(eid) / "record.json"
+        if not path.exists():
+            raise ArlError(
+                f"{path.parent} has no record.json, so it is not an experiment. Remove the folder if it is a leftover."
+            )
+        return self._read_record(path)
 
     def save_record(self, rec: dict[str, Any]) -> None:
         write_json(self.exp_dir(rec["id"]) / "record.json", rec)
@@ -197,33 +256,34 @@ class Ledger:
         if not self.exp_root.exists():
             return []
         paths = sorted(self.exp_root.glob("E[0-9][0-9][0-9][0-9]*/record.json"))
-        return [read_json(p) for p in paths]
+        return [self._read_record(p) for p in paths]
 
     # --- hypotheses --------------------------------------------------------------
 
     def hyp_path(self, hid: str) -> Path:
+        check_id("H", hid)
         matches = sorted(self.hyp_root.glob(f"{hid}-*.md")) + sorted(self.hyp_root.glob(f"{hid}.md"))
         if not matches:
             raise ArlError(f"no hypothesis {hid}")
         return matches[0]
 
     def hypothesis(self, hid: str) -> tuple[dict[str, Any], str]:
-        return read_front(self.hyp_path(hid))
+        return _front(self.hyp_path(hid), "hypothesis")
 
     def hypotheses(self) -> list[dict[str, Any]]:
         if not self.hyp_root.exists():
             return []
-        return [read_front(p)[0] for p in sorted(self.hyp_root.glob("H[0-9][0-9][0-9]*.md"))]
+        return [_front(p, "hypothesis")[0] for p in sorted(self.hyp_root.glob("H[0-9][0-9][0-9]*.md"))]
 
     def set_hypothesis(self, hid: str, status: str, note: str = "") -> None:
         if status not in HYP_STATES:
             raise ArlError(f"hypothesis status must be one of {', '.join(HYP_STATES)}")
         path = self.hyp_path(hid)
-        meta, body = read_front(path)
+        meta, body = _front(path, "hypothesis")
         if meta.get("status") != status or note:
             meta["status"], meta["updated"] = status, now()
             if note:
-                body = body.rstrip("\n") + f"\n- {now()[:10]}: {status}. {note}\n"
+                body = body.rstrip("\n") + f"\n- {now()[:10]}: {status}. {' '.join(note.split())}\n"
             write_front(path, meta, body)
 
     # --- tracks ------------------------------------------------------------------
@@ -233,23 +293,45 @@ class Ledger:
 
     def track(self, name: str) -> dict[str, Any]:
         path = self.track_path(name)
-        if not path.exists():
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name or "") or not path.exists():
             raise ArlError(f"no track '{name}'. Tracks: {', '.join(t['name'] for t in self.tracks()) or 'none'}")
-        return read_front(path)[0]
+        return _front(path, "track")[0]
 
     def tracks(self) -> list[dict[str, Any]]:
         if not self.track_root.exists():
             return []
-        return [read_front(p)[0] for p in sorted(self.track_root.glob("*.md"))]
+        return [_front(p, "track")[0] for p in sorted(self.track_root.glob("*.md"))]
 
     def save_track(self, meta: dict[str, Any], body: str | None = None) -> None:
         path = self.track_path(meta["name"])
         if body is None:
-            body = read_front(path)[1]
+            body = _front(path, "track")[1]
         write_front(path, meta, body)
 
     def track_params_path(self, name: str) -> Path:
         return self.track_root / f"{name}.params.json"
+
+    def track_params(self, track: dict[str, Any]) -> dict[str, Any]:
+        """The track's current params. arl wrote them; a hand edit is refused."""
+        path = self.track_params_path(track["name"])
+        try:
+            params = read_json(path)
+        except (OSError, json.JSONDecodeError) as e:
+            raise ArlError(f"{path} is not valid JSON ({e}). arl writes that file; restore it from git.") from e
+        if not isinstance(params, dict):
+            raise ArlError(f"{path} must hold one JSON object. arl writes that file; restore it from git.")
+        recorded = track.get("params_sha256")
+        if recorded and sha256_text(canonical(params)) != recorded:
+            raise ArlError(
+                f"{path} was changed by hand. A track's params move only when an experiment is kept:\n"
+                f"put the file back ('git diff -- {path}'), and change params in an experiment's own params.json."
+            )
+        return params
+
+    def write_track_params(self, track: dict[str, Any], params: dict[str, Any]) -> None:
+        """Write the params file and note its hash in the track's fields (the caller saves the track)."""
+        write_json(self.track_params_path(track["name"]), params)
+        track["params_sha256"] = sha256_text(canonical(params))
 
     def worktree_root(self) -> Path:
         root = Path(os.path.expanduser(self.cfg.worktrees))
@@ -261,18 +343,19 @@ class Ledger:
     # --- reviews -----------------------------------------------------------------
 
     def review_path(self, rid: str) -> Path:
+        check_id("R", rid)
         path = self.review_root / f"{rid}.md"
         if not path.exists():
             raise ArlError(f"no review {rid}")
         return path
 
     def review(self, rid: str) -> tuple[dict[str, Any], str]:
-        return read_front(self.review_path(rid))
+        return _front(self.review_path(rid), "review")
 
     def reviews(self) -> list[dict[str, Any]]:
         if not self.review_root.exists():
             return []
-        return [read_front(p)[0] for p in sorted(self.review_root.glob("R[0-9][0-9][0-9].md"))]
+        return [_front(p, "review")[0] for p in sorted(self.review_root.glob("R[0-9][0-9][0-9].md"))]
 
     # --- ideas -------------------------------------------------------------------
 
@@ -298,26 +381,34 @@ class Ledger:
         return out
 
     def add_idea(self, title: str, source: str, kind: str, body: str) -> str:
+        title = one_line(title, "the title")
+        # A heading inside the text would read as another idea: keep it as text.
+        body = re.sub(r"^(\s*)(#+ )", r"\1\\\2", body.strip(), flags=re.M)
+        if not body:
+            raise ArlError("the body is empty: say what the idea is, why it could matter, and the cheapest test")
+        source = one_line(source, "the source") if source else "not given"
         iid = self.next_id("I")
         head, sections = self._idea_sections()
         entry = (
             f"## {iid}: {title}\n"
             f"Status: open\n"
-            f"Added: {now()[:10]}. From: {source or 'not given'}. Kind: {kind}.\n\n"
-            f"{body.strip()}\n\n"
+            f"Added: {now()[:10]}. From: {source}. Kind: {one_line(kind, 'the kind')}.\n\n"
+            f"{body}\n\n"
         )
         text = head + "".join(s for _, _, s in sections)
         if not text.endswith("\n\n"):
             text = text.rstrip("\n") + "\n\n"
-        self.ideas_path.write_text(text + entry)
+        write_text(self.ideas_path, text + entry)
         return iid
 
     def set_idea(self, iid: str, status: str, note: str) -> None:
+        check_id("I", iid)
         if status not in IDEA_STATES:
             raise ArlError(f"idea status must be one of {', '.join(IDEA_STATES)}")
         head, sections = self._idea_sections()
         if iid not in [s[0] for s in sections]:
             raise ArlError(f"no idea {iid} in {self.ideas_path}")
+        note = " ".join(note.split())
         out = []
         for sid, _, section in sections:
             if sid == iid:
@@ -328,4 +419,4 @@ class Ledger:
                     section = f"{first}\nStatus: {status}\n{rest}"
                 section = section.rstrip("\n") + f"\n- {now()[:10]}: {status}. {note}\n\n"
             out.append(section)
-        self.ideas_path.write_text(head + "".join(out))
+        write_text(self.ideas_path, head + "".join(out))

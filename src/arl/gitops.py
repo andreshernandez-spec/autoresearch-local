@@ -93,10 +93,34 @@ class Git:
     def is_ancestor(self, older: str, newer: str) -> bool:
         return self.ok("merge-base", "--is-ancestor", older, newer)
 
+    def status(self, *pathspecs: str) -> list[tuple[str, str]]:
+        """(two-letter code, path) of changed and untracked paths, ignored files left out.
+
+        Read with -z: no quoting, so names with spaces or accents come out as they are.
+        """
+        out = self("status", "--porcelain", "-z", "--untracked-files=all", "--", *pathspecs)
+        fields, items, i = out.split("\0"), [], 0
+        while i < len(fields):
+            entry = fields[i]
+            i += 1
+            if len(entry) < 4:
+                continue
+            code, path = entry[:2], entry[3:]
+            if code[0] in "RC":
+                i += 1  # the next field is the path it was renamed or copied from
+            items.append((code, path))
+        return items
+
     def dirty(self, *pathspecs: str) -> list[str]:
-        """Changed and untracked paths, ignored files left out."""
-        out = self("status", "--porcelain", "--untracked-files=all", "--", *pathspecs)
-        return [line[3:] for line in out.splitlines() if line.strip()]
+        return [path for _, path in self.status(*pathspecs)]
+
+    def tracked_changes(self) -> list[str]:
+        """Changes to files git already tracks (untracked files left out)."""
+        return [path for code, path in self.status() if code != "??"]
+
+    def blob(self, ref: str, path: str) -> str | None:
+        """Object id of a file at a commit, None if it is not there."""
+        return self("rev-parse", "--verify", "--quiet", f"{ref}:{path}", check=False).strip() or None
 
     def changed(self, older: str, newer: str, *paths: str) -> list[str]:
         out = self("diff", "--name-only", older, newer, "--", *paths)
@@ -157,3 +181,7 @@ class Git:
     def remove_worktree(self, path: Path) -> None:
         """Only for the throwaway trees arl makes for a rerun."""
         self("worktree", "remove", "--force", str(path), _remove_ok=True)
+
+    def prune_worktrees(self) -> None:
+        """Forget worktrees whose folder is gone. Touches no branch and no file."""
+        self("worktree", "prune")

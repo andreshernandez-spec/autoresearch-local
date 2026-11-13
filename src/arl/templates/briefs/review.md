@@ -14,5 +14,6 @@ change, or a different approach, needed?
 5. Close it:
      {arl} review close <id> --decision <continue|adjust|branch|pivot|stop|escalate>
    A decision the agent may not take alone then waits for a person.
-6. Carry out section 7: `{arl} track new <name> --review <id>`, `{arl} track set ...`,
-   `{arl} idea set ...`, `{arl} hyp new ...`.
+6. Carry out section 7 with the id of this review: `{arl} track new <name> --review <id>`,
+   `{arl} track set <name> --status parked --review <id> --note "..."`, `{arl} idea set ...`,
+   `{arl} hyp new ...`. Only the latest closed review opens, parks or reopens tracks.

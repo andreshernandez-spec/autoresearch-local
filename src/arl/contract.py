@@ -14,6 +14,7 @@ needs a person at a terminal.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -24,12 +25,24 @@ _SKIP_DIRS = {"__pycache__", ".pytest_cache", ".ipynb_checkpoints"}
 _SKIP_SUFFIXES = {".pyc", ".pyo"}
 
 
+def _leftover(name: str) -> bool:
+    """Swap, backup and lock files an editor leaves beside the file it has open."""
+    return (
+        name.endswith("~")
+        or name.startswith(".#")
+        or (name.startswith("#") and name.endswith("#"))
+        or bool(re.fullmatch(r"\..*\.sw[a-p]", name))
+        or name.endswith(".arltmp")
+        or name == ".DS_Store"
+    )
+
+
 def _files_under(path: Path) -> list[Path]:
     if path.is_file():
         return [path]
     out = []
     for p in sorted(path.rglob("*")):
-        if p.is_file() and not (set(p.parts) & _SKIP_DIRS) and p.suffix not in _SKIP_SUFFIXES:
+        if p.is_file() and not (set(p.parts) & _SKIP_DIRS) and p.suffix not in _SKIP_SUFFIXES and not _leftover(p.name):
             out.append(p)
     return out
 

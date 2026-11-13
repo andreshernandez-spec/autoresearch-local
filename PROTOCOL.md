@@ -31,6 +31,10 @@ At the start of a session, before `arl next`: read `research/PROGRAM.md`,
 `research/IDEAS.md`. The ledger is the memory. What you remember from earlier in
 a conversation may be out of date or compacted away.
 
+Hypotheses, tracks and reviews are files with a block between `+++` lines at
+the top. That block is arl's. Write below it, and edit such a file in place
+rather than replacing it whole.
+
 ## Rules
 
 1. **The contract is not yours to change.** Not the evaluator, not a metric,
@@ -58,7 +62,8 @@ a conversation may be out of date or compacted away.
    eyes, and argue against the current path as well as you can.
 9. **Git writes go through arl** (`arl exp commit`, `arl exp judge`). No commit,
    switch, reset, merge or push by hand in the project or its worktrees. Reading
-   with git is fine.
+   with git is fine. The one exception is the one arl asks for: putting a file
+   back with `git restore <file>` when it says a file must go back.
 10. **Output goes to files.** Runs log to disk; read the end with
     `arl exp log`. Do not pull whole logs or data files into the conversation.
 11. **A busy machine is not yours to free.** If a run does not start because
@@ -121,8 +126,14 @@ the experiments in the window. The decisions:
 | `stop` | end the program: the goal is met or out of reach |
 | `escalate` | a person has to decide something first |
 
-`arl.toml` says which of these you may take alone. Tripwires written in one
-review are checked first in the next.
+`arl.toml` says which of these you may take alone. A decision outside that
+list waits for a person, and nothing runs while it waits. After a `stop`, any
+later review waits for a person too. Tripwires written in one review are
+checked first in the next.
+
+Tracks follow reviews. Once the first experiment is judged, opening a track,
+parking one or reopening one needs `--review <id>` of the latest closed
+review. Parking a track that stalled does not make its review go away.
 
 ## Reporting to the person
 

@@ -193,10 +193,12 @@ def analysis_facts(ledger: Ledger, rec: dict[str, Any]) -> str:
     head = ["metric", "role", "value"] + ([f"reference {ref['id']}", "gain"] if ref else [])
     rows = []
     for m in cfg.metrics:
+        if m.name not in metrics:  # added to the contract after this run
+            continue
         row = [m.name, m.role, fmt(metrics[m.name])]
         if ref:
             before = ref["metrics"].get(m.name)
-            row += [fmt(before), f"{m.gain(metrics[m.name], before):+.6g}" if before is not None else ""]
+            row += [fmt(before) if before is not None else "", f"{m.gain(metrics[m.name], before):+.6g}" if before is not None else ""]
         rows.append(row)
     lines = [f"Written by arl. Outcome: **{comp['outcome']}**.", "", table(head, rows)]
     if ref:
@@ -260,8 +262,9 @@ def next_text(ledger: Ledger, action: dict[str, Any]) -> str:
         "target": action.get("target", ""),
         "why": action.get("why", ""),
     }
-    if stage in ("judge", "design", "crashed"):
+    if stage in ("judge", "design", "crashed", "outdated", "interrupted"):
         rec = ledger.record(action["target"])
+        ctx["track"] = rec["track"]
         ctx["exp"] = ledger.exp_dir(rec["id"])
         ctx["worktree"] = ledger.worktree_path(rec["track"])
         ctx["branch"] = rec["branch"]
@@ -273,7 +276,7 @@ def next_text(ledger: Ledger, action: dict[str, Any]) -> str:
             flags = "".join(f" \\\n       --hyp {h}=<supported|refuted|inconclusive|open>" for h in rec["hypotheses"])
         ctx["hyp_flags"] = flags
         if stage == "crashed" and rec.get("attempts"):
-            ctx["why"] = rec["attempts"][-1].get("failed", ctx["why"])
+            ctx["why"] = f"{ctx['why']}. Last failure: {rec['attempts'][-1].get('failed', 'not recorded')}"
     name = stage
     if stage == "judge" and ledger.record(action["target"])["type"] == "diagnose":
         name = "judge_diagnose"

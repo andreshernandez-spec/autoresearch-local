@@ -4,3 +4,4 @@ experiments/*/logs/
 .cache/
 .arl.lock
 .run.lock
+.*.arltmp

@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import os
 import re
 import tomllib
 from pathlib import Path
@@ -58,12 +59,49 @@ def slugify(text: str, max_len: int = 36) -> str:
     return slug[:max_len].rstrip("-") or "x"
 
 
+def write_text(path: Path, text: str) -> None:
+    """Write through a temporary file, so a reader never sees half a file."""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.arltmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
 def read_json(path: Path) -> Any:
     return json.loads(Path(path).read_text())
 
 
 def write_json(path: Path, obj: Any) -> None:
-    Path(path).write_text(json.dumps(obj, indent=2, default=str) + "\n")
+    write_text(path, json.dumps(obj, indent=2, default=str) + "\n")
+
+
+# --- what a person or an agent types ---------------------------------------------
+
+_IDS = {"E": (r"E\d{4}", "an experiment id like E0007"), "H": (r"H\d{3}", "a hypothesis id like H003"),
+        "R": (r"R\d{3}", "a review id like R002"), "I": (r"I\d{3}", "an idea id like I012")}
+
+
+def check_id(kind: str, value: str) -> str:
+    pattern, what = _IDS[kind]
+    if not re.fullmatch(pattern, value or ""):
+        raise ArlError(f"'{value}' is not {what}")
+    return value
+
+
+def check_text(value: str, what: str) -> str:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as e:
+        raise ArlError(f"{what} has characters that are not valid UTF-8") from e
+    return value
+
+
+def one_line(value: str, what: str) -> str:
+    """A title: valid text, on one line, not empty."""
+    value = " ".join(check_text(value, what).split())
+    if not value:
+        raise ArlError(f"{what} is empty")
+    return value
 
 
 # --- placeholders ----------------------------------------------------------------
@@ -121,7 +159,7 @@ def read_front(path: Path) -> tuple[dict[str, Any], str]:
 
 
 def write_front(path: Path, meta: dict[str, Any], body: str) -> None:
-    Path(path).write_text(join_front(meta, body))
+    write_text(path, join_front(meta, body))
 
 
 def fmt(value: Any) -> str:

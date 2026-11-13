@@ -44,6 +44,10 @@ Things that go wrong most often:
   stop other jobs and do not lower the limits in `arl.toml`.
 - **New idea in the middle of something:** `arl idea add --title ... --body ...`
   and carry on. Reviews read that file.
+- **The block between `+++` lines at the top of a hypothesis, track or review
+  file is arl's.** Write below it; edit the file, do not replace it whole.
+- **Tracks follow reviews.** After the first verdict, opening, parking or
+  reopening a track takes `--review <id>` of the latest closed review.
 
 ## The review
 

@@ -201,7 +201,7 @@ def test_design_is_locked_when_the_run_starts(project: Project):
     design = p.ledger.exp_dir(eid) / "design.md"
     original = design.read_text()
     design.write_text(original + "\nI expected exactly this.\n")
-    assert "changed after the run started" in p.judge(eid, "keep", "--hyp", f"{h}=supported", code=1)
+    assert "changed after its run started" in p.judge(eid, "keep", "--hyp", f"{h}=supported", code=1)
     assert "design.md changed after the run started" in p.arl("verify", code=1)
     design.write_text(original)
     p.judge(eid, "keep", "--hyp", f"{h}=supported")
@@ -281,9 +281,15 @@ def test_some_decisions_wait_for_a_person(project: Project, monkeypatch):
     p.arl("review", "resolve", "R001", "--decision", "stop", "--note", "enough")
     assert "NEXT: stopped R001" in p.arl("next")
     assert "decided to stop" in new_exp(p, "tune", h, code=1)
+    # after a stop the agent can write a review, but reopening is the person's decision
+    monkeypatch.setattr(cli, "interactive", lambda: False)
     p.arl("review", "new", "--trigger", "reopened")
     p.fill(p.research / "reviews" / "R002.md")
-    p.arl("review", "close", "R002", "--decision", "continue")
+    assert "Reopening the program is a person's decision" in p.arl("review", "close", "R002", "--decision", "continue")
+    assert "NEXT: wait R002" in p.arl("next")
+    assert "waits for a person" in new_exp(p, "tune", h, code=1)
+    monkeypatch.setattr(cli, "interactive", lambda: True)
+    p.arl("review", "resolve", "R002", "--decision", "continue", "--note", "go on")
     assert "NEXT: hypothesize" in p.arl("next")
 
 

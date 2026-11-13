@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any, Callable, Generator
 
 from .config import Config
 from .ledger import Ledger
@@ -131,22 +131,78 @@ def _stop(proc: subprocess.Popen) -> None:
             continue
 
 
-def _session_rss_gb(sid: int) -> float:
-    """Resident memory of every process in the run's session (it starts its own)."""
-    page, total = os.sysconf("SC_PAGE_SIZE"), 0
+def _stat_fields(pid: int | str) -> list[str] | None:
+    """/proc/<pid>/stat after the command name: state, ppid, pgrp, session, ..."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return stat[stat.rindex(")") + 2 :].split()
+    except (OSError, ValueError):
+        return None
+
+
+def session_pids(sid: int) -> list[int]:
+    """Every process of the session a run started (each run starts its own)."""
     try:
         entries = [e.name for e in os.scandir("/proc") if e.name.isdigit()]
     except OSError:
-        return 0.0
+        return []
+    out = []
     for pid in entries:
+        fields = _stat_fields(pid)
         try:
-            stat = Path(f"/proc/{pid}/stat").read_text()
-            fields = stat[stat.rindex(")") + 2 :].split()  # state, ppid, pgrp, session, ...
-            if int(fields[3]) == sid:
-                total += int(fields[21]) * page
-        except (OSError, ValueError, IndexError):
+            if fields and int(fields[3]) == sid:
+                out.append(int(pid))
+        except (ValueError, IndexError):
+            continue
+    return out
+
+
+def _session_rss_gb(sid: int) -> float:
+    """Resident memory of every process in the run's session."""
+    page, total = os.sysconf("SC_PAGE_SIZE"), 0
+    for pid in session_pids(sid):
+        fields = _stat_fields(pid)
+        try:
+            total += int(fields[21]) * page if fields else 0
+        except (ValueError, IndexError):
             continue
     return total / 1024**3
+
+
+def stop_session(sid: int, patience: float = 10.0) -> bool:
+    """Stop what is left of a run whose arl died: ask, then force. True if anything was alive."""
+    found = False
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        pids = session_pids(sid)
+        if not pids:
+            return found
+        found = True
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+        end = time.monotonic() + patience
+        while time.monotonic() < end and session_pids(sid):
+            time.sleep(0.1)
+    return found
+
+
+def proc_start(pid: int | None) -> int | None:
+    """When a process started, in clock ticks since boot. Tells a live pid from a reused one."""
+    fields = _stat_fields(pid) if pid else None
+    try:
+        return int(fields[19]) if fields else None
+    except (ValueError, IndexError):
+        return None
+
+
+def alive(pid: int | None, start: int | None = None) -> bool:
+    """The process exists and, when its start time is known, is the same one."""
+    now_start = proc_start(pid)
+    if now_start is None:
+        return False
+    return start is None or now_start == start
 
 
 def execute(
@@ -157,6 +213,7 @@ def execute(
     log: Path,
     max_rss_gb: float | None = None,
     min_free_ram_gb: float | None = None,
+    on_start: Callable[[int], None] | None = None,
 ) -> dict[str, Any]:
     """Run through bash in its own session, output to a file.
 
@@ -180,6 +237,8 @@ def execute(
             start_new_session=True,
         )
         try:
+            if on_start:
+                on_start(proc.pid)  # the session id of everything the run starts
             while True:
                 try:
                     proc.wait(timeout=1.0)
@@ -199,18 +258,6 @@ def execute(
             _stop(proc)  # interrupted: do not leave the job running behind us
             raise
     return {"exit_code": proc.returncode, "seconds": round(time.monotonic() - start, 2), "stopped": stopped}
-
-
-def alive(pid: int | None) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
 
 
 def tail(path: Path, lines: int = 120, max_bytes: int = 48_000) -> str:

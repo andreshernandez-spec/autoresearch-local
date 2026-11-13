@@ -24,10 +24,10 @@ The framework lives here. Each project keeps its own `research/` directory.
 |---|---|
 | **The evaluation is frozen** | `PROGRAM.md`, `arl.toml` and the evaluator files form the contract. `arl freeze` hashes them into `frozen.lock`; every run checks the hashes before and after. The evaluator runs from the home checkout, never from a track's worktree, on what the experiment wrote. Once an experiment exists, a new freeze needs a person at a terminal. Scores are compared only within one evaluator version. |
 | **Hypothesis, design and evaluation are separate** | Three records written at three times. A hypothesis is a claim with an observable consequence, no plan. A design names the change and the prediction; its hash is taken when the run starts, so it cannot be adjusted to the result. The number comes from the frozen evaluator, the outcome (improve, neutral, worse, constraint not met) is computed, and the verdict has to be one that outcome allows. |
-| **Experiments come in kinds** | `baseline` measures a track as it is. `tune` changes params only. `feature` changes code. `diagnose` observes: not scored, never merged. Each kind is held to what it may change. |
-| **Parallel code tracks** | A track is one approach: a branch (`track/<name>`) with its own worktree. A code experiment gets a branch off the track head. Keep is a fast-forward of the track, discard leaves the branch where it is. arl never resets, rebases, deletes or pushes. |
-| **Everything can be recalled** | Each experiment has a `record.json`: commit, params, command, contract version, package list, data hashes, timings, artifact hashes, metrics, comparison, verdict. The ledger is committed at every step. `arl exp show` reads it back, `arl exp reproduce` runs it again from the recorded commit, `arl verify` checks ledger, contract and git against each other. |
-| **Periodic reconsideration** | After a set number of experiments, a run of failures on one track, or a number of days, no new experiment can be drafted until a review is written: where things stand, whether each track's premises still hold, the case against the current path, the alternatives, a decision. Decisions the agent may not take alone wait for a person. New tracks come out of a review. |
+| **Experiments come in kinds** | `baseline` measures a track as it is. `tune` changes params only. `feature` changes code. `diagnose` observes: not scored, never merged. Each kind is held to what it may change: a baseline with other params than its track's is refused, and so is a tune with a code change. |
+| **Parallel code tracks** | A track is one approach: a branch (`track/<name>`) with its own worktree. A code experiment gets a branch off the track head. Keep is a fast-forward of the track, discard leaves the branch where it is. arl never resets, rebases or pushes, and never deletes a branch. |
+| **Everything can be recalled** | Each experiment has a `record.json`: commit, params, command, contract version, package list, data hashes, timings, artifact hashes, metrics, comparison, verdict. A run whose code or contract changed while it was going is failed, not recorded. The ledger is committed at every step. `arl exp show` reads it back, `arl exp reproduce` runs it again from the recorded commit, `arl verify` checks ledger, contract and git against each other. |
+| **Periodic reconsideration** | After a set number of experiments, a run of failures on one track, or a number of days, no new experiment can be drafted until a review is written: where things stand, whether each track's premises still hold, the case against the current path, the alternatives, a decision. Decisions the agent may not take alone wait for a person, and nothing runs while they wait. Tracks are opened, parked and reopened only by the latest closed review or by a person. After a decision to stop, only a person reopens the program. |
 | **A document of ideas** | `research/IDEAS.md`. Whatever comes up that is outside the current experiment is written there instead of chased. Every review goes through the open ones. |
 
 ## A project, start to finish
@@ -97,7 +97,13 @@ load average, below a free amount of RAM or GPU memory, or while another run
 holds the lock file (one file can be shared by every project on the machine).
 A run in progress is stopped, with everything it started, when it passes its
 time limit, when its processes hold more RAM than `max_run_rss_gb`, or when
-the machine falls below `stop_below_free_ram_gb`.
+the machine falls below `stop_below_free_ram_gb`. If arl itself is stopped
+(terminal closed, session ended), it takes the job down with it; if it is
+killed outright, the next arl command that touches the experiment stops what
+was left behind before anything else starts.
+
+The budget counts experiments that ran and the hours of every run, reruns
+included. Without `max_run_hours` nothing bounds reruns.
 
 ## Layout of `research/`
 
@@ -128,7 +134,7 @@ code that touches `research/`.
 
 ```
 arl init | freeze | status | next | verify
-arl track  new | set | sync | list
+arl track  new | set | sync | worktree | list
 arl hyp    new | set | list
 arl idea   add | set | list
 arl exp    new | commit | run | judge | abandon | show | list | log | reproduce
@@ -147,6 +153,8 @@ or the evaluator failed, 75 the machine is busy, 1 a gate refused.
   check it.
 - No guard against a determined cheat. The hashes and gates stop drift and
   rationalization, not someone who edits `frozen.lock` by hand. Git shows that.
+- No way to stop a `diagnose` command from calling the evaluator itself. That
+  is rule 2 of the protocol, not a gate.
 
 ## For agents
 
@@ -160,4 +168,5 @@ python -m pytest
 ```
 
 A toy project in a temporary git repository is driven through the real CLI:
-every stage and every gate has a test.
+every stage and every gate has a test (`tests/test_flow.py`), and so has every
+way of breaking one that was found by trying (`tests/test_hardening.py`).
