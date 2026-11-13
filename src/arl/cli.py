@@ -575,11 +575,12 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
             finish(ledger, f"{eid} design, {typ} on {rec['track']}" if n == 1 else f"{eid} attempt {n}")
         attempt, env, failed = attempts[-1], _run_env(ledger, rec, values), ""
         try:
-            res = runner.execute(runner.substitute(command, values), path, env, cfg.run_timeout, logs / f"run-{n}.log")
+            limits = {"max_rss_gb": cfg.max_run_rss_gb, "min_free_ram_gb": cfg.stop_below_free_ram_gb}
+            res = runner.execute(runner.substitute(command, values), path, env, cfg.run_timeout, logs / f"run-{n}.log", **limits)
             attempt.update(run_seconds=res["seconds"], exit_code=res["exit_code"])
             (exp / "run.tail.txt").write_text(runner.tail(logs / f"run-{n}.log"))
-            if res["timed_out"]:
-                failed = f"the run passed its limit of {cfg.run_timeout:.0f} s and was stopped"
+            if res["stopped"]:
+                failed = f"the run was stopped: {res['stopped']}"
             elif res["exit_code"] != 0:
                 failed = f"the run exited with code {res['exit_code']}"
             if not failed:
@@ -590,11 +591,11 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
             if not failed and scored:
                 contract.require(ledger)  # the run itself must not have touched the evaluator
                 (exp / "metrics.json").unlink(missing_ok=True)
-                ev = runner.execute(runner.substitute(cfg.eval_command, values), ledger.home, env, cfg.eval_timeout, logs / f"eval-{n}.log")
+                ev = runner.execute(runner.substitute(cfg.eval_command, values), ledger.home, env, cfg.eval_timeout, logs / f"eval-{n}.log", **limits)
                 attempt["eval_seconds"] = ev["seconds"]
                 (exp / "eval.tail.txt").write_text(runner.tail(logs / f"eval-{n}.log"))
-                if ev["timed_out"]:
-                    failed = f"the evaluator passed its limit of {cfg.eval_timeout:.0f} s and was stopped"
+                if ev["stopped"]:
+                    failed = f"the evaluator was stopped: {ev['stopped']}"
                 elif ev["exit_code"] != 0:
                     failed = f"the evaluator exited with code {ev['exit_code']}"
                 else:
@@ -822,12 +823,15 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
         ledger.git.add_detached(tree, rec["code_commit"])
         try:
             command = rec.get("command") or cfg.run_command
-            res = runner.execute(runner.substitute(command, values), tree, env, cfg.run_timeout, logs / f"rerun-{n}.log")
-            if res["timed_out"] or res["exit_code"] != 0:
-                raise ArlError(f"the rerun failed (exit {res['exit_code']}). Log: {logs / f'rerun-{n}.log'}", EXIT_CRASH)
-            ev = runner.execute(runner.substitute(cfg.eval_command, values), ledger.home, env, cfg.eval_timeout, logs / f"rerun-eval-{n}.log")
-            if ev["timed_out"] or ev["exit_code"] != 0:
-                raise ArlError(f"the evaluator failed on the rerun (exit {ev['exit_code']}). Log: {logs / f'rerun-eval-{n}.log'}", EXIT_CRASH)
+            limits = {"max_rss_gb": cfg.max_run_rss_gb, "min_free_ram_gb": cfg.stop_below_free_ram_gb}
+            res = runner.execute(runner.substitute(command, values), tree, env, cfg.run_timeout, logs / f"rerun-{n}.log", **limits)
+            if res["stopped"] or res["exit_code"] != 0:
+                why = res["stopped"] or f"exit {res['exit_code']}"
+                raise ArlError(f"the rerun failed ({why}). Log: {logs / f'rerun-{n}.log'}", EXIT_CRASH)
+            ev = runner.execute(runner.substitute(cfg.eval_command, values), ledger.home, env, cfg.eval_timeout, logs / f"rerun-eval-{n}.log", **limits)
+            if ev["stopped"] or ev["exit_code"] != 0:
+                why = ev["stopped"] or f"exit {ev['exit_code']}"
+                raise ArlError(f"the evaluator failed on the rerun ({why}). Log: {logs / f'rerun-eval-{n}.log'}", EXIT_CRASH)
             metrics = runner.read_metrics(metrics_path, cfg)
         finally:
             ledger.git.remove_worktree(tree)

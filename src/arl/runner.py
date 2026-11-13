@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Generator
+from typing import Any, Generator
 
 from .config import Config
 from .ledger import Ledger
@@ -131,18 +131,42 @@ def _stop(proc: subprocess.Popen) -> None:
             continue
 
 
+def _session_rss_gb(sid: int) -> float:
+    """Resident memory of every process in the run's session (it starts its own)."""
+    page, total = os.sysconf("SC_PAGE_SIZE"), 0
+    try:
+        entries = [e.name for e in os.scandir("/proc") if e.name.isdigit()]
+    except OSError:
+        return 0.0
+    for pid in entries:
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            fields = stat[stat.rindex(")") + 2 :].split()  # state, ppid, pgrp, session, ...
+            if int(fields[3]) == sid:
+                total += int(fields[21]) * page
+        except (OSError, ValueError, IndexError):
+            continue
+    return total / 1024**3
+
+
 def execute(
     command: str,
     cwd: Path,
     env: dict[str, str],
     timeout: float,
     log: Path,
-    on_start: Callable[[int], None] | None = None,
+    max_rss_gb: float | None = None,
+    min_free_ram_gb: float | None = None,
 ) -> dict[str, Any]:
-    """Run through bash in its own process group, output to a file, killed at the limit."""
+    """Run through bash in its own session, output to a file.
+
+    The run is stopped, whole process group, when it passes its time limit,
+    when its processes hold more memory than allowed, or when the machine runs
+    low on memory. "stopped" then says why.
+    """
     log.parent.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
-    timed_out = False
+    stopped = ""
     with open(log, "ab") as f:
         f.write(f"$ cd {cwd} && {command}\n".encode())
         f.flush()
@@ -155,22 +179,26 @@ def execute(
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
-        if on_start:
-            on_start(proc.pid)
         try:
-            try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                _stop(proc)
+            while True:
+                try:
+                    proc.wait(timeout=1.0)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if time.monotonic() - start > timeout:
+                    stopped = f"it passed its limit of {timeout:.0f} s"
+                elif max_rss_gb is not None and (held := _session_rss_gb(proc.pid)) > max_rss_gb:
+                    stopped = f"its processes held {held:.1f} GB of RAM, the limit is {max_rss_gb}"
+                elif min_free_ram_gb is not None and (free := _mem_available_gb()) is not None and free < min_free_ram_gb:
+                    stopped = f"the machine was down to {free:.1f} GB of free RAM, the floor is {min_free_ram_gb}"
+                if stopped:
+                    _stop(proc)
+                    break
         except BaseException:
             _stop(proc)  # interrupted: do not leave the job running behind us
             raise
-    return {
-        "exit_code": proc.returncode,
-        "seconds": round(time.monotonic() - start, 2),
-        "timed_out": timed_out,
-    }
+    return {"exit_code": proc.returncode, "seconds": round(time.monotonic() - start, 2), "stopped": stopped}
 
 
 def alive(pid: int | None) -> bool:

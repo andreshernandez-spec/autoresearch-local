@@ -32,6 +32,8 @@ a = p.parse_args()
 params = json.load(open(a.params))
 if params.get("crash"):
     sys.exit(3)
+if params.get("hog_mb"):
+    hog = b"x" * (params["hog_mb"] << 20)
 if params.get("sleep"):
     time.sleep(params["sleep"])
 x = params.get("x", 0.0) + OFFSET
@@ -89,6 +91,7 @@ max_experiments = {max_experiments}
 every = {every}
 stagnation = {stagnation}
 agent_may = ["continue", "adjust", "branch", "pivot"]
+{extra}
 """
 
 _FILL = re.compile(r"^\s*>?\s*FILL:.*$", re.M)
@@ -120,7 +123,7 @@ class Project:
         path.write_text(_FILL.sub("Written for the test.", path.read_text()))
 
     def contract(self, **over) -> None:
-        cfg = dict(worktrees=str(self.base / "wt"), python=sys.executable, timeout=60, max_experiments=40, every=6, stagnation=4)
+        cfg = dict(worktrees=str(self.base / "wt"), python=sys.executable, timeout=60, max_experiments=40, every=6, stagnation=4, extra="")
         cfg.update(over)
         (self.research / "arl.toml").write_text(ARL_TOML.format(**cfg))
 

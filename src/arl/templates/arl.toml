@@ -70,6 +70,10 @@ agent_may = ["continue", "adjust", "branch", "pivot"]
 # min_free_gpu_mb = 6000
 # One run at a time across every project that names this file.
 # lock = "~/.arl-run.lock"
+# A run is stopped when its processes hold more RAM than this, or when the
+# machine as a whole runs this low.
+# max_run_rss_gb = 24
+# stop_below_free_ram_gb = 6
 
 [env]
 # Its output is stored with each run, once per distinct content.

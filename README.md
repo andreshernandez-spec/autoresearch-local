@@ -95,6 +95,9 @@ on. Those results are stored and never used for a verdict.
 `[machine]` holds gates for a shared machine: a run does not start above a
 load average, below a free amount of RAM or GPU memory, or while another run
 holds the lock file (one file can be shared by every project on the machine).
+A run in progress is stopped, with everything it started, when it passes its
+time limit, when its processes hold more RAM than `max_run_rss_gb`, or when
+the machine falls below `stop_below_free_ram_gb`.
 
 ## Layout of `research/`
 

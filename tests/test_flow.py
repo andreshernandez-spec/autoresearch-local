@@ -331,6 +331,16 @@ def test_time_limit_stops_the_run(project: Project):
     assert time.time() - start < 30
 
 
+def test_memory_limit_stops_the_run(project: Project):
+    p = project
+    h = p.started(extra="[machine]\nmax_run_rss_gb = 0.2\n")
+    eid = p.draft("tune", hyps=(h,), params={"x": 0.5, "hog_mb": 400, "sleep": 60})
+    start = time.time()
+    out = p.arl("exp", "run", eid, code=2)
+    assert "GB of RAM, the limit is 0.2" in out and time.time() - start < 30
+    assert p.record(eid)["attempts"][0]["failed"].startswith("the run was stopped")
+
+
 def test_budget_ends_new_work(project: Project):
     p = project
     h = p.started(max_experiments=2)

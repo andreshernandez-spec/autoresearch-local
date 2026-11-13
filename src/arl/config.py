@@ -58,6 +58,8 @@ class Config:
     min_free_ram_gb: float | None
     min_free_gpu_mb: float | None
     lock: str | None
+    max_run_rss_gb: float | None
+    stop_below_free_ram_gb: float | None
     env_command: str | None
     data_files: list[str] = field(default_factory=list)
 
@@ -156,6 +158,8 @@ def load(path: Path) -> Config:
         min_free_ram_gb=machine.get("min_free_ram_gb"),
         min_free_gpu_mb=machine.get("min_free_gpu_mb"),
         lock=machine.get("lock"),
+        max_run_rss_gb=machine.get("max_run_rss_gb"),
+        stop_below_free_ram_gb=machine.get("stop_below_free_ram_gb"),
         env_command=env.get("command"),
         data_files=list(data.get("files", [])),
     )
