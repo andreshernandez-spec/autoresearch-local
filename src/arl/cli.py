@@ -705,15 +705,10 @@ def cmd_lesson_add(args: argparse.Namespace) -> int:
     with ledger.locked():
         lid = ledger.add_lesson(args.scope, args.title, args.body, args.source or "")
         path = ledger.lessons_file(args.scope)
-        if args.scope == "project":
-            if ledger.lock_path.exists():
-                finish(ledger, f"lesson {lid}")
-        else:
-            try:  # the general file lives with the skill: commit it there when that is a repository
-                top = Git(path.parent).top()
-                Git(top).commit_paths(f"lessons: {lid} {args.title[:48]}", [path.relative_to(top).as_posix()])
-            except (ArlError, OSError, ValueError):
-                pass
+        if args.scope == "project" and ledger.lock_path.exists():
+            finish(ledger, f"lesson {lid}")
+        # A general lesson is not committed anywhere. Its file sits next to the skill, on this
+        # machine only: what a loop writes in one project never goes into the arl repository.
     print(f"{lid} added to {path}")
     return 0
 

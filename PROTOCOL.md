@@ -35,7 +35,7 @@ STOP either. At a STOP, write a short report (below) and end.
 |---|---|---|
 | `research/KNOWLEDGE.md` | what the work has shown about the problem, distilled | part 3 of every introspection |
 | `research/LESSONS.md` | how to work in this project | `arl lesson add --scope project` |
-| `skill/LESSONS.md` in the arl repository | how to work with arl in any project | `arl lesson add --scope general` |
+| `skill/LESSONS.md` beside the arl skill (this machine only, not in git) | how to work with arl in any project | `arl lesson add --scope general` |
 
 Then read `research/PROGRAM.md`, `research/STATUS.md`, the files of the active
 tracks and `research/IDEAS.md`. The ledger is the memory. What you remember

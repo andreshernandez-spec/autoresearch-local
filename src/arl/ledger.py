@@ -16,8 +16,9 @@
         envs/<hash>.txt                  package listings of the environment, stored once each
 
 The ledger lives in the project's home checkout. Code lives on track branches,
-each with its own worktree. Lessons that hold for any project live with the
-skill, in this repository (skill/LESSONS.md).
+each with its own worktree. Lessons that hold for any project live next to the
+skill (skill/LESSONS.md beside this code), on this machine only: that file is
+not tracked, so nothing a loop writes ends up in the arl repository.
 """
 
 from __future__ import annotations

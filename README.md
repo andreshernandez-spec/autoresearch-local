@@ -47,7 +47,7 @@ notes written in passing). The agent writes the rest, in four parts:
 | Part | Question | What it leaves behind |
 |---|---|---|
 | 1. The path | Is the current approach still worth it, does it need a bigger change, or is a different approach due? | A decision: continue, adjust, branch, pivot, stop or escalate, with tripwires for the next time |
-| 2. How the work went | Which behaviours or errors of the agents are worth a standing instruction? Not about the problem: about the way of working | Lessons, added with `arl lesson add` to the instructions agents load: `skill/LESSONS.md` here for what holds in any project, `research/LESSONS.md` for what holds in one |
+| 2. How the work went | Which behaviours or errors of the agents are worth a standing instruction? Not about the problem: about the way of working | Lessons, added with `arl lesson add` to the instructions agents load: `research/LESSONS.md` for what holds in one project, `skill/LESSONS.md` next to the skill for what holds in any (on this machine only, not in git) |
 | 3. What we know | What did the work reveal about the problem itself? | `research/KNOWLEDGE.md`, revised: a distillation of everything found so far, in sections by how sure it is (established, likely, ruled out, open) |
 | 4. Reload | | `arl reload` prints the knowledge and the lessons as they now are. Until an agent has run it, nothing new starts |
 
@@ -174,7 +174,10 @@ machine that ran them. On another machine `exp reproduce` makes them again.
 ## On another machine
 
 Everything the harness is lives in this repository: the code, the templates,
-the helper, the protocol, the skill and the lessons agents have added.
+the helper, the protocol and the skill. Nothing a research loop writes does:
+experiments, results, knowledge and ideas are in each project's own
+repository, and the lessons loops add for every project are in a file that is
+not tracked here.
 
 ```sh
 git clone <url> ~/private/open-source/autoresearch-local
@@ -184,6 +187,9 @@ mkdir -p ../.claude/skills/research-loop
 ln -s ../../../autoresearch-local/skill/SKILL.md ../.claude/skills/research-loop/SKILL.md
 ln -s ../../../autoresearch-local/skill/LESSONS.md ../.claude/skills/research-loop/LESSONS.md
 ```
+
+`skill/LESSONS.md` is written on each machine by the loops that run there. To
+take the lessons of another machine along, copy that file.
 
 The skill names the path above. In another place, change the paths in
 `skill/SKILL.md`.
@@ -320,10 +326,12 @@ carry a stale copy of `research/` that nothing reads: arl always writes the
 home checkout, also when called from inside a worktree, and refuses experiment
 code that touches `research/`.
 
-Lessons that hold for any project live in this repository, in
-[skill/LESSONS.md](skill/LESSONS.md), next to the skill that agents load. A
-person prunes that file from time to time and moves what has proved itself
-into [PROTOCOL.md](PROTOCOL.md).
+Lessons that hold for any project are in `skill/LESSONS.md`, next to the
+skill that agents load. That file is written by the loops on one machine and
+is not tracked: what was learned in one project, possibly a private one, never
+becomes part of this repository by itself. A person prunes it from time to
+time and writes what has proved itself into [PROTOCOL.md](PROTOCOL.md), in
+words that fit any project.
 
 ## Commands
 

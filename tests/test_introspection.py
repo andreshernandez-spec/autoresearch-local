@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import contextlib
 import io
+from pathlib import Path
+
+import pytest
 
 from arl import cli, runner
 from arl import ledger as ledger_module
@@ -180,3 +183,32 @@ def test_note_is_one_line_in_a_project(project: Project):
     p.arl("note", "--about", "work", "two\nlines", "and  spaces")
     events = p.ledger.activity()
     assert events[-1] == {"at": events[-1]["at"], "kind": "note", "text": "two lines and spaces", "about": "work"}
+
+
+def test_a_lesson_for_every_project_is_committed_nowhere(project: Project, monkeypatch):
+    """The arl repository is public and the projects are not: what a loop writes stays out of it."""
+    p = project
+    p.started()
+    checkout = p.base / "arl"  # stands for the arl checkout, a git repository of its own
+    (checkout / "skill").mkdir(parents=True)
+    git(checkout, "init", "-q", "-b", "main")
+    git(checkout, "config", "user.email", "test@example.org")
+    git(checkout, "config", "user.name", "Test")
+    (checkout / "README.md").write_text("the harness\n")
+    git(checkout, "add", "-A")
+    git(checkout, "commit", "-q", "-m", "harness")
+    monkeypatch.setattr(ledger_module, "GENERAL_LESSONS", checkout / "skill" / "LESSONS.md")
+    before = git(checkout, "rev-parse", "HEAD")
+    lesson(p, "general", "what the loop learned in a private project")
+    assert "what the loop learned" in (checkout / "skill" / "LESSONS.md").read_text()
+    assert git(checkout, "rev-parse", "HEAD") == before and git(checkout, "rev-list", "--count", "HEAD") == "1"
+    assert git(checkout, "ls-files") == "README.md"  # written, and not made part of the repository
+    assert "what the loop learned" not in git(p.root, "log", "-p", "--all")  # nor of the project's history
+
+
+def test_the_arl_repository_does_not_track_what_loops_write():
+    root = Path(__file__).resolve().parent.parent
+    if not (root / ".git").exists():
+        pytest.skip("not a git checkout")
+    assert "skill/LESSONS.md" not in git(root, "ls-files", "skill").splitlines()
+    assert git(root, "check-ignore", "skill/LESSONS.md") == "skill/LESSONS.md"

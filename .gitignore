@@ -1,6 +1,8 @@
 __pycache__/
 .pytest_cache/
 *.pyc
-# left by arl while it writes the lessons file
+# Written by research loops on this machine (arl lesson add --scope general).
+# Never tracked: what a loop learned in a private project stays out of this repository.
+skill/LESSONS.md
 skill/.*.lock
 skill/.*.arltmp

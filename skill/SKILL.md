@@ -93,7 +93,9 @@ noted since the last one. Four parts, in order:
 2. **How the work went.** Behaviours and errors worth a standing instruction
    become lessons: `arl lesson add --scope general|project --title "..."
    --body "what happened, what to do instead" --from <id>`. General ones land
-   in `LESSONS.md` next to this file and reach every project.
+   in `LESSONS.md` next to this file and reach every project on this machine.
+   Write them without the project's own details: they are about the way of
+   working.
 3. **What we know.** Revise `research/KNOWLEDGE.md`: what the work has revealed
    about the problem, distilled. Merge and rewrite, do not append.
 4. **Reload.** After `arl introspect close <id> --decision ...`, run

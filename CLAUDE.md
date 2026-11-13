@@ -46,15 +46,16 @@ enforced. `PROTOCOL.md` is what an agent reads before using it.
 - Every record names the arl that ran it (`__version__` and the commit). Raise
   `__version__` in `src/arl/__init__.py` and `pyproject.toml` when what a
   command checks or records changes.
-- `skill/LESSONS.md` is written by `arl lesson add --scope general`, from any
-  project on the machine, and committed here by that command, on whatever
-  branch this checkout is on. Prune it by hand; what has proved itself moves
-  into `PROTOCOL.md`.
-- The repository is public (`andreshernandez-spec/autoresearch-local`). `main`
-  there moves only through pull requests, so a change to the harness and the
-  lessons that piled up locally reach it on a branch and a PR. Nothing
-  project-specific and nothing about other people's systems goes into a
-  tracked file or a commit message.
+- The repository is public (`andreshernandez-spec/autoresearch-local`), and
+  the projects that use it are not. Nothing a research loop writes may end up
+  in a tracked file here: no experiment, no result, no project name beyond an
+  example, nothing about other people's systems. That holds for commit
+  messages too. `main` on GitHub moves only through pull requests.
+- `skill/LESSONS.md` is the one file a loop writes inside this checkout
+  (`arl lesson add --scope general`, from any project on the machine). It is
+  ignored by git and never committed; a test checks that. What has proved
+  itself is written into `PROTOCOL.md` by hand, in words that fit any
+  project.
 - `../.claude/skills/research-loop/` holds symlinks to `skill/SKILL.md` and
   `skill/LESSONS.md`.
 
