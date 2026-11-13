@@ -8,9 +8,9 @@ import re
 from pathlib import Path
 from typing import Any
 
-from . import contract, rules
+from . import contract, rules, runner
 from .ledger import Ledger
-from .util import fmt, now, read_text
+from .util import ArlError, fmt, now, read_text
 
 ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = ROOT / "bin" / "arl"
@@ -204,13 +204,54 @@ def _env_line(rec: dict[str, Any]) -> str:
     return f" Environment: {env.get('prefix') or 'the python on the PATH'}, python {env['python']}{named}."
 
 
+def _reported(rec: dict[str, Any]) -> list[str]:
+    """What the run says about itself in train_metrics.json."""
+    said = rec.get("train_metrics") or {}
+    return ["Reported by the run itself (not scored): " + ", ".join(f"{k} {fmt(v)}" for k, v in list(said.items())[:20]) + "."] if said else []
+
+
+def _env_facts(ledger: Ledger, rec: dict[str, Any], ref: dict[str, Any] | None) -> list[str]:
+    """Where the environment of a run is not the one it is compared with. A changed
+    package can explain a changed score, so the analysis starts from knowing it."""
+    out = []
+    env = rec.get("conditions", {}).get("env")
+    primary = ledger.cfg.primary.name
+    try:
+        if ref is not None and ref["id"] != rec["id"]:
+            differs = runner.env_differences(ledger, ref.get("conditions", {}).get("env"), env)
+            if differs:
+                out.append(
+                    f"The environment is not the one the reference {ref['id']} ran in ({runner.differences(len(differs))}): {runner.short(differs)}. "
+                    f"A difference in the scores may come from there. All of them: `arl exp env {ref['id']} {rec['id']}`."
+                )
+        elif rec.get("comparison", {}).get("outcome") == "reference":
+            last = ledger.track(rec["track"]).get("head_experiment")
+            if last and last != rec["id"]:
+                before = ledger.record(last)
+                differs = runner.env_differences(ledger, before.get("conditions", {}).get("env"), env)
+                value = f" ({primary} {fmt(before['metrics'][primary])})" if primary in before.get("metrics", {}) else ""
+                out.append(
+                    f"The track was last measured by {last}{value}, which no longer counts as its reference. "
+                    + (f"The environment since then ({runner.differences(len(differs))}): {runner.short(differs)}." if differs else "The environment is the same, as far as it was recorded.")
+                )
+        parts = rec["attempts"][-1].get("segments", [])
+        if len(parts) > 1:
+            between = runner.env_differences(ledger, parts[0].get("env"), parts[-1].get("env"))
+            if between:
+                out.append(f"The environment changed between the parts of this run ({runner.differences(len(between))}): {runner.short(between)}.")
+    except (ArlError, KeyError, OSError, TypeError, ValueError) as e:
+        out.append(f"The environments could not be compared ({e}).")
+    return out
+
+
 def analysis_facts(ledger: Ledger, rec: dict[str, Any]) -> str:
     cfg = ledger.cfg
     where = f"Code {rec['code_commit'][:10]} on `{rec['branch']}`, contract v{rec['contract']['version']}.{_env_line(rec)}"
     took = _took(rec)
     if rec["type"] not in rules.SCORED:
         kept = ", ".join(f"kept/{k}" for k in rec.get("kept", [])) or "none"
-        return f"Written by arl. Not scored. {took}. {where}\nSmall result files: {kept}. Everything else is under artifacts/."
+        extra = "".join(f"\n{line}" for line in _reported(rec) + _env_facts(ledger, rec, None))
+        return f"Written by arl. Not scored. {took}. {where}\nSmall result files: {kept}. Everything else is under artifacts/.{extra}"
     comp, metrics = rec["comparison"], rec["metrics"]
     ref = ledger.record(comp["reference"]) if comp.get("reference") else None
     head = ["metric", "role", "value"] + ([f"reference {ref['id']}", "gain"] if ref else [])
@@ -230,6 +271,7 @@ def analysis_facts(ledger: Ledger, rec: dict[str, Any]) -> str:
         lines.append(f"A change of at least {fmt(comp['min_delta'])} on {comp['metric']} counts as better or worse.")
     if comp["gate_failures"]:
         lines.append("Constraints not met: " + "; ".join(comp["gate_failures"]) + ".")
+    lines += _reported(rec) + _env_facts(ledger, rec, ref)
     lines.append(f"{took}. {where}")
     return "\n".join(lines)
 
@@ -273,6 +315,24 @@ def _activity_facts(ledger: Ledger, events: list[dict[str, Any]], window: list[d
     return out
 
 
+def _env_window_facts(ledger: Ledger, window: list[dict[str, Any]]) -> list[str]:
+    """Where the environment changed from one run to the next, for the runs of this window."""
+    try:
+        ran = [e for e in ledger.experiments() if e.get("conditions", {}).get("env") and e.get("attempts")]
+        ran.sort(key=lambda e: (e["attempts"][0]["started"], e["id"]))
+        inside, out = {e["id"] for e in window}, []
+        for before, after in zip(ran, ran[1:]):
+            if after["id"] in inside:
+                differs = runner.env_differences(ledger, before["conditions"]["env"], after["conditions"]["env"])
+                if differs:
+                    out.append(f"- between {before['id']} and {after['id']} ({runner.differences(len(differs))}): {runner.short(differs, 5)}")
+    except (ArlError, KeyError, OSError, TypeError, ValueError) as e:
+        return [f"Environment: the runs could not be compared ({e})."]
+    if not out:
+        return ["Environment: the same for every run of this window, as far as it was recorded."]
+    return ["The environment changed between runs (a possible reason for a changed score; `arl exp env <id> <other>` lists everything):", ""] + out
+
+
 def introspection_facts(ledger: Ledger, trigger: str, state_: dict[str, Any], activity_from: int) -> str:
     lock = contract.load(ledger)
     by_id = {e["id"]: e for e in ledger.experiments()}
@@ -289,6 +349,7 @@ def introspection_facts(ledger: Ledger, trigger: str, state_: dict[str, Any], ac
     others = sum(1 for e in by_id.values() for r in e.get("reruns", []) if r.get("split") != first)
     if len(ledger.cfg.splits) > 1:
         out.append(f"Runs on a confirmation split so far: {others}.")
+    out += [""] + _env_window_facts(ledger, window)
     if state_["last"]:
         tripwires = _section(ledger.introspection(state_["last"])[1], "6. Tripwires")
         out += ["", f"Tripwires set by {state_['last']}:", "", tripwires or "none written"]

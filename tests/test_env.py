@@ -12,7 +12,7 @@ import os
 import shutil
 import sys
 
-from arl import __version__, cli
+from arl import __version__, cli, runner
 from conftest import Project, env_table, git, install, make_env, pause_record
 
 
@@ -138,20 +138,29 @@ def test_a_changed_package_asks_for_a_new_baseline(project: Project):
     assert "with other packages (demo 1.0 -> 2.0)" in refused
     again = p.baseline(params={"x": 0.5})  # the same code and params with another package: a new measurement
     assert p.record(again)["comparison"]["outcome"] == "reference"
+    analysis = (p.ledger.exp_dir(again) / "analysis.md").read_text()  # did the change move the result? the facts to tell
+    assert "The track was last measured by E0002 (score 0.8), which no longer counts as its reference." in analysis
+    assert "The environment since then (1 difference): demo 1.0 -> 2.0." in analysis
     assert p.record(again)["conditions"]["env"]["versions"] == {"demo": "2.0"}
     p.tune(0.6, "keep", h)
     assert p.arl("verify").strip() == "ok"
 
 
-def test_a_rerun_with_other_packages_says_so(project: Project):
+def test_a_rerun_says_what_differs_from_the_environment_it_first_ran_in(project: Project):
+    """A rerun does not put the old environment back. It says what changed since."""
     p = project
     env, _ = pinned(p, "demo")
-    install(env, "demo", "2.0")
     out = p.arl("exp", "reproduce", "E0001")
-    assert "not with the packages of the recorded run: demo 1.0 -> 2.0" in out
-    rerun = p.record("E0001")["reruns"][0]
-    assert rerun["packages_changed"] == ["demo 1.0 -> 2.0"] and rerun["env"]["versions"] == {"demo": "2.0"}
-    assert "other packages (demo 1.0 -> 2.0)" in p.arl("exp", "show", "E0001")
+    assert "the environment is the one it first ran in" in out and "env_changed" not in p.record("E0001")["reruns"][0]
+    install(env, "demo", "2.0")
+    install(env, "other", "0.3")
+    out = p.arl("exp", "reproduce", "E0001")
+    assert "the environment is not the one it first ran in (2 differences): demo 1.0 -> 2.0; other 0.3 added" in out
+    assert "exp env E0001" in out
+    rerun = p.record("E0001")["reruns"][1]
+    assert rerun["env_changed"] == {"count": 2, "first": ["demo 1.0 -> 2.0", "other 0.3 added"]}
+    assert rerun["env"]["versions"] == {"demo": "2.0"} and rerun["env"]["listing"] != p.record("E0001")["conditions"]["env"]["listing"]
+    assert "rerun 2 on dev" in p.arl("exp", "show", "E0001") and "in another environment (2 differences: demo 1.0 -> 2.0; other 0.3 added)" in p.arl("exp", "show", "E0001")
 
 
 def test_a_paused_run_is_not_continued_with_other_packages(project: Project):
@@ -206,7 +215,7 @@ def test_show_says_what_an_experiment_ran_with_and_how_to_go_back_to_it(project:
     p.judge(eid, "discard", "--hyp", f"{h}=open")
     out = p.arl("exp", "show", eid)
     assert f"environment: {env}, python {sys.version.split()[0]}, demo 1.0" in out
-    assert f"ran under: contract v1, arl {__version__}" in out
+    assert "ran under: contract v1 (frozen in " in out and f", arl {__version__}" in out and f"exp env {eid}" in out
     rec = p.record(eid)
     assert f"diff {rec['base_commit'][:10]} {rec['code_commit'][:10]} -- . ':(exclude)research'" in out
     assert f"exp reproduce {eid}" in out and f"track new <name> --from {eid}" in out
@@ -302,3 +311,136 @@ def test_a_cloned_project_goes_on_where_it_was(project: Project, monkeypatch):
     q.arl("exp", "reproduce", "E0002")  # an old result, made again from its recorded commit
     assert q.record("E0002")["reruns"][0]["reproduced"] is True
     assert q.arl("verify").strip() == "ok"
+
+
+# --- the package list of every run, and what changed between two runs -----------------------
+
+
+def test_every_run_stores_the_packages_python_saw(project: Project):
+    """No setting needed: arl asks the python of the job and keeps the list in the ledger."""
+    p = project
+    env = make_env(p.base / "env")
+    install(env, "plain", "1.0")
+    mine = p.base / "mine"  # an editable install is whatever its folder holds
+    mine.mkdir()
+    git(mine, "init", "-q", "-b", "main")
+    git(mine, "config", "user.email", "test@example.org")
+    git(mine, "config", "user.name", "Test")
+    (mine / "code.py").write_text("as committed\n")
+    git(mine, "add", "-A")
+    git(mine, "commit", "-q", "-m", "mine")
+    head = git(mine, "rev-parse", "HEAD")[:12]
+    install(env, "mine", "0.1", editable=mine)
+    (env / "conda-meta").mkdir()  # what conda installed has a build, also for libraries python does not list
+    (env / "conda-meta" / "libblas-3.9.0-20_mkl.json").write_text("{}")
+    p.started(python="python", extra=env_table(env))
+    recorded = p.record("E0001")["conditions"]["env"]
+    path = p.research / "envs" / f"{recorded['listing']}.txt"
+    listing = path.read_text().splitlines()
+    assert listing[0] == f"python=={sys.version.split()[0]}"
+    assert "plain==1.0" in listing and f"mine==0.1 (editable {mine} at {head})" in listing and "conda: libblas=3.9.0=20_mkl" in listing
+    assert f"research/envs/{path.name}" in git(p.root, "ls-files", "research/envs")  # part of the experiment's history
+    out = p.arl("exp", "env", "E0001")
+    assert "every package python saw: research/envs/" in out and "Compared with the environment as it is now: no difference" in out
+    # Two changes no version number shows: the editable folder is edited, a library is rebuilt.
+    (mine / "code.py").write_text("changed by hand\n")
+    (env / "conda-meta" / "libblas-3.9.0-20_mkl.json").rename(env / "conda-meta" / "libblas-3.9.0-20_netlib.json")
+    before = sorted(f.name for f in (p.research / "envs").iterdir())
+    out = p.arl("exp", "env", "E0001")
+    assert "Compared with the environment as it is now, 2 differences:" in out
+    assert f"  mine 0.1 (editable {mine} at {head}) -> 0.1 (editable {mine} at {head}, modified)" in out
+    assert "  conda libblas 3.9.0 20_mkl -> 3.9.0 20_netlib" in out
+    assert sorted(f.name for f in (p.research / "envs").iterdir()) == before  # looking stores nothing
+
+
+def test_a_project_that_names_no_environment_still_gets_the_list(project: Project):
+    p = project
+    p.started()
+    recorded = p.record("E0001")["conditions"]["env"]
+    assert "prefix" not in recorded and "packages" not in recorded
+    assert (p.research / "envs" / f"{recorded['listing']}.txt").read_text().startswith("python==")
+
+
+def test_the_output_of_a_command_is_stored_beside_the_list(project: Project):
+    p = project
+    p.started(extra='[env]\ncommand = "echo from-the-command"\n')
+    recorded = p.record("E0001")["conditions"]["env"]
+    assert (p.research / "envs" / f"{recorded['packages']}.txt").read_text() == "from-the-command\n"
+    assert recorded["listing"] != recorded["packages"]
+    assert "the output of [env] command: research/envs/" in p.arl("exp", "env", "E0001")
+
+
+def test_a_changed_environment_is_said_where_a_score_is_read(project: Project):
+    """Nothing is gated here (the contract names no packages), and nothing goes unsaid."""
+    p = project
+    env = make_env(p.base / "env")
+    install(env, "extra", "1.0")
+    h = p.started(python="python", extra=env_table(env))
+    first = p.tune(0.5, "keep", h)  # same environment as the baseline
+    assert "The environment is not" not in (p.ledger.exp_dir(first) / "analysis.md").read_text()
+    install(env, "extra", "2.0")  # somebody upgrades a package the contract does not name
+    second = p.draft("tune", hyps=(h,), params={"x": 0.6})
+    p.arl("exp", "run", second)
+    analysis = (p.ledger.exp_dir(second) / "analysis.md").read_text()
+    assert f"The environment is not the one the reference {first} ran in (1 difference): extra 1.0 -> 2.0." in analysis
+    assert "A difference in the scores may come from there." in analysis and f"`arl exp env {first} {second}`" in analysis
+    p.judge(second, "keep", "--hyp", f"{h}=supported")
+    out = p.arl("exp", "env", first, second)
+    assert f"Compared with the one {second} ran in, 1 difference:" in out and "  extra 1.0 -> 2.0" in out
+    assert f"Compared with the one {first} ran in: no difference" in p.arl("exp", "env", "E0001", first)
+    p.arl("introspect", "new", "--trigger", "asked")
+    facts = (p.research / "introspections" / "N001.md").read_text()
+    assert "The environment changed between runs" in facts
+    assert f"- between {first} and {second} (1 difference): extra 1.0 -> 2.0" in facts
+    assert "between E0001" not in facts  # the first two runs had the same one
+
+
+def test_an_introspection_says_when_nothing_changed(project: Project):
+    p = project
+    h = p.started()
+    p.tune(0.5, "keep", h)
+    p.arl("introspect", "new", "--trigger", "asked")
+    assert "Environment: the same for every run of this window" in (p.research / "introspections" / "N001.md").read_text()
+
+
+def test_what_a_run_reports_about_itself_is_part_of_the_record(project: Project):
+    p = project
+    h = p.started()
+    eid = p.draft("tune", hyps=(h,), params={"x": 0.5, "report": {"loss": 0.25, "steps": 40, "note": "text"}})
+    out = p.arl("exp", "run", eid)
+    assert p.record(eid)["train_metrics"] == {"loss": 0.25, "steps": 40.0}
+    assert "reported by the run itself (not scored): loss 0.25, steps 40" in out
+    assert "Reported by the run itself (not scored): loss 0.25, steps 40." in (p.ledger.exp_dir(eid) / "analysis.md").read_text()
+    assert p.record(eid)["comparison"]["outcome"] == "improve"  # the evaluator's score decides, as before
+    p.judge(eid, "keep", "--hyp", f"{h}=supported")
+    p.arl("exp", "reproduce", eid)
+    assert p.record(eid)["reruns"][0]["train_metrics"] == {"loss": 0.25, "steps": 40.0}
+    broken = p.draft("tune", hyps=(h,), params={"x": 0.6, "report": "not json"})
+    out = p.arl("exp", "run", broken)  # a report that cannot be read does not fail the run
+    assert "train_metrics" not in p.record(broken) and "train_metrics.json is not JSON" in out
+
+
+def test_show_names_the_commit_that_froze_the_contract(project: Project):
+    p = project
+    p.started()
+    frozen = git(p.root, "log", "-1", "--format=%h", "--grep", "freeze contract v1$")
+    assert f"contract v1 (frozen in {frozen}: git show {frozen}:research/arl.toml)" in p.arl("exp", "show", "E0001")
+    assert "[project]" in git(p.root, "show", f"{frozen}:research/arl.toml")
+
+
+def test_a_run_continued_in_a_changed_environment_says_so(project: Project):
+    p = project
+    env = make_env(p.base / "env")
+    install(env, "extra", "1.0")
+    h = p.started(python="python", extra=env_table(env))
+    eid = p.draft("tune", hyps=(h,), params={"x": 0.5})
+    pause_record(p, eid)
+    rec = p.record(eid)  # the first part of the run, with the environment it had
+    rec["attempts"][-1]["segments"][0]["env"] = rec["conditions"]["env"] = runner.environment(p.ledger, runner.probe_env(p.ledger))
+    p.ledger.save_record(rec)
+    install(env, "extra", "2.0")  # changed while the run was paused
+    p.arl("exp", "run", eid)
+    analysis = (p.ledger.exp_dir(eid) / "analysis.md").read_text()
+    assert "The environment changed between the parts of this run (1 difference): extra 1.0 -> 2.0." in analysis
+    parts = p.record(eid)["attempts"][-1]["segments"]
+    assert parts[0]["env"]["listing"] != parts[1]["env"]["listing"]

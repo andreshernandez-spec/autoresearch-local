@@ -30,7 +30,7 @@ also the path the skill file names. Cloned anywhere else it works the same:
 | **Hypothesis, design and evaluation are separate** | Three records written at three times. A hypothesis is a claim with an observable consequence, no plan. A design names the change and the prediction; its hash is taken when the run starts, so it cannot be adjusted to the result. The number comes from the frozen evaluator, the outcome (improve, neutral, worse, constraint not met) is computed, and the verdict has to be one that outcome allows. |
 | **Experiments come in kinds** | `baseline` measures a track as it is. `tune` changes params only. `feature` changes code. `diagnose` observes: not scored, never merged. Each kind is held to what it may change: a baseline with other params than its track's is refused, and so is a tune with a code change. |
 | **Parallel code tracks** | A track is one approach: a branch (`track/<name>`) with its own worktree. A code experiment gets a branch off the track head. Keep is a fast-forward of the track, discard leaves the branch where it is. arl never resets, rebases or pushes, and never deletes a branch. |
-| **Everything can be recalled** | Each experiment has a `record.json`: commit, params, command, contract version, the environment and its package list, the version of arl, data hashes, timings, the parts the run was made of, artifact hashes, metrics, comparison, verdict. A run whose code or contract changed while it was going is failed, not recorded. The ledger is committed at every step. `arl exp show` reads it back, `arl exp reproduce` runs it again from the recorded commit, `arl track new --from <id>` starts a new line of work from it, `arl verify` checks ledger, contract and git against each other. Below. |
+| **Everything can be recalled** | Each experiment has a `record.json`: commit, params, command, contract version, the environment with the list of every package python saw, the version of arl, data hashes, timings, the parts the run was made of, artifact hashes, the evaluator's metrics and what the run reported about itself, comparison, verdict. Where two runs did not have the same environment, arl says so and says what differs. A run whose code or contract changed while it was going is failed, not recorded. The ledger is committed at every step. `arl exp show` reads it back, `arl exp reproduce` runs it again from the recorded commit, `arl track new --from <id>` starts a new line of work from it, `arl verify` checks ledger, contract and git against each other. Below. |
 | **One environment** | The contract names the environment runs use (`[env] prefix`). arl puts it first on the PATH of every job, whoever started the command, asks its python what it is before each run, and refuses to start when it is not that environment. The contract also names the packages that must not change between two results that are compared (`[env] packages`). Below. |
 | **The introspection step** | After a set number of experiments, a run of failures on one track, or a number of days, no new experiment can be drafted until an introspection is written and closed. It has four parts, below. Decisions the agent may not take alone wait for a person, and nothing runs while they wait. Tracks are opened, parked and reopened only by the latest closed introspection or by a person. After a decision to stop, only a person reopens the program. |
 | **A document of ideas** | `research/IDEAS.md`. Whatever comes up that is outside the current experiment is written there instead of chased. Every introspection goes through the open ones. |
@@ -107,7 +107,6 @@ active. With it, that no longer matters:
 [env]
 prefix = "~/anaconda3/envs/project"     # a conda env or a venv
 packages = ["numpy", "jax", "optax"]    # must be the same for two results to be compared
-command = "python -m pip freeze"        # the whole list, stored with every run
 ```
 
 - **`prefix`.** Every run, evaluation and rerun starts with `<prefix>/bin`
@@ -126,13 +125,58 @@ command = "python -m pip freeze"        # the whole list, stored with every run
   experiment, a draft made before the change is `outdated`, and a paused run
   is not continued. Name the packages the method and the evaluator compute
   with, not everything: a list that changes daily asks for a baseline daily.
-- **`command`.** Its output is the full list, stored once per distinct content
-  under `research/envs/`. It gates nothing. It is what rebuilds the
-  environment on another machine.
+
+Whatever the contract says, arl asks the python of the job what it sees and
+stores the answer with every run and every rerun, once per distinct content,
+under `research/envs/` in the project's git:
+
+- every package with its version;
+- for an editable install the folder it points at, the commit that folder is
+  on, and whether it has changes that are not committed (an editable package
+  is whatever its folder holds, and no version number shows that);
+- for a conda environment what conda installed, with the build: also the
+  libraries python does not list, such as the BLAS a numpy is linked against.
+
+The machine, the system, the GPU and its driver are in the record beside it.
+`[env] command` adds the output of one more command, stored the same way.
+These lists name folders and the machine: something to know before a
+project's ledger is published.
+
+**A changed environment is said, not prevented.** A rerun does not put an old
+environment back: on one machine that is rarely worth it. What arl does is
+say what is different, because that can explain a different result:
+
+- `arl exp reproduce` prints what differs from the environment the experiment
+  first ran in, and keeps it with the rerun;
+- the facts of an analysis say when the run did not have the environment of
+  the reference it is compared with, and what differs;
+- a new baseline after a named package changed says what the track scored
+  before and what changed since, which is the measurement of whether the
+  change moved the result;
+- the facts of an introspection list every change between two runs of its
+  window;
+- `arl exp env E0007` compares the environment of an experiment with the one
+  that is there now, `arl exp env E0007 E0012` with that of another.
 
 What an agent types itself (a quick check in python, a test run) uses its own
 shell. `arl reload`, the first command of a session, says where runs happen
 and, when the shell's `python` is another one, which interpreter to call.
+
+## What an experiment records
+
+| | Where | In git |
+|---|---|---|
+| The claim and the prediction | the hypothesis file, `design.md` (hashed when the run starts) | yes |
+| Parameters | `params.json` (hashed when the run starts) | yes |
+| Code | the commit in `record.json`, on a branch arl never deletes | yes |
+| Configuration | the contract version in `record.json`; `exp show` names the commit that froze it | yes |
+| Inputs | name, size and sha256 of every file under `[data] files`; the evaluator's own files are part of the contract | the hashes |
+| Environment | prefix, python, machine, system, GPU and driver, arl version, and the list of every package | yes |
+| Outputs | name, size and sha256 of every file the run wrote; small ones copied into `kept/` | hashes and small files |
+| Test metrics | `metrics.json`, written by the frozen evaluator; reruns on other splits beside it | yes |
+| Training metrics | what the run reports about itself in `{out}/train_metrics.json` | yes |
+| Timings, the parts of a paused run, failures | `record.json` | yes |
+| Outcome, verdict, reasons | `record.json`, `analysis.md` | yes |
 
 ## Going back to an experiment
 
@@ -148,8 +192,9 @@ arl track new again --from E0007    # a new line of work that starts there
 ```
 
 - **Look.** `exp show` prints the scores, the verdict and its reason, the
-  commit, the params, the environment, the contract version, the arl version,
-  and the git command that shows its code change. The folder
+  commit, the params, the environment, the contract version with the commit
+  that froze it, the arl version, and the git command that shows its code
+  change. `exp env` says what changed in the environment since. The folder
   `research/experiments/E0007-<slug>/` holds the design with the prediction
   written before the run, the analysis written after, the small result files,
   and the end of the logs. `git log -- research/experiments/E0007-*` shows
@@ -270,6 +315,11 @@ Two commands in `arl.toml`:
 - `[eval] command`: runs in the home checkout, reads `{out}`, and writes one
   JSON object to `{metrics}` with a number for every `[[metric]]`.
 
+A run that has something to say about itself (training loss, steps, time)
+writes it to `{out}/train_metrics.json`, one JSON object of numbers. arl keeps
+it in the record and shows it with the result. It is never compared and never
+part of a verdict: the score comes from the evaluator.
+
 The evaluator must not import code that experiments can change, and the run
 must not compute its own score. One metric is `primary` (with `min_delta`, the
 smallest change that counts). `constraint` metrics have a `limit` or a
@@ -318,7 +368,7 @@ experiments/E0007-<slug>/
     artifacts/  logs/            not in git (hashes are in the record)
     artifacts/run-1/checkpoint/  the state a job saves to be continued
 introspections/N002.md
-envs/<hash>.txt                  package listings, one per distinct content
+envs/<hash>.txt                  what python saw in a run: every package, once per distinct content
 ```
 
 The ledger lives on the project's home branch. Track branches fork from it and
@@ -342,7 +392,7 @@ arl track      new | set | sync | worktree | list
 arl hyp        new | set | list
 arl idea       add | set | list
 arl lesson     add | list
-arl exp        new | commit | run | pause | fail | judge | abandon | show | list | log | reproduce
+arl exp        new | commit | run | pause | fail | judge | abandon | show | env | list | log | reproduce
 arl introspect due | new | close | resolve
 ```
 
@@ -366,8 +416,9 @@ machine is busy, 1 a gate refused.
   first on its PATH and the variables above, not what `conda activate` would
   add from the environment's own scripts. A project that needs those sets them
   in its command.
-- No watch over packages the contract does not name. Their change is on
-  record (the stored lists differ) and gates nothing.
+- No return to an old environment. A rerun uses the one that is there and
+  says what differs from the recorded one. A change in a package the contract
+  does not name is reported and gates nothing.
 - No guard against a determined cheat. The hashes and gates stop drift and
   rationalization, not someone who edits `frozen.lock` by hand. Git shows that.
   "A person at a terminal" is a check that the command runs in a terminal; a

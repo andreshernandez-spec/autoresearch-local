@@ -351,6 +351,46 @@ for name in json.loads(sys.argv[1]):
         found[name] = None
 print(json.dumps({"prefix": sys.prefix, "python": sys.version.split()[0], "packages": found}))
 """
+_LISTING = """\
+import importlib.metadata as m, json, os, subprocess, sys
+
+def git(path, *args):
+    out = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=30)
+    return out.stdout.strip() if out.returncode == 0 else None
+
+lines = set()
+for d in m.distributions():
+    name = d.metadata["Name"] if d.metadata else None
+    if not name:
+        continue
+    line = name + "==" + d.version
+    try:
+        url = json.loads(d.read_text("direct_url.json") or "{}")
+    except Exception:
+        url = {}
+    where = str(url.get("url", ""))
+    if url.get("dir_info", {}).get("editable") and where.startswith("file://"):
+        # An editable install is whatever its folder holds now: say which commit, and whether it was changed.
+        path = where[7:]
+        line += " (editable " + path
+        try:
+            head = git(path, "rev-parse", "HEAD")
+            if head:
+                # --no-optional-locks: only looking, in a folder somebody else may be working in
+                line += " at " + head[:12] + (", modified" if git(path, "--no-optional-locks", "status", "--porcelain", "--untracked-files=no") else "")
+        except Exception:
+            pass
+        line += ")"
+    lines.add(line)
+print("python==" + sys.version.split()[0])
+print("\\n".join(sorted(lines, key=str.lower)))
+meta = os.path.join(sys.prefix, "conda-meta")
+if os.path.isdir(meta):  # what conda installed, with the build: also the libraries python does not list
+    for f in sorted(os.listdir(meta), key=str.lower):
+        if f.endswith(".json") and f.count("-") >= 2:
+            name, version, build = f[:-5].rsplit("-", 2)
+            print("conda: " + name + "=" + version + "=" + build)
+"""
 _POINTS_ELSEWHERE = ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV")
 
 
@@ -468,10 +508,38 @@ def harness_version() -> str:
 # --- conditions -------------------------------------------------------------------
 
 
-def environment(ledger: Ledger, probed: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Where and with what the run happens. The package list is stored once per content.
+def own_listing(ledger: Ledger) -> str | None:
+    """Every package the python of a job would see, asked of that python: name and
+    version, for an editable install its folder, commit and whether it was changed,
+    and for a conda environment what conda installed, with the build. None when
+    there is no python to ask: a run does not depend on this."""
+    try:
+        out = subprocess.run(["bash", "-c", 'exec python -I -c "$0"', _LISTING], cwd=ledger.home, env=job_env(ledger), capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return out.stdout if out.returncode == 0 and out.stdout.startswith("python==") else None
+
+
+def command_listing(ledger: Ledger) -> str | None:
+    """The output of [env] command, when the contract has one."""
+    cmd = ledger.cfg.env_command
+    if not cmd:
+        return None
+    out = subprocess.run(["bash", "-c", cmd], cwd=ledger.home, env=job_env(ledger), capture_output=True, text=True, timeout=300)
+    if out.returncode != 0:
+        raise ArlError(f"[env] command failed: {cmd}\n{out.stderr.strip()[-2000:]}")
+    return out.stdout
+
+
+LISTS = ("listing", "packages")  # arl's own list of what python sees, and the output of [env] command
+
+
+def snapshot(ledger: Ledger, probed: dict[str, Any] | None = None, store: bool = True) -> tuple[dict[str, Any], dict[str, str]]:
+    """Where and with what a run happens: what goes into a record, and the package lists as text.
 
     probed: what probe_env answered, when the contract names an environment or packages.
+    store: keep the lists under research/envs/, once per distinct content. A command
+    that only looks leaves it out.
     """
     info: dict[str, Any] = {
         "host": socket.gethostname(),
@@ -483,18 +551,144 @@ def environment(ledger: Ledger, probed: dict[str, Any] | None = None) -> dict[st
     gpu = _nvidia("name,driver_version")
     if gpu:
         info["gpu"] = [row.strip() for row in gpu]
-    cmd = ledger.cfg.env_command
-    if cmd:
-        out = subprocess.run(["bash", "-c", cmd], cwd=ledger.home, env=job_env(ledger), capture_output=True, text=True, timeout=300)
-        if out.returncode != 0:
-            raise ArlError(f"[env] command failed: {cmd}\n{out.stderr.strip()[-2000:]}")
-        digest = sha256_text(out.stdout)[:16]
-        ledger.env_root.mkdir(parents=True, exist_ok=True)
-        listing = ledger.env_root / f"{digest}.txt"
-        if not listing.exists():
-            listing.write_text(out.stdout)
-        info["packages"] = digest
-    return info
+    texts = {key: text for key, text in (("listing", own_listing(ledger)), ("packages", command_listing(ledger))) if text is not None}
+    for key, text in texts.items():
+        info[key] = sha256_text(text)[:16]
+        if store:
+            ledger.env_root.mkdir(parents=True, exist_ok=True)
+            path = ledger.env_root / f"{info[key]}.txt"
+            if not path.exists():
+                path.write_text(text)
+    return info, texts
+
+
+def environment(ledger: Ledger, probed: dict[str, Any] | None = None) -> dict[str, Any]:
+    """What goes into a record about the environment. The package lists are stored with it."""
+    return snapshot(ledger, probed)[0]
+
+
+def stored_listing(ledger: Ledger, env: dict[str, Any] | None, key: str = "listing") -> str | None:
+    """A package list a record points at, if it is still in the ledger."""
+    digest = (env or {}).get(key)
+    path = ledger.env_root / f"{digest}.txt" if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{8,64}", digest) else None
+    try:
+        return path.read_text() if path is not None and path.exists() else None
+    except OSError:
+        return None
+
+
+def _name(text: str) -> str:
+    return re.sub(r"[-_.]+", "-", text.strip()).lower()
+
+
+def _packages(text: str) -> dict[str, str]:
+    """A package list as {name: what the list says about it}. arl's own lines and the
+    lines pip freeze writes are understood; any other line stands for itself."""
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("conda: ") and line.count("=") >= 2:
+            name, version, build = line[7:].rsplit("=", 2)
+            out[f"conda {_name(name)}"] = f"{version} {build}"
+        elif line.startswith("-e "):
+            rest = line[3:].strip()
+            if "#egg=" in rest:
+                where, name = rest.rsplit("#egg=", 1)
+                tail = where.split("://", 1)[-1]
+                out[_name(name.split("&")[0])] = f"editable at {tail.rsplit('@', 1)[1][:12]}" if "@" in tail else f"editable from {where}"
+            else:
+                out[_name(os.path.basename(rest.rstrip("/")) or rest)] = f"editable in {rest}"
+        elif "==" in line:
+            name, said = line.split("==", 1)
+            out[_name(name)] = said.strip()
+        elif " @ " in line:
+            name, said = line.split(" @ ", 1)
+            out[_name(name)] = f"from {said.strip()}"
+        else:
+            out[line] = ""
+    return out
+
+
+def listing_changes(old: str, new: str) -> list[str]:
+    """What differs between two package lists, one line per package. What conda says about
+    a package is left out where the line of python already says the same."""
+    before, after = _packages(old), _packages(new)
+
+    def conda_repeats(key: str) -> bool:
+        base = key[6:]
+        if not key.startswith("conda ") or (base not in before and base not in after):
+            return False
+        if key in before and key in after:  # say it only when the build changed and the version did not
+            return before[key].split()[0] != after[key].split()[0]
+        return (base in before) == (key in before) and (base in after) == (key in after)
+
+    def order(k: str) -> tuple[int, bool, str]:  # what changed first, then what is new, then what is gone
+        return (0 if k in before and k in after else 1 if k in after else 2, k.startswith("conda "), k)
+
+    out = []
+    for k in sorted((k for k in {*before, *after} if before.get(k) != after.get(k) and not conda_repeats(k)), key=order):
+        if k in before and k in after:
+            out.append(f"{k} {before[k] or 'listed'} -> {after[k] or 'listed'}")
+        else:
+            said = after[k] if k in after else before[k]
+            out.append(f"{k}{' ' + said if said else ''} {'added' if k in after else 'removed'}")
+    return out
+
+
+def env_differences(ledger: Ledger, old: dict[str, Any] | None, new: dict[str, Any] | None, new_texts: dict[str, str] | None = None) -> list[str]:
+    """Everything two recorded environments differ in that could change a result:
+    the machine, the system, the GPU and its driver, python, and the package lists.
+
+    new_texts: the lists of the newer one, when they are at hand and not stored.
+    Never raises: a record from an older arl, or a list that is gone, says less.
+    """
+    old, new, out = old or {}, new or {}, []
+    for key, label in (("host", "machine"), ("platform", "system"), ("prefix", "environment"), ("python", "python")):
+        if old.get(key) and new.get(key) and old[key] != new[key]:
+            out.append(f"{label} {old[key]} -> {new[key]}")
+    if old.get("gpu") and new.get("gpu") and old["gpu"] != new["gpu"]:
+        out.append(f"GPU and driver {'; '.join(map(str, old['gpu']))} -> {'; '.join(map(str, new['gpu']))}")
+    both = [key for key in LISTS if old.get(key) and new.get(key)]
+    if both:
+        key = both[0]  # arl's own list when both runs have it: one format, every package with its version
+        if old[key] != new[key]:
+            before = stored_listing(ledger, old, key)
+            after = (new_texts or {}).get(key) or stored_listing(ledger, new, key)
+            if before is None or after is None:
+                out.append("the package lists differ, and one of them is no longer in the ledger")
+            else:
+                said = any(line.startswith("python ") for line in out)
+                out += [c for c in listing_changes(before, after) if not (said and c.startswith("python "))]
+    elif old.get("versions") and new.get("versions"):
+        out += [c for c in env_changes(old, new) if not c.startswith("python ")]
+    return out
+
+
+def differences(n: int) -> str:
+    return f"{n} difference{'' if n == 1 else 's'}"
+
+
+def short(changes: list[str], first: int = 6) -> str:
+    """A list of differences in one line: the first few, and how many more."""
+    more = len(changes) - first
+    return "; ".join(changes[:first]) + (f"; and {more} more" if more > 0 else "")
+
+
+def read_train_metrics(path: Path) -> tuple[dict[str, float], str]:
+    """What a run reports about itself ({out}/train_metrics.json): numbers, kept as they
+    are and never compared. Returns them and, when the file is no good, why."""
+    if not path.exists():
+        return {}, ""
+    try:
+        data = json.loads(read_text(path))
+    except (ArlError, OSError, json.JSONDecodeError) as e:
+        return {}, f"{path.name} is not JSON ({e}): not recorded"
+    if not isinstance(data, dict):
+        return {}, f"{path.name} must hold one JSON object: not recorded"
+    numbers = {str(k): float(v) for k, v in data.items() if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)}
+    return dict(list(numbers.items())[:200]), ""
 
 
 def data_fingerprint(ledger: Ledger) -> list[dict[str, Any]]:

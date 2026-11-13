@@ -1280,6 +1280,11 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
                         attempt["run_done"] = True
             if not failed and not paused:
                 rec["artifacts"] = runner.manifest(out)  # what the run left, before the evaluator adds to it
+                reported, note = runner.read_train_metrics(out / "train_metrics.json")
+                if reported:
+                    rec["train_metrics"] = reported  # what the run says about itself: kept, never compared
+                if note:
+                    attempt["warning"] = "; ".join(filter(None, [attempt.get("warning"), note]))
                 if scored and not [a for a in rec["artifacts"] if not a["path"].startswith("checkpoint/")]:
                     failed = "the run wrote nothing into its output folder"
             if not failed and not paused and scored:
@@ -1417,6 +1422,8 @@ def _summary(ledger: Ledger, rec: dict[str, Any]) -> str:
         for g in comp["gate_failures"]:
             lines.append(f"  constraint not met: {g}")
         lines.append(f"  outcome: {comp['outcome']}")
+    if rec.get("train_metrics"):
+        lines.append("  reported by the run itself (not scored): " + ", ".join(f"{k} {fmt(v)}" for k, v in list(rec["train_metrics"].items())[:12]))
     if rec["status"] in ("judged", "judging", "abandoned"):
         v = rec["verdict"]
         lines.append(f"  verdict: {v['decision']}. {v['reason']}")
@@ -1565,22 +1572,80 @@ def cmd_exp_show(args: argparse.Namespace) -> int:
             print(f"  rerun {r['n']} on {r['split']}: FAILED: {r['failed']}")
         else:
             value = fmt(r["metrics"][name]) if name in r.get("metrics", {}) else "not reported"
-            other = f", other packages ({'; '.join(r['packages_changed'])})" if r.get("packages_changed") else ""
+            changed = r.get("env_changed")
+            other = f", in another environment ({runner.differences(changed['count'])}: {runner.short(changed['first'], 3)})" if changed else ""
             print(f"  rerun {r['n']} on {r['split']}: {name} {value}" + (f", reproduced: {r['reproduced']}" if "reproduced" in r else "") + other)
     env = rec.get("conditions", {}).get("env")
     if env:
         named = [f"{k} {v}" for k, v in (env.get("versions") or {}).items()]
         what = [env.get("prefix") or "the python of the shell that ran it"] + ([f"python {env['python']}"] if env.get("python") else []) + named
-        listing = f"; every package: {ledger.name}/envs/{env['packages']}.txt" if env.get("packages") else ""
+        digest = env.get("listing") or env.get("packages")
+        listing = f"; every package: {ledger.name}/envs/{digest}.txt" if digest else ""
         print(f"  environment: {', '.join(what)}{listing}")
-        print(f"  ran under: contract v{rec['contract']['version']}, arl {env.get('arl', '(version not recorded)')}, on {env.get('host', 'an unnamed machine')}")
+        print(f"  ran under: {_contract_at(ledger, rec['contract']['version'])}, arl {env.get('arl', '(version not recorded)')}, on {env.get('host', 'an unnamed machine')}")
     print(f"  files: {exp}")
     code, base = rec.get("code_commit"), rec["base_commit"]
     if code and code != base:
         print(f"  its code change:  git -C {ledger.home} diff {base[:10]} {code[:10]} -- . ':(exclude){ledger.name}'")
+    if env:
+        print(f"  what changed since: {ARL} exp env {rec['id']}")
     if rec["type"] in rules.SCORED and "metrics" in rec:
         print(f"  run it again:     {ARL} exp reproduce {rec['id']}")
         print(f"  start from it:    {ARL} track new <name> --from {rec['id']}")
+    return 0
+
+
+def _contract_at(ledger: Ledger, version: int) -> str:
+    """A contract version with the commit that froze it, so its files can be read as they were."""
+    try:
+        found = ledger.git("log", "-1", "--format=%h", "--grep", f"freeze contract v{version}$").strip()
+    except ArlError:
+        found = ""
+    return f"contract v{version}" + (f" (frozen in {found}: git show {found}:{ledger.name}/arl.toml)" if found else "")
+
+
+def _env_lines(ledger: Ledger, env: dict[str, Any]) -> list[str]:
+    named = ", ".join(f"{k} {v}" for k, v in (env.get("versions") or {}).items())
+    lines = [f"  environment: {env.get('prefix') or 'not named by the contract'}" + (f", python {env['python']}" if env.get("python") else "") + (f", {named}" if named else "")]
+    lines.append(f"  machine: {env.get('host', 'not recorded')}, {env.get('platform', 'system not recorded')}")
+    if env.get("gpu"):
+        lines.append(f"  GPU and driver: {'; '.join(map(str, env['gpu']))}")
+    lines.append(f"  arl: {env.get('arl', 'version not recorded')}")
+    for key, label in (("listing", "every package python saw"), ("packages", "the output of [env] command")):
+        if env.get(key):
+            text = runner.stored_listing(ledger, env, key)
+            size = f"{len(text.splitlines())} lines" if text is not None else "no longer in the ledger"
+            lines.append(f"  {label}: {ledger.name}/envs/{env[key]}.txt ({size})")
+    return lines
+
+
+def cmd_exp_env(args: argparse.Namespace) -> int:
+    """The environment an experiment ran in, and what differs from now or from another experiment."""
+    ledger = Ledger.locate()
+    rec = ledger.record(check_id("E", args.id))
+    env = rec.get("conditions", {}).get("env")
+    if not env:
+        raise ArlError(f"{rec['id']} has not run: there is no environment to show")
+    print(f"{rec['id']} ran in:")
+    print("\n".join(_env_lines(ledger, env)))
+    if args.other:
+        other = ledger.record(check_id("E", args.other))
+        there = other.get("conditions", {}).get("env")
+        if not there:
+            raise ArlError(f"{other['id']} has not run: there is no environment to compare with")
+        differs, against = runner.env_differences(ledger, env, there), f"the one {other['id']} ran in"
+    else:
+        probed = _env_or_problem(ledger)
+        if probed and probed.get("problem"):
+            print(f"The environment cannot be asked now: {probed['problem'].splitlines()[0]}")
+            return 1
+        now_env, texts = runner.snapshot(ledger, probed, store=False)
+        differs, against = runner.env_differences(ledger, env, now_env, texts), "the environment as it is now"
+    if differs:
+        print(f"Compared with {against}, {runner.differences(len(differs))}:")
+        print("\n".join(f"  {line}" for line in differs))
+    else:
+        print(f"Compared with {against}: no difference in what was recorded.")
     return 0
 
 
@@ -1647,9 +1712,11 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
         env = _run_env(ledger, rec, values, resume=False)
         limits = {"max_rss_gb": cfg.max_run_rss_gb, "min_free_ram_gb": cfg.stop_below_free_ram_gb, "pause_file": logs / "pause.request", "pause_grace": cfg.pause_grace}
         entry: dict[str, Any] = {"n": n, "at": now(), "split": split, "eval_digest": lock["eval_digest"], "env": env_now}
-        then = rec["conditions"]
-        if probed and probed.get("digest") and then.get("env_digest") not in (None, probed["digest"]):
-            entry["packages_changed"] = runner.env_changes(then.get("env"), probed)
+        # A rerun does not put the old environment back. It says what is different now,
+        # since that can explain a different result. Both package lists are in the ledger.
+        differs = runner.env_differences(ledger, rec["conditions"].get("env"), env_now)
+        if differs:
+            entry["env_changed"] = {"count": len(differs), "first": differs[:20]}
 
         def why(res: dict[str, Any]) -> str:
             if res["paused"]:
@@ -1681,6 +1748,9 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
                     failed = "the contract was frozen anew during the rerun"
                 else:
                     metrics = runner.read_metrics(metrics_path, cfg)
+                    reported = runner.read_train_metrics(out / "train_metrics.json")[0]
+                    if reported:
+                        entry["train_metrics"] = reported
         except ArlError as e:
             failed = str(e).splitlines()[0]
         except BaseException:
@@ -1725,8 +1795,11 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
         print(f"{eid} rerun on split '{split}' FAILED: {failed}. Log: {logs / f'rerun-{n}.log'}")
         return EXIT_CRASH
     print(f"{eid} rerun on split '{split}': {primary.name} = {fmt(metrics[primary.name])}")
-    if entry.get("packages_changed"):
-        print(f"  not with the packages of the recorded run: {'; '.join(entry['packages_changed'])}")
+    if differs:
+        print(f"  the environment is not the one it first ran in ({runner.differences(len(differs))}): {runner.short(differs)}")
+        print(f"  all of them: {ARL} exp env {eid}")
+    else:
+        print("  the environment is the one it first ran in, as far as it was recorded")
     if "reproduced" in entry:
         print(f"  recorded {fmt(rec['metrics'][primary.name])}, difference {entry['difference']:.3g}, reproduced: {entry['reproduced']}")
     else:
@@ -1970,6 +2043,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("id")
     sp.add_argument("--eval", action="store_true", help="the evaluator's log")
     sp.add_argument("--lines", type=int, default=60)
+    sp = add(exp, "env", cmd_exp_env, "The environment an experiment ran in, and what differs from now or from another experiment.")
+    sp.add_argument("id")
+    sp.add_argument("other", nargs="?", help="another experiment to compare with (default: the environment as it is now)")
     sp = add(exp, "reproduce", cmd_exp_reproduce, "Run a recorded experiment again from its commit and params.")
     sp.add_argument("id")
     sp.add_argument("--split", help="score on another split named in arl.toml")

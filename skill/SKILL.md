@@ -146,7 +146,8 @@ equal and which are free, before building a gate around it.
 
 `arl status` for the overview, `arl exp list`, `arl exp show <id>` for one
 experiment's conditions and result (it also prints how to run it again and how
-to start a track from it), the `analysis.md` files for the reasoning,
+to start a track from it), `arl exp env <id> [<other>]` for what differs
+between its environment and today's or another experiment's, the `analysis.md` files for the reasoning,
 `research/introspections/` for the decisions, `research/KNOWLEDGE.md` for what
 it all adds up to. Report findings first, in plain words, and define a name
 before using it: "E0012" means nothing to a reader.

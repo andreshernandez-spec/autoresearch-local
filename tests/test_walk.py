@@ -354,6 +354,8 @@ class Walk:
                         ("exp", "fail", eid, "--reason", "typed without looking"),
                         ("exp", "commit", eid, "-m", "typed without looking"),
                         ("exp", "show", eid),
+                        ("exp", "env", eid),
+                        ("exp", "env", eid, rng.choice([e["id"] for e in exps] + ["E0999"])),
                         ("exp", "log", eid),
                         ("exp", "pause"),
                         ("exp", "reproduce", eid),

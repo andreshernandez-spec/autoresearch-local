@@ -138,6 +138,11 @@ what you had only in your head. So write things down when they happen:
     own). A package that is missing or broken is not a result and not yours to
     repair: stop and tell the person. For what you run yourself outside arl (a
     quick check, a test), use the interpreter `arl reload` names.
+14. **A run is decided by what is on record.** Whatever decides the result is
+    in `params.json` or in the committed code: the random seed, the number of
+    steps, every setting. Nothing comes from the clock, an environment
+    variable of your shell or a file that is not tracked. Only then can
+    `arl exp reproduce` say whether a result holds.
 
 ## Temptations
 
@@ -193,6 +198,10 @@ A job that arl runs is told three things, and a long job acts on them:
 | `ARL_RESUME=1` | an earlier part of this run was paused or cut off | reads the saved state and goes on from there; with `0` it starts from nothing |
 | the signal SIGTERM | arl asks it to stop | saves and ends within `[run] pause_grace_s`, after which it is killed |
 
+A run that has something to report about itself (training loss, steps, time)
+writes it to `{out}/train_metrics.json`, one JSON object of numbers. It goes
+into the record and is never scored.
+
 `helpers/arl_job.py` in the arl repository does all three in a few lines; copy
 it next to the run script. arl points out a part that ran long without saving
 anything. A job that ignores all this still works: a pause then costs it
@@ -200,7 +209,10 @@ everything it had done.
 
 **Judge** (`arl exp judge`). Work from `design.md` and `arl exp show`, not from
 what you hoped. Write what happened against the prediction, the most likely
-reason, and what you did not check. Before believing a good number, check that
+reason, and what you did not check. If the facts say the environment is not
+the one the reference ran in, a changed package is a candidate reason for the
+difference, before the change you made: `arl exp env <reference> <id>` lists
+what differs, and a baseline in the environment as it is now settles it. Before believing a good number, check that
 the work was done: the run time is plausible, the instances were all scored,
 nothing was skipped. Results that flatter the method deserve the hardest look.
 
@@ -251,8 +263,10 @@ closed one. Parking a track that stalled does not make its introspection go
 away.
 
 **Going back.** Nothing that ran is lost. `arl exp show <id>` says what an old
-experiment was and what it ran with, `arl exp reproduce <id>` runs it again
-from its recorded commit and params, and `arl track new <name> --from <id>`
+experiment was and what it ran with, `arl exp env <id>` what has changed in
+the environment since, `arl exp reproduce <id>` runs it again from its
+recorded commit and params (in the environment as it is now, and it says what
+differs), and `arl track new <name> --from <id>`
 opens a track at the code and params of that experiment, kept or not. When an
 earlier result looks better in hindsight than the path taken since, that is a
 `branch` for the next introspection, not a reason to rework the current track

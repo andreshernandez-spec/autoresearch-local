@@ -15,6 +15,8 @@ commit_prefix = "research"
 [run]
 # Runs inside the track's worktree and writes its results into {out}.
 # Placeholders: {params} {out} {split} {home} {research} {exp} {worktree}
+# What the run should have on record about itself (training loss, steps, time) goes
+# into {out}/train_metrics.json, one JSON object of numbers: kept and shown, never scored.
 command = "python run.py --params {params} --out {out} --split {split}"
 timeout_s = 1800
 max_attempts = 3
@@ -89,9 +91,11 @@ agent_may = ["continue", "adjust", "branch", "pivot"]
 # Packages whose versions must be the same for two results to be compared. When one of
 # them (or python) changes, the next scored experiment waits for a new baseline.
 # packages = ["numpy", "jax"]
-# Its output is stored with each run, once per distinct content: the whole list,
-# to rebuild the environment somewhere else.
-command = "python -m pip freeze"
+# arl stores with every run the list of packages that python sees (name and version,
+# the commit of an editable install, the builds conda installed), once per distinct
+# content, and says where two runs differ. The output of one more command can be
+# stored the same way:
+# command = "python -m pip freeze"
 
 [data]
 # Files the experiments read. Size and sha256 go into every record.

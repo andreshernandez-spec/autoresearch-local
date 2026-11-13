@@ -119,6 +119,41 @@ def test_what_differs_between_two_environments():
     assert runner.env_changes(None, {"python": "3.13.2"}) == ["python not recorded -> 3.13.2"]
 
 
+def test_what_differs_between_two_package_lists():
+    old = (
+        "python==3.13.1\nPillow==11.0\nscikit_learn==1.7.0\nmine==0.1 (editable /src/mine at aaaaaaaaaaaa)\n"
+        "conda: libblas=3.9.0=20_mkl\nconda: pillow=11.0=py313_0\n"
+    )
+    new = (
+        "python==3.13.1\npillow==11.1\nscikit-learn==1.7.0\nmine==0.1 (editable /src/mine at aaaaaaaaaaaa, modified)\ntqdm==4.67\n"
+        "conda: libblas=3.9.0=20_netlib\nconda: pillow=11.1=py313_0\n"
+    )
+    assert runner.listing_changes(old, new) == [
+        "mine 0.1 (editable /src/mine at aaaaaaaaaaaa) -> 0.1 (editable /src/mine at aaaaaaaaaaaa, modified)",
+        "pillow 11.0 -> 11.1",  # one line: what conda says about it repeats the version
+        "conda libblas 3.9.0 20_mkl -> 3.9.0 20_netlib",  # a library python does not list, rebuilt
+        "tqdm 4.67 added",
+    ]
+    assert runner.listing_changes(old, old) == []
+    # the lines pip freeze writes
+    then = "jax==0.11.0\n-e git+ssh://git@host/me/pkg.git@765853d57a44a7c9bf22#egg=pkg\nold @ file:///build/1/work\n"
+    now_ = "jax==0.12.1\n-e git+ssh://git@host/me/pkg.git@0955987aaaabbbbcccc#egg=pkg\n"
+    assert runner.listing_changes(then, now_) == ["jax 0.11.0 -> 0.12.1", "pkg editable at 765853d57a44 -> editable at 0955987aaaab", "old from file:///build/1/work removed"]
+    assert runner.short(["a", "b", "c"], 2) == "a; b; and 1 more" and runner.differences(1) == "1 difference"
+
+
+def test_what_a_run_reports_about_itself(tmp_path):
+    path = tmp_path / "train_metrics.json"
+    assert runner.read_train_metrics(path) == ({}, "")
+    path.write_text('{"loss": 0.25, "steps": 40, "note": "text", "bad": NaN, "flag": true}')
+    assert runner.read_train_metrics(path) == ({"loss": 0.25, "steps": 40.0}, "")
+    path.write_text("not json")
+    said, why = runner.read_train_metrics(path)
+    assert said == {} and "is not JSON" in why
+    path.write_text("[1, 2]")
+    assert "one JSON object" in runner.read_train_metrics(path)[1]
+
+
 def test_metrics_must_be_finite(cfg, tmp_path):
     path = tmp_path / "metrics.json"
     path.write_text('{"score": 0.5, "seconds": 1, "note": "text", "extra": 3}')

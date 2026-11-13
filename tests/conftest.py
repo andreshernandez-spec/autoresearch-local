@@ -64,6 +64,9 @@ if params.get("steps"):
         if asked:
             print("asked to stop at step", step + 1)
             sys.exit(1)
+if "report" in params:  # what a run says about itself: training loss, steps
+    said = params["report"]
+    (out / "train_metrics.json").write_text(said if isinstance(said, str) else json.dumps(said))
 pathlib.Path(a.out, "prediction.json").write_text(json.dumps({"x": x, "continued_from": start}))
 pathlib.Path(a.out, "weights.bin").write_bytes(b"0" * 4096)
 print("predicted", x)
@@ -280,14 +283,17 @@ def make_env(path: Path) -> Path:
     return path
 
 
-def install(env: Path, name: str, version: str) -> None:
-    """Make the environment report a package at a version, the way an install or an upgrade would."""
+def install(env: Path, name: str, version: str, editable: Path | None = None) -> None:
+    """Make the environment report a package at a version, the way an install or an upgrade would.
+    editable: the folder an editable install points at."""
     site = next((env / "lib").glob("python*")) / "site-packages"
     for old in site.glob(f"{name}-*.dist-info"):
         shutil.rmtree(old)
     info = site / f"{name}-{version}.dist-info"
     info.mkdir(parents=True)
     (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
+    if editable is not None:
+        (info / "direct_url.json").write_text(json.dumps({"url": f"file://{editable}", "dir_info": {"editable": True}}))
 
 
 def env_table(env: Path, *packages: str) -> str:
