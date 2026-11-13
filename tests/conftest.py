@@ -10,6 +10,7 @@ import contextlib
 import io
 import json
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -248,6 +249,13 @@ def cut_off(p: "Project", eid: str, child: dict | None = None) -> None:
     rec.update(status="running", pid=DEAD_PID, pid_start=1, code_commit=code)
     rec.setdefault("contract", {k: lock[k] for k in ("version", "digest", "eval_digest")})
     rec.setdefault("conditions", {"command": p.ledger.cfg.run_command, "split": "dev", "worktree": str(wt), "data": [], "data_digest": runner.data_digest([])})
+    try:
+        probed = runner.probe_env(p.ledger)
+    except cli.ArlError:
+        probed = None
+    if probed and probed.get("digest"):  # the packages it started with, as a real run records them
+        rec["conditions"].setdefault("env_digest", probed["digest"])
+        rec["conditions"].setdefault("env", {k: probed[k] for k in ("prefix", "python", "versions") if k in probed})
     if child:
         rec["child"] = child
     p.ledger.save_record(rec)
@@ -264,6 +272,28 @@ def pause_record(p: "Project", eid: str, seconds: float = 1.0) -> None:
     for key in ("pid", "pid_start"):
         rec.pop(key)
     p.ledger.save_record(rec)
+
+
+def make_env(path: Path) -> Path:
+    """A real environment of its own (a venv without pip), for a contract that names one."""
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(path)], check=True, capture_output=True)
+    return path
+
+
+def install(env: Path, name: str, version: str) -> None:
+    """Make the environment report a package at a version, the way an install or an upgrade would."""
+    site = next((env / "lib").glob("python*")) / "site-packages"
+    for old in site.glob(f"{name}-*.dist-info"):
+        shutil.rmtree(old)
+    info = site / f"{name}-{version}.dist-info"
+    info.mkdir(parents=True)
+    (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
+
+
+def env_table(env: Path, *packages: str) -> str:
+    """The [env] table of a contract that names this environment and these packages."""
+    named = f"packages = {json.dumps(list(packages))}\n" if packages else ""
+    return f'[env]\nprefix = "{env}"\n{named}'
 
 
 LAUNCHER = Path(__file__).resolve().parent.parent / "bin" / "arl"

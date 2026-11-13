@@ -110,6 +110,44 @@ def _data_digest_or_none(ledger: Ledger) -> str | None:
         return None
 
 
+ENV_IS_THE_CONTRACTS = (
+    "The environment belongs to the contract. Do not create it, do not install into it and do not\n"
+    "run in another one: stop, and tell the person who owns the program what is missing."
+)
+
+
+def _env(ledger: Ledger) -> dict[str, Any] | None:
+    """What the python a job would get answered, for a command that is about to start work."""
+    try:
+        return runner.probe_env(ledger)
+    except ArlError as e:
+        raise ArlError(f"{e}\n{ENV_IS_THE_CONTRACTS}") from e
+
+
+def _env_or_problem(ledger: Ledger) -> dict[str, Any] | None:
+    """For commands that only read: what is wrong with the environment is an answer, not an error."""
+    try:
+        return runner.probe_env(ledger)
+    except ArlError as e:
+        return {"problem": str(e)}
+
+
+def _next(ledger: Ledger) -> dict[str, Any]:
+    return rules.next_action(ledger, _data_digest_or_none(ledger), _env_or_problem(ledger))
+
+
+def _env_note(ledger: Ledger) -> list[str]:
+    """For the start of a session: where runs happen, and whether this shell's python is somewhere else."""
+    prefix = runner.env_prefix(ledger)
+    if prefix is None:
+        return []
+    lines = [f"==> Environment: runs and the evaluator use {ledger.cfg.env_prefix}. arl starts them there itself, whatever this shell has active."]
+    other = runner.shell_python_elsewhere(ledger)
+    if other:
+        lines.append(f"    'python' in this shell is {other}. For anything you run yourself, call {prefix / 'bin' / 'python'}.")
+    return lines + [""]
+
+
 # --- gates ------------------------------------------------------------------------
 
 
@@ -432,6 +470,10 @@ def cmd_freeze(args: argparse.Namespace) -> int:
             raise ArlError("not frozen")
     with ledger.locked():
         before = contract.load(ledger)
+        try:
+            runner.probe_env(ledger)  # a contract that names an environment nothing can run in is not frozen
+        except ArlError as e:
+            raise ArlError(f"{e}\nNothing was frozen. Name an environment that is on this machine, with those packages in it.") from e
         lock = contract.freeze(ledger, args.reason, person, shown)
         try:
             write_text(ledger.status_path, render.status(ledger))
@@ -441,7 +483,7 @@ def cmd_freeze(args: argparse.Namespace) -> int:
             raise
     print(f"Contract v{lock['version']} frozen ({len(lock['files'])} files).")
     if old and old["eval_digest"] != lock["eval_digest"]:
-        print("The evaluator or the metrics changed: every track needs a new baseline.")
+        print("What a score depends on changed (the evaluator, the metrics, the commands or the environment): every track needs a new baseline.")
     return 0
 
 
@@ -456,11 +498,11 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_next(args: argparse.Namespace) -> int:
     ledger = Ledger.locate()
-    data = None
+    data = env = None
     if ledger.exists():
         ledger.check_files()  # a damaged record is the first thing to say
-        data = _data_digest_or_none(ledger)
-    action = rules.next_action(ledger, data)
+        data, env = _data_digest_or_none(ledger), _env_or_problem(ledger)
+    action = rules.next_action(ledger, data, env)
     if args.json:
         print(json.dumps(action, indent=2))
     else:
@@ -477,10 +519,13 @@ def cmd_verify(args: argparse.Namespace) -> int:
         left = contract.uncommitted(ledger)
         if left:
             bad.append("the frozen contract is not committed: " + ", ".join(left[:6]) + ". A person runs 'arl freeze' again, or commits these files.")
+        env = _env_or_problem(ledger)
+        if env and env.get("problem"):
+            bad.append("the environment: " + env["problem"].splitlines()[0])
     git = ledger.git
     for t in ledger.tracks():
         if not git.branch_exists(t["branch"]):
-            bad.append(f"track {t['name']}: branch {t['branch']} is gone")
+            bad.append(f"track {t['name']}: branch {t['branch']} is gone ('arl track worktree {t['name']}' makes it again where the ledger says it stood)")
         elif t["status"] == "active" and git.head(t["branch"]) != t["head_commit"]:
             bad.append(f"track {t['name']}: branch moved outside arl (run 'arl track sync {t['name']}')")
         try:
@@ -616,9 +661,9 @@ def cmd_resume(args: argparse.Namespace) -> int:
         _mark_reloaded(ledger)
         if ledger.lock_path.exists():
             finish(ledger, "resume")
-    print(render.reload_text(ledger, state), end="")
+    print(render.reload_text(ledger, state, _env_note(ledger)), end="")
     print()
-    print(render.next_text(ledger, rules.next_action(ledger, _data_digest_or_none(ledger))), end="")
+    print(render.next_text(ledger, _next(ledger)), end="")
     return 0
 
 
@@ -639,7 +684,7 @@ def cmd_reload(args: argparse.Namespace) -> int:
         nid = _mark_reloaded(ledger)
         if nid:
             finish(ledger, f"{nid} reloaded")
-    print(render.reload_text(ledger), end="")
+    print(render.reload_text(ledger, env=_env_note(ledger)), end="")
     return 0
 
 
@@ -695,9 +740,21 @@ def cmd_track_new(args: argparse.Namespace) -> int:
             raise ArlError(f"track {name} already exists")
         opened_by = _authorized(ledger, args.introspection, ("branch", "pivot"), "a new track")
         git, branch = ledger.git, f"track/{name}"
-        start = git.head(args.from_ref or "HEAD")
+        source = None
+        if args.from_ref and re.fullmatch(r"E\d{4}", args.from_ref):
+            # An experiment: the track starts at the code it ran and, unless told otherwise, its params.
+            source = ledger.record(args.from_ref)
+            if source["type"] not in rules.SCORED:
+                raise ArlError(f"{source['id']} is a diagnose experiment: its code observes, it is not a method. Name a commit if you mean it.")
+            if not source.get("code_commit") or "design" not in source:
+                raise ArlError(f"{source['id']} never ran, so there is no code to start from")
+            _require_design_unchanged(ledger, source)
+            start = git.head(source["code_commit"])
+            params = _load_params(Path(args.params)) if args.params else _load_params(ledger.exp_dir(source["id"]) / "params.json")
+        else:
+            start = git.head(args.from_ref or "HEAD")
+            params = _load_params(Path(args.params)) if args.params else {}
         path = ledger.worktree_path(name)
-        params = _load_params(Path(args.params)) if args.params else {}
         # A branch or a worktree without a track file is what an earlier try left when it was cut off.
         if git.branch_exists(branch) and git.head(branch) != start:
             raise ArlError(f"branch {branch} exists already and is not at {start[:10]}. Pick another name.")
@@ -727,6 +784,8 @@ def cmd_track_new(args: argparse.Namespace) -> int:
         write_front(ledger.track_path(name), meta, body)
         finish(ledger, f"open track {name}")
     print(f"Track {name}: branch {branch} at {start[:10]}, worktree {path}")
+    if source:
+        print(f"It starts from {source['id']}: the code it ran and {'the params given' if args.params else 'its params'}. Its baseline should give the result of {source['id']} again.")
     print(f"Now write {ledger.track_path(name)} (approach, premises, stop if), below the +++ block.")
     return 0
 
@@ -785,9 +844,25 @@ def cmd_track_worktree(args: argparse.Namespace) -> int:
             raise ArlError(f"{path} is there already")
         flying = [e for e in rules.in_flight(ledger, args.name) if e["status"] != "judging"]
         branch = flying[0]["branch"] if flying else track["branch"]
-        ledger.git.prune_worktrees()  # git still lists the folder that is gone
+        git = ledger.git
+        # A clone of the project brings the commits and not the local branches. The ledger
+        # says where each one stood; an experiment's own branch may be further on where
+        # the project was cloned from.
+        wanted = {track["branch"]: track["head_commit"]}
+        if flying and branch != track["branch"]:
+            there = f"refs/remotes/origin/{branch}"
+            wanted[branch] = git.head(there) if git.ok("rev-parse", "--verify", "--quiet", there) else flying[0].get("code_commit") or flying[0]["base_commit"]
+        missing = {name: commit for name, commit in wanted.items() if not git.branch_exists(name)}
+        for name, commit in missing.items():
+            if not git.commit_exists(commit):
+                raise ArlError(f"branch {name} is not in this repository, and neither is the commit it stood at ({commit[:10]}). Fetch it from where the project came from.")
+        for name, commit in missing.items():
+            git.create_branch(name, commit)
+        git.prune_worktrees()  # git still lists the folder that is gone
         path.parent.mkdir(parents=True, exist_ok=True)
-        ledger.git.add_worktree(path, branch)
+        git.add_worktree(path, branch)
+    for name, commit in missing.items():
+        print(f"Branch {name} was not in this repository: made again at {commit[:10]}, where the ledger says it stood.")
     print(f"Track {args.name}: worktree {path} is back, on {branch}.")
     return 0
 
@@ -868,6 +943,7 @@ def cmd_exp_new(args: argparse.Namespace) -> int:
         lock = contract.require(ledger)
         cfg = ledger.cfg
         _gate_new_work(ledger)
+        probed = _env(ledger)
         track = ledger.track(args.track)
         if track["status"] != "active":
             raise ArlError(f"track {args.track} is {track['status']}")
@@ -900,8 +976,9 @@ def cmd_exp_new(args: argparse.Namespace) -> int:
         if typ in ("tune", "feature"):
             if not hyps:
                 raise ArlError(f"a {typ} experiment tests a hypothesis: write one with 'arl hyp new' and pass --hyp")
-            if rules.reference_for(ledger, track, lock["eval_digest"], _data(ledger)[1]) is None:
-                raise ArlError(f"track {args.track} has no reference under contract v{lock['version']} and the data as it is: run a baseline first")
+            data = _data(ledger)[1]
+            if rules.reference_for(ledger, track, lock["eval_digest"], data, (probed or {}).get("digest")) is None:
+                raise ArlError(f"{rules.why_no_reference(ledger, track, lock, data, probed)}: run a baseline first")
         if args.command and typ != "diagnose":
             raise ArlError("--command is for diagnose experiments. Scored runs use the command in arl.toml.")
 
@@ -1008,7 +1085,7 @@ def cmd_exp_commit(args: argparse.Namespace) -> int:
 
 
 def _run_env(ledger: Ledger, rec: dict[str, Any], values: dict[str, Any], resume: bool) -> dict[str, str]:
-    env = dict(os.environ)
+    env = runner.job_env(ledger)
     env.update(
         ARL_HOME=str(ledger.home),
         ARL_RESEARCH=str(ledger.dir),
@@ -1065,6 +1142,8 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
             give_up = f"Judge it as a crash ('{ARL} exp judge {eid} --verdict crash --reason \"...\"') and draft it again."
             again = give_up if attempts else f"Abandon it ('{ARL} exp abandon {eid} --reason \"...\"') and draft again."
             fingerprint, data = _data(ledger)
+            probed = _env(ledger)
+            env_digest = (probed or {}).get("digest")
             if resuming:
                 if code != rec["code_commit"]:
                     raise ArlError(f"{path} is at {code[:10]}, but {eid} was paused while running {rec['code_commit'][:10]}. A run continues the code it started with. {give_up}")
@@ -1072,6 +1151,9 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
                     raise ArlError(f"the contract was frozen anew since {eid} started (v{rec['contract']['version']} to v{lock['version']}), so it cannot be continued. {give_up}")
                 if rec["conditions"].get("data_digest") not in (None, data):
                     raise ArlError(f"the data files changed since {eid} started, so it cannot be continued. {give_up}")
+                if env_digest is not None and rec["conditions"].get("env_digest") != env_digest:
+                    changes = "; ".join(runner.env_changes(rec["conditions"].get("env"), probed)) or "see its record"
+                    raise ArlError(f"the packages changed since {eid} started ({changes}), so it cannot be continued. {give_up}")
             elif typ in ("baseline", "tune"):
                 if code != track["head_commit"]:
                     raise ArlError(f"track {rec['track']} moved since {eid} was drafted. {again}")
@@ -1100,8 +1182,10 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
             command = rec.get("command") or cfg.run_command
             # The files, not the commit: the same change committed twice is the same experiment.
             what = {"track": rec["track"], "tree": wgit.tree(code), "params": params_hash, "command": command, "eval": lock["eval_digest"] if scored else "", "split": split, "data": data}
+            if env_digest is not None:
+                what["env"] = env_digest  # the same run with other packages is not a known result
             key = sha256_text(canonical(what))
-            reference = rules.reference_for(ledger, track, lock["eval_digest"], data)
+            reference = rules.reference_for(ledger, track, lock["eval_digest"], data, env_digest)
             repeat = typ == "baseline" and reference is not None  # the track has a reference: this one shows the noise
             if not resuming:
                 for other in ledger.experiments():
@@ -1114,7 +1198,7 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
                             )
                         rec["duplicate_of"], rec["duplicate_reason"] = other["id"], args.allow_duplicate
             if typ in ("tune", "feature") and reference is None:
-                raise ArlError(f"track {rec['track']} has no reference under contract v{lock['version']} and the data as it is. {again} Then run a baseline first.")
+                raise ArlError(f"{rules.why_no_reference(ledger, track, lock, data, probed)}. {again} Then run a baseline first.")
             reasons = runner.busy(cfg)
             if reasons:
                 raise ArlError(
@@ -1134,6 +1218,8 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
                     attempts.append(attempt)
                     rec["contract"] = {k: lock[k] for k in ("version", "digest", "eval_digest")}
                     rec["conditions"] = {"command": command, "split": split, "worktree": str(path), "data": fingerprint, "data_digest": data}
+                    if env_digest is not None:
+                        rec["conditions"]["env_digest"] = env_digest
                 n = attempt["n"]
                 part = {"started": now()}
                 attempt.setdefault("segments", []).append(part)
@@ -1141,7 +1227,7 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
                 (exp / "logs" / "pause.request").unlink(missing_ok=True)
                 rec.update(status="running", pid=os.getpid(), pid_start=runner.proc_start(os.getpid()), code_commit=code, dedup=key)
                 rec.setdefault("design", {"design_sha256": design_hash, "params_sha256": params_hash, "locked_at": now()})
-                part["env"] = runner.environment(ledger)
+                part["env"] = runner.environment(ledger, probed)
                 rec["conditions"].setdefault("env", part["env"])
                 ledger.save_record(rec)
                 parts = len(attempt["segments"])
@@ -1424,7 +1510,7 @@ def cmd_exp_judge(args: argparse.Namespace) -> int:
         _finish_judge(ledger, rec)
     print(_summary(ledger, rec))
     print()
-    print(render.next_text(ledger, rules.next_action(ledger, _data_digest_or_none(ledger))), end="")
+    print(render.next_text(ledger, _next(ledger)), end="")
     return 0
 
 
@@ -1481,8 +1567,22 @@ def cmd_exp_show(args: argparse.Namespace) -> int:
             print(f"  rerun {r['n']} on {r['split']}: FAILED: {r['failed']}")
         else:
             value = fmt(r["metrics"][name]) if name in r.get("metrics", {}) else "not reported"
-            print(f"  rerun {r['n']} on {r['split']}: {name} {value}" + (f", reproduced: {r['reproduced']}" if "reproduced" in r else ""))
+            other = f", other packages ({'; '.join(r['packages_changed'])})" if r.get("packages_changed") else ""
+            print(f"  rerun {r['n']} on {r['split']}: {name} {value}" + (f", reproduced: {r['reproduced']}" if "reproduced" in r else "") + other)
+    env = rec.get("conditions", {}).get("env")
+    if env:
+        named = [f"{k} {v}" for k, v in (env.get("versions") or {}).items()]
+        what = [env.get("prefix") or "the python of the shell that ran it"] + ([f"python {env['python']}"] if env.get("python") else []) + named
+        listing = f"; every package: {ledger.name}/envs/{env['packages']}.txt" if env.get("packages") else ""
+        print(f"  environment: {', '.join(what)}{listing}")
+        print(f"  ran under: contract v{rec['contract']['version']}, arl {env.get('arl', '(version not recorded)')}, on {env.get('host', 'an unnamed machine')}")
     print(f"  files: {exp}")
+    code, base = rec.get("code_commit"), rec["base_commit"]
+    if code and code != base:
+        print(f"  its code change:  git -C {ledger.home} diff {base[:10]} {code[:10]} -- . ':(exclude){ledger.name}'")
+    if rec["type"] in rules.SCORED and "metrics" in rec:
+        print(f"  run it again:     {ARL} exp reproduce {rec['id']}")
+        print(f"  start from it:    {ARL} track new <name> --from {rec['id']}")
     return 0
 
 
@@ -1523,6 +1623,7 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
                 raise ArlError("only a scored experiment with a result can be run again")
             _gate_running(ledger, first_attempt=False)
             _require_design_unchanged(ledger, rec)
+            probed = _env(ledger)
             split = args.split or cfg.splits[0]
             if split not in cfg.splits:
                 raise ArlError(f"arl.toml knows the splits {cfg.splits}, not '{split}'")
@@ -1538,6 +1639,7 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
             if tree.exists():
                 _drop_tree(ledger, tree)
             (logs / "pause.request").unlink(missing_ok=True)  # an old request is not meant for this rerun
+            env_now = runner.environment(ledger, probed)
             rec["rerun"] = {"n": n, "split": split, "started": now(), "pid": os.getpid(), "pid_start": runner.proc_start(os.getpid()), "tree": str(tree)}
             ledger.save_record(rec)
 
@@ -1546,7 +1648,10 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
         values = {"params": exp / "params.json", "out": out, "split": split, "home": ledger.home, "research": ledger.dir, "exp": exp, "worktree": tree, "metrics": metrics_path}
         env = _run_env(ledger, rec, values, resume=False)
         limits = {"max_rss_gb": cfg.max_run_rss_gb, "min_free_ram_gb": cfg.stop_below_free_ram_gb, "pause_file": logs / "pause.request", "pause_grace": cfg.pause_grace}
-        entry: dict[str, Any] = {"n": n, "at": now(), "split": split, "eval_digest": lock["eval_digest"]}
+        entry: dict[str, Any] = {"n": n, "at": now(), "split": split, "eval_digest": lock["eval_digest"], "env": env_now}
+        then = rec["conditions"]
+        if probed and probed.get("digest") and then.get("env_digest") not in (None, probed["digest"]):
+            entry["packages_changed"] = runner.env_changes(then.get("env"), probed)
 
         def why(res: dict[str, Any]) -> str:
             if res["paused"]:
@@ -1622,6 +1727,8 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
         print(f"{eid} rerun on split '{split}' FAILED: {failed}. Log: {logs / f'rerun-{n}.log'}")
         return EXIT_CRASH
     print(f"{eid} rerun on split '{split}': {primary.name} = {fmt(metrics[primary.name])}")
+    if entry.get("packages_changed"):
+        print(f"  not with the packages of the recorded run: {'; '.join(entry['packages_changed'])}")
     if "reproduced" in entry:
         print(f"  recorded {fmt(rec['metrics'][primary.name])}, difference {entry['difference']:.3g}, reproduced: {entry['reproduced']}")
     else:
@@ -1727,7 +1834,7 @@ def cmd_introspect_close(args: argparse.Namespace) -> int:
     else:
         print(f"{args.id} proposes '{args.decision}', which the agent may not decide alone.")
     print()
-    print(render.next_text(ledger, rules.next_action(ledger, _data_digest_or_none(ledger))), end="")
+    print(render.next_text(ledger, _next(ledger)), end="")
     return 0
 
 
@@ -1780,7 +1887,7 @@ def build_parser() -> argparse.ArgumentParser:
     track = sub.add_parser("track", help="Code tracks: one branch and worktree each.").add_subparsers(dest="action", required=True)
     sp = add(track, "new", cmd_track_new, "Open a track.")
     sp.add_argument("name")
-    sp.add_argument("--from", dest="from_ref", help="commit or branch to start from (default: the home branch)")
+    sp.add_argument("--from", dest="from_ref", help="commit, branch or experiment (E0007: its code and its params) to start from. Default: the home branch")
     sp.add_argument("--introspection", help="the latest closed introspection, which decided to open it")
     sp.add_argument("--params", help="JSON file with the track's starting params")
     sp = add(track, "set", cmd_track_set, "Park, close or reactivate a track.")
@@ -1791,7 +1898,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add(track, "sync", cmd_track_sync, "Record that a track branch was changed by hand.")
     sp.add_argument("name")
     sp.add_argument("--note", required=True)
-    sp = add(track, "worktree", cmd_track_worktree, "Put a track's worktree back when its folder is gone.")
+    sp = add(track, "worktree", cmd_track_worktree, "Put a track's worktree back when its folder is gone, and its branch after a clone.")
     sp.add_argument("name")
     add(track, "list", cmd_track_list, "List tracks.")
 

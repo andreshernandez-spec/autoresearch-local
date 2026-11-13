@@ -13,7 +13,7 @@
         tracks/<name>.md, <name>.params.json
         experiments/E0007-slug/          record.json, design.md, params.json, analysis.md, ...
         introspections/N002.md
-        envs/<hash>.txt                  environment listings, stored once each
+        envs/<hash>.txt                  package listings of the environment, stored once each
 
 The ledger lives in the project's home checkout. Code lives on track branches,
 each with its own worktree. Lessons that hold for any project live with the

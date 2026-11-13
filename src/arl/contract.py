@@ -5,8 +5,10 @@ every run checks the hashes first. The lock carries two digests:
 
 - digest: every contract file. Any mismatch blocks runs.
 - eval_digest: the evaluator files plus the [run], [eval] and [[metric]]
-  tables. Scores are compared only within one eval_digest, so raising the
-  budget does not ask for a new baseline, and touching the evaluator does.
+  tables and the environment the contract names ([env] prefix). Scores are
+  compared only within one eval_digest, so raising the budget does not ask for
+  a new baseline, and touching the evaluator or moving to another environment
+  does.
 
 The first freeze can be done by anyone. Once an experiment exists, a new freeze
 needs a person at a terminal.
@@ -69,6 +71,8 @@ def current(ledger: Ledger) -> dict[str, Any]:
     files.update(evals)
     raw = cfg.raw
     scoring = {"files": evals, "run": raw.get("run"), "eval": raw.get("eval"), "metric": raw.get("metric")}
+    if cfg.env_prefix:
+        scoring["env"] = cfg.env_prefix  # a score belongs to the environment it was computed in
     return {
         "files": dict(sorted(files.items())),
         "digest": sha256_text(canonical(files)),

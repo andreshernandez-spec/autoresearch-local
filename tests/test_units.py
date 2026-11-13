@@ -79,6 +79,10 @@ def test_min_goal(tmp_path):
         (TOML.replace("min_delta = 0.01", "min_delta = -1"), "min_delta must be at least 0"),
         (TOML + "[machine]\nmax_loadavg = true\n", "max_loadavg must be a number"),
         ("run = 1\n" + TOML.replace("[run]", "[other]"), "must be a table"),
+        (TOML + '[env]\npackages = "numpy"\n', "packages must be a list"),
+        (TOML + '[env]\npackages = ["numpy>=2"]\n', "names of installed packages"),
+        (TOML + '[env]\npackages = ["numpy", "NumPy"]\n', "names a package twice"),
+        (TOML + "[env]\nprefix = 3\n", "prefix must be text"),
     ],
 )
 def test_bad_config(tmp_path, broken, message):
@@ -97,6 +101,22 @@ def test_old_and_new_name_of_the_introspection_table(tmp_path):
     path.write_text(TOML)
     cfg = config.load(path)
     assert (cfg.intro_every, cfg.checkpoint_every, cfg.pause_grace) == (8, 600.0, 60.0)
+
+
+def test_the_environment_table(tmp_path, cfg):
+    assert (cfg.env_prefix, cfg.env_packages, cfg.env_command) == (None, [], None)
+    path = tmp_path / "arl.toml"
+    path.write_text(TOML + '[env]\nprefix = "~/envs/x"\npackages = ["numpy", "scikit-learn"]\ncommand = "pip freeze"\n')
+    named = config.load(path)
+    assert (named.env_prefix, named.env_packages, named.env_command) == ("~/envs/x", ["numpy", "scikit-learn"], "pip freeze")
+
+
+def test_what_differs_between_two_environments():
+    old = {"python": "3.13.1", "versions": {"jax": "0.11.0", "numpy": "2.5.1"}}
+    new = {"python": "3.13.2", "versions": {"jax": "0.12.0", "numpy": "2.5.1", "optax": "0.3"}}
+    assert runner.env_changes(old, new) == ["python 3.13.1 -> 3.13.2", "jax 0.11.0 -> 0.12.0", "optax not recorded -> 0.3"]
+    assert runner.env_changes(old, old) == []
+    assert runner.env_changes(None, {"python": "3.13.2"}) == ["python not recorded -> 3.13.2"]
 
 
 def test_metrics_must_be_finite(cfg, tmp_path):

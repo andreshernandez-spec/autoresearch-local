@@ -27,7 +27,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Generator
 
+from . import __version__
 from .config import Config
+from .gitops import Git
 from .ledger import Ledger
 from .util import EXIT_BUSY, ArlError, canonical, read_json, read_text, sha256_file, sha256_text, write_json
 
@@ -337,22 +339,152 @@ def tail(path: Path, lines: int = 120, max_bytes: int = 48_000) -> str:
     return "\n".join(text.splitlines()[-lines:]) + "\n"
 
 
+# --- the environment a job gets -----------------------------------------------------
+
+_PROBE = """\
+import importlib.metadata as m, json, sys
+found = {}
+for name in json.loads(sys.argv[1]):
+    try:
+        found[name] = m.version(name)
+    except m.PackageNotFoundError:
+        found[name] = None
+print(json.dumps({"prefix": sys.prefix, "python": sys.version.split()[0], "packages": found}))
+"""
+_POINTS_ELSEWHERE = ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV")
+
+
+def env_prefix(ledger: Ledger) -> Path | None:
+    """The environment the contract names ([env] prefix), as a folder on this machine."""
+    text = ledger.cfg.env_prefix
+    if not text:
+        return None
+    path = Path(os.path.expandvars(os.path.expanduser(text)))
+    return path if path.is_absolute() else ledger.home / path
+
+
+def job_env(ledger: Ledger) -> dict[str, str]:
+    """What every job starts with: the caller's environment, with the one the contract
+    names in front and without what would point python somewhere else. So a run is the
+    same whether an agent's session or a person's terminal started it."""
+    env = dict(os.environ)
+    prefix = env_prefix(ledger)
+    if prefix is None:
+        return env
+    for name in _POINTS_ELSEWHERE:
+        env.pop(name, None)
+    env["PATH"] = f"{prefix / 'bin'}{os.pathsep}{env.get('PATH', os.defpath)}"
+    env["PYTHONNOUSERSITE"] = "1"  # packages installed with --user are not part of the environment
+    if (prefix / "conda-meta").is_dir():
+        env["CONDA_PREFIX"], env["CONDA_DEFAULT_ENV"] = str(prefix), prefix.name
+    elif (prefix / "pyvenv.cfg").is_file():
+        env["VIRTUAL_ENV"] = str(prefix)
+    return env
+
+
+def probe_env(ledger: Ledger) -> dict[str, Any] | None:
+    """Ask the python a job would get what it is.
+
+    None when the contract names neither an environment nor packages. Otherwise
+    its version, the prefix as the contract writes it, and for [env] packages
+    their versions and one digest of them: results are compared only within
+    one digest. Raises when that python is not what the contract names.
+    """
+    cfg = ledger.cfg
+    prefix = env_prefix(ledger)
+    if prefix is None and not cfg.env_packages:
+        return None
+    where = f"the environment {cfg.env_prefix}" if prefix else "the python on the PATH"
+    if prefix is not None and not (prefix / "bin" / "python").exists():
+        raise ArlError(f"The contract names the environment {cfg.env_prefix} ([env] prefix), and it is not on this machine: no {prefix / 'bin' / 'python'}.")
+    detail = ""
+    try:
+        out = subprocess.run(
+            ["bash", "-c", 'exec python -I -c "$0" "$1"', _PROBE, json.dumps(cfg.env_packages)],
+            cwd=ledger.home,
+            env=job_env(ledger),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        found = json.loads(out.stdout) if out.returncode == 0 else None
+        detail = out.stderr.strip()[-600:]
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+        found, detail = None, str(e)[-600:]
+    if not isinstance(found, dict):
+        raise ArlError(f"python does not start in {where}" + (f":\n{detail}" if detail else "."))
+    if prefix is not None and os.path.realpath(found["prefix"]) != os.path.realpath(prefix):
+        raise ArlError(f"A job's python is {found['prefix']}, not the environment the contract names ({cfg.env_prefix}).")
+    missing = [name for name, version in found["packages"].items() if version is None]
+    if missing:
+        raise ArlError(f"The contract names the package{'s' if len(missing) > 1 else ''} {', '.join(missing)} ([env] packages), not installed in {where}.")
+    info: dict[str, Any] = {"python": found["python"]}
+    if prefix is not None:
+        info["prefix"] = cfg.env_prefix
+    if cfg.env_packages:
+        info["versions"] = found["packages"]
+        info["digest"] = sha256_text(canonical({"python": found["python"], "packages": found["packages"]}))[:16]
+    return info
+
+
+def env_changes(old: dict[str, Any] | None, new: dict[str, Any] | None) -> list[str]:
+    """What differs between two recorded environments: python and the packages the contract names."""
+    before = {"python": (old or {}).get("python"), **((old or {}).get("versions") or {})}
+    after = {"python": (new or {}).get("python"), **((new or {}).get("versions") or {})}
+    names = ["python"] + sorted({*before, *after} - {"python"})
+    return [f"{n} {before.get(n) or 'not recorded'} -> {after.get(n) or 'not there'}" for n in names if before.get(n) != after.get(n)]
+
+
+def shell_python_elsewhere(ledger: Ledger) -> str | None:
+    """Where 'python' of the calling shell lives, when that is not the contract's environment."""
+    prefix = env_prefix(ledger)
+    if prefix is None:
+        return None
+    mine = shutil.which("python")
+    if mine and os.path.realpath(os.path.dirname(mine)) == os.path.realpath(prefix / "bin"):
+        return None
+    return mine or "not on the PATH"
+
+
+_HARNESS: str | None = None
+
+
+def harness_version() -> str:
+    """The arl that is running: its version, and its commit when it runs from its own checkout."""
+    global _HARNESS
+    if _HARNESS is None:
+        text, root = __version__, Path(__file__).resolve().parents[2]
+        try:
+            git = Git(root)
+            if git.top().resolve() == root:
+                text += f" ({git.head()[:10]}{', modified' if git.tracked_changes() else ''})"
+        except (ArlError, OSError):
+            pass
+        _HARNESS = text
+    return _HARNESS
+
+
 # --- conditions -------------------------------------------------------------------
 
 
-def environment(ledger: Ledger) -> dict[str, Any]:
-    """Where and with what the run happens. The package list is stored once per content."""
+def environment(ledger: Ledger, probed: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Where and with what the run happens. The package list is stored once per content.
+
+    probed: what probe_env answered, when the contract names an environment or packages.
+    """
     info: dict[str, Any] = {
         "host": socket.gethostname(),
         "platform": platform.platform(),
+        "arl": harness_version(),
         "arl_python": sys.version.split()[0],
     }
+    info.update({k: probed[k] for k in ("prefix", "python", "versions") if probed and k in probed})
     gpu = _nvidia("name,driver_version")
     if gpu:
         info["gpu"] = [row.strip() for row in gpu]
     cmd = ledger.cfg.env_command
     if cmd:
-        out = subprocess.run(["bash", "-c", cmd], cwd=ledger.home, capture_output=True, text=True, timeout=300)
+        out = subprocess.run(["bash", "-c", cmd], cwd=ledger.home, env=job_env(ledger), capture_output=True, text=True, timeout=300)
         if out.returncode != 0:
             raise ArlError(f"[env] command failed: {cmd}\n{out.stderr.strip()[-2000:]}")
         digest = sha256_text(out.stdout)[:16]

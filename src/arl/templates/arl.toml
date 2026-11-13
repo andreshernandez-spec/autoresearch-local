@@ -82,7 +82,15 @@ agent_may = ["continue", "adjust", "branch", "pivot"]
 # stop_below_free_ram_gb = 6
 
 [env]
-# Its output is stored with each run, once per distinct content.
+# The environment every run and the evaluator use: a conda env or a venv (~ allowed,
+# or relative to the project). arl puts its bin first on the PATH of each job, whoever
+# started the command, and refuses to start when it is not there.
+# prefix = "~/anaconda3/envs/project"
+# Packages whose versions must be the same for two results to be compared. When one of
+# them (or python) changes, the next scored experiment waits for a new baseline.
+# packages = ["numpy", "jax"]
+# Its output is stored with each run, once per distinct content: the whole list,
+# to rebuild the environment somewhere else.
 command = "python -m pip freeze"
 
 [data]

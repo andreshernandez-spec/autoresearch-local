@@ -195,9 +195,18 @@ def _took(rec: dict[str, Any]) -> str:
     return took
 
 
+def _env_line(rec: dict[str, Any]) -> str:
+    """The environment a run had, when the contract named one."""
+    env = rec.get("conditions", {}).get("env") or {}
+    if not env.get("python"):
+        return ""
+    named = "".join(f", {k} {v}" for k, v in (env.get("versions") or {}).items())
+    return f" Environment: {env.get('prefix') or 'the python on the PATH'}, python {env['python']}{named}."
+
+
 def analysis_facts(ledger: Ledger, rec: dict[str, Any]) -> str:
     cfg = ledger.cfg
-    where = f"Code {rec['code_commit'][:10]} on `{rec['branch']}`, contract v{rec['contract']['version']}."
+    where = f"Code {rec['code_commit'][:10]} on `{rec['branch']}`, contract v{rec['contract']['version']}.{_env_line(rec)}"
     took = _took(rec)
     if rec["type"] not in rules.SCORED:
         kept = ", ".join(f"kept/{k}" for k in rec.get("kept", [])) or "none"
@@ -290,8 +299,11 @@ def introspection_facts(ledger: Ledger, trigger: str, state_: dict[str, Any], ac
 # --- what a reload prints ---------------------------------------------------------
 
 
-def reload_text(ledger: Ledger, handoff: dict[str, Any] | None = None) -> str:
-    """The knowledge and the lessons as they are now, in full, with the notes left at a pause."""
+def reload_text(ledger: Ledger, handoff: dict[str, Any] | None = None, env: list[str] | None = None) -> str:
+    """The knowledge and the lessons as they are now, in full, with the notes left at a pause.
+
+    env: lines about the environment runs use, when the contract names one.
+    """
     out = []
     if handoff and (handoff.get("note") or handoff.get("reason")):
         out += [
@@ -308,6 +320,7 @@ def reload_text(ledger: Ledger, handoff: dict[str, Any] | None = None) -> str:
     ):
         out += [f"==> {path}  ({label})", "", read_text(path).rstrip("\n") if path.exists() else "(not written yet)", ""]
     tracks = ", ".join(f"{ledger.name}/tracks/{t['name']}.md" for t in ledger.tracks() if t["status"] == "active") or "none yet"
+    out += env or []
     out += [
         "==> Also part of your instructions. Read them again if this session has not, or has been cut short since:",
         f"  {ROOT / 'PROTOCOL.md'}",

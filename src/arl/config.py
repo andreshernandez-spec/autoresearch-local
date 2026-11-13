@@ -7,6 +7,7 @@ of a run.
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -67,6 +68,8 @@ class Config:
     lock: str | None
     max_run_rss_gb: float | None
     stop_below_free_ram_gb: float | None
+    env_prefix: str | None
+    env_packages: list[str]
     env_command: str | None
     data_files: list[str] = field(default_factory=list)
 
@@ -172,6 +175,12 @@ def load(path: Path) -> Config:
     frozen = _texts(ev, "eval", "frozen", [])
     if not frozen:
         raise ArlError("arl.toml: [eval] needs 'frozen', the files and folders of the evaluator")
+    packages = _texts(env, "env", "packages", [])
+    odd = [p for p in packages if not re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?", p)]
+    if odd:
+        raise ArlError(f"arl.toml: [env] packages holds the names of installed packages, not {odd}")
+    if len({p.lower() for p in packages}) != len(packages):
+        raise ArlError("arl.toml: [env] packages names a package twice")
 
     return Config(
         raw=raw,
@@ -204,6 +213,8 @@ def load(path: Path) -> Config:
         lock=_text(machine, "machine", "lock"),
         max_run_rss_gb=_number(machine, "machine", "max_run_rss_gb", least=0),
         stop_below_free_ram_gb=_number(machine, "machine", "stop_below_free_ram_gb", least=0),
+        env_prefix=_text(env, "env", "prefix"),
+        env_packages=packages,
         env_command=_text(env, "env", "command"),
         data_files=_texts(data, "data", "files", []),
     )

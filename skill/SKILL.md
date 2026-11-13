@@ -57,6 +57,11 @@ the user later says to go on, start at step 2 above with `arl resume`.
 - **Code changes go in the track's worktree** (the path is in the brief), are
   committed with `arl exp commit <id> -m "..."`, and never touch `research/`
   there. No git writes by hand.
+- **The environment is the contract's.** arl starts every run in the
+  environment `arl.toml` names. Never install into it, create another one or
+  run the work elsewhere. If `next` says `environment`, or a run fails on an
+  import, stop and tell the user. For your own quick checks use the
+  interpreter `arl reload` names.
 - **Long runs go in the background** (Bash with `run_in_background`), and you
   wait for the notification. Read logs with `arl exp log <id>`, never whole.
 - **Exit codes of `arl exp run`:** 0 a result, 2 the run failed, 3 the run was
@@ -112,6 +117,9 @@ decision the agent may not take alone leaves the loop waiting for the user.
    - the primary metric, the smallest change that counts (`min_delta`), any
      constraints;
    - what the agent may change and what it may not;
+   - which environment runs use (`[env] prefix`), and which packages must stay
+     the same for two results to be compared (`[env] packages`: the ones the
+     method and the evaluator compute with);
    - the budget, how often to introspect, which decisions the agent may take
      alone;
    - how long a run may take, how often a job saves its state
@@ -135,7 +143,8 @@ equal and which are free, before building a gate around it.
 ## Answering "what happened"
 
 `arl status` for the overview, `arl exp list`, `arl exp show <id>` for one
-experiment's conditions and result, the `analysis.md` files for the reasoning,
+experiment's conditions and result (it also prints how to run it again and how
+to start a track from it), the `analysis.md` files for the reasoning,
 `research/introspections/` for the decisions, `research/KNOWLEDGE.md` for what
 it all adds up to. Report findings first, in plain words, and define a name
 before using it: "E0012" means nothing to a reader.

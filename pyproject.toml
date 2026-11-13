@@ -1,7 +1,7 @@
 [project]
 name = "autoresearch-local"
-version = "0.1.0"
-description = "A local harness for automated research: frozen evaluation, a git ledger, code tracks, periodic reviews."
+version = "0.2.0"
+description = "A local harness for automated research: frozen evaluation, a git ledger, code tracks, a periodic introspection."
 requires-python = ">=3.11"
 
 [tool.pytest.ini_options]

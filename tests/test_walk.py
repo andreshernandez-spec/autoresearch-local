@@ -2,8 +2,9 @@
 
 Mostly it does what `arl next` says. Sometimes it types another command, and
 sometimes the ground is pulled away: a run is cut off, the loop is paused, a
-contract file is edited, a worktree folder disappears. A person steps in only
-where `next` says STOP. After every step the same things must hold: no
+contract file is edited, a worktree folder disappears, the environment the
+contract names is moved away, a package in it changes version. A person steps
+in only where `next` says STOP. After every step the same things must hold: no
 traceback, `next` and `status` answer, the records agree with each other, and
 the step that `next` asks for is not refused for ever.
 
@@ -26,13 +27,13 @@ import pytest
 from arl import cli, rules
 from arl.config import DECISIONS
 from arl.ledger import Ledger
-from conftest import NOTHING_NEW, Project, cut_off, git, pause_record
+from conftest import NOTHING_NEW, Project, cut_off, env_table, git, install, make_env, pause_record
 
 SEEDS = range(int(os.environ.get("ARL_WALK_SEEDS", "6")))
 STEPS = int(os.environ.get("ARL_WALK_STEPS", "70"))
 STAGES = {
     "track", "baseline", "hypothesize", "design", "outdated", "judge", "crashed", "interrupted", "resume",
-    "unfinished", "introspect", "reload", "wait", "stopped", "paused", "budget", "target", "contract",
+    "unfinished", "introspect", "reload", "wait", "stopped", "paused", "budget", "target", "contract", "environment",
 }  # fmt: skip
 STATUSES = {"draft", "running", "paused", "evaluated", "judging", "judged", "crashed", "abandoned"}
 ACCEPTED = (0, 2, 3)  # done, the run failed, the run was paused: each one moved the loop on
@@ -43,8 +44,9 @@ class DeadEnd(AssertionError):
 
 
 class Walk:
-    def __init__(self, p: Project, seed: int, monkeypatch):
+    def __init__(self, p: Project, seed: int, monkeypatch, env):
         self.p, self.rng, self.mp = p, random.Random(seed), monkeypatch
+        self.env, self.away = env, env.with_name("env.away")  # the environment, and where it is when it is gone
         self.log: list[str] = []
         self.damaged: tuple | None = None  # a contract file edited by hand, and what it held
         self.seen: collections.Counter = collections.Counter()  # stages followed and commands by exit code
@@ -189,7 +191,10 @@ class Walk:
         exps, tracks = p.ledger.experiments(), p.ledger.tracks()
         if stage in ("budget", "target"):
             return False
-        if stage == "contract":
+        if stage == "environment":
+            assert self.away.exists(), self.story()
+            self.away.rename(self.env)  # the person puts it back; the agent only reported it
+        elif stage == "contract":
             assert self.damaged, self.story()
             path, text = self.damaged
             path.write_text(text)  # changed by accident: the frozen version goes back
@@ -289,7 +294,7 @@ class Walk:
     def disrupt(self) -> None:
         p, rng = self.p, self.rng
         exps, tracks = p.ledger.experiments(), p.ledger.tracks()
-        kind = rng.choice(["cut", "cut", "half", "pause", "contract", "refreeze", "folder", "typed", "typed", "typed", "typed"])
+        kind = rng.choice(["cut", "cut", "half", "pause", "contract", "refreeze", "folder", "gone", "upgrade", "typed", "typed", "typed", "typed"])
         if kind in ("cut", "half"):
             drafts = [e for e in exps if e["status"] in ("draft", "crashed") and e["type"] in ("tune", "baseline") and p.ledger.worktree_path(e["track"]).exists()]
             if drafts and not p.ledger.paused() and self.damaged is None:
@@ -304,9 +309,11 @@ class Walk:
         elif kind == "refreeze":
             if self.damaged is None and p.ledger.lock_path.exists() and not p.ledger.paused():
                 evaluator = p.research / "eval" / "evaluate.py"
-                evaluator.write_text(evaluator.read_text() + f"\n# stricter, {self.name('change ')}\n")
+                before = evaluator.read_text()
+                evaluator.write_text(before + f"\n# stricter, {self.name('change ')}\n")
                 self.person(True)  # the owner of the program changes the evaluator and freezes again
-                self.call("freeze", "--reason", "a stricter evaluator", "--yes")
+                if self.call("freeze", "--reason", "a stricter evaluator", "--yes")[0] != 0:
+                    evaluator.write_text(before)  # refused (the environment is gone): they take the change back
                 self.person(False)
         elif kind == "pause":
             self.person(rng.random() < 0.5)  # in the chat, or by the person from a terminal
@@ -318,6 +325,14 @@ class Walk:
                 self.damaged = (path, path.read_text())
                 path.write_text(path.read_text() + "\n# edited by accident\n")
                 self.log.append(f"# {path.name} edited by hand")
+        elif kind == "gone":
+            if self.env.exists():
+                self.env.rename(self.away)
+                self.log.append("# the environment the contract names is moved away")
+        elif kind == "upgrade":
+            if self.env.exists():
+                install(self.env, "demo", f"{self.name('')}.0")
+                self.log.append("# a package the contract names changes version")
         elif kind == "folder":
             there = [t["name"] for t in tracks if p.ledger.worktree_path(t["name"]).exists()]
             clean = [name for name in there if not git(p.ledger.worktree_path(name), "status", "--porcelain")]
@@ -348,6 +363,7 @@ class Walk:
                         ("track", "set", track, "--status", "parked", "--note", "typed", "--introspection", nid),
                         ("track", "new", self.name("typed")),
                         ("track", "new", self.name("typed"), "--introspection", nid),
+                        ("track", "new", self.name("typed"), "--from", eid),
                         ("track", "sync", track, "--note", "typed"),
                         ("track", "worktree", track),
                         ("track", "list"),
@@ -398,6 +414,8 @@ class Walk:
             path, text = self.damaged
             path.write_text(text)
             self.damaged = None
+        if self.away.exists():
+            self.away.rename(self.env)
         if self.p.ledger.paused():
             self.person(True)
             self.call("resume")
@@ -413,8 +431,10 @@ class Walk:
 @pytest.mark.parametrize("seed", SEEDS)
 def test_walk(project: Project, monkeypatch, seed: int):
     p = project
-    p.setup(every=5, stagnation=3, max_experiments=max(30, STEPS // 2))
-    walk = Walk(p, seed, monkeypatch)
+    env = make_env(p.base / "env")
+    install(env, "demo", "1.0")
+    p.setup(every=5, stagnation=3, max_experiments=max(30, STEPS // 2), python="python", extra=env_table(env, "demo"))
+    walk = Walk(p, seed, monkeypatch, env)
     walk.go(STEPS)
     walk.settle()
     code, text = walk.call("verify")

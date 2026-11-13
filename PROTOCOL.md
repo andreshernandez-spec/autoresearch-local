@@ -7,8 +7,8 @@ where they are stricter, they win.
 ## Who owns what
 
 - **The person** owns the contract: `PROGRAM.md` (goal, scope, rules),
-  `arl.toml` (metrics, thresholds, budget, how often to introspect) and the
-  evaluator. They also own direction: pausing and resuming the loop, stopping
+  `arl.toml` (metrics, thresholds, budget, how often to introspect, the
+  environment runs use) and the evaluator. They also own direction: pausing and resuming the loop, stopping
   the program, and anything `PROGRAM.md` lists under "Ask first".
 - **arl** owns the mechanics: checking the contract, locking designs, running,
   pausing and continuing runs, scoring, comparing, committing, moving branches,
@@ -131,6 +131,13 @@ what you had only in your head. So write things down when they happen:
 12. **A long run saves its state.** A job that runs longer than a few minutes
     saves what it needs to continue (below), so that a pause costs minutes and
     not the run.
+13. **The environment is the contract's.** Runs and the evaluator use the
+    environment `arl.toml` names, and arl starts them there. Do not install,
+    upgrade or remove a package in it, do not create another one, and do not
+    route a run around it (another interpreter in the command, a venv of your
+    own). A package that is missing or broken is not a result and not yours to
+    repair: stop and tell the person. For what you run yourself outside arl (a
+    quick check, a test), use the interpreter `arl reload` names.
 
 ## Temptations
 
@@ -149,6 +156,8 @@ what you had only in your head. So write things down when they happen:
 | "That command was refused, I will find another way to get the same thing." | The refusal is the rule speaking. Do what its message says, and note it (`arl note --about work`). |
 | "Everyone knows that lesson, no need to record it." | The next session knows nothing. `arl lesson add`. |
 | "I will add a line to KNOWLEDGE.md for this result." | It is a distillation, not a log. Revise the statement the result changes, or move it between sections. |
+| "A package is missing. One install and the run goes through." | The environment is the person's, and an install changes every later comparison. Stop and say what is missing. |
+| "It works in another environment, I will run it there." | Then the result is not this program's. Runs use the environment the contract names. Stop and say what is wrong with it. |
 | "I was told to stop, but this run is nearly done." | `arl pause` now. The run saves its state and continues later. |
 | "This needs a person at a terminal. I could run it so that it looks like one." | That forges the person's decision. Stop, say what is waiting for them and why, and end the turn. |
 
@@ -163,7 +172,7 @@ writing a new one.
 
 | Kind | Use it when | Changes | Scored | Merged |
 |---|---|---|---|---|
-| `baseline` | a track has no reference, the evaluator or the data changed, or you want to see the noise | nothing | yes | the first one becomes the reference, a repeat never replaces it |
+| `baseline` | a track has no reference, the evaluator, the data or a package the contract names changed, or you want to see the noise | nothing | yes | the first one becomes the reference, a repeat never replaces it |
 | `tune` | the claim is about a setting | `params.json` | yes | params, on keep |
 | `feature` | the claim needs new code | code in the worktree | yes | code and params, on keep |
 | `diagnose` | you do not know why something happens | instrumentation, or its own command | no | never |
@@ -241,6 +250,14 @@ track, parking one or reopening one needs `--introspection <id>` of the latest
 closed one. Parking a track that stalled does not make its introspection go
 away.
 
+**Going back.** Nothing that ran is lost. `arl exp show <id>` says what an old
+experiment was and what it ran with, `arl exp reproduce <id>` runs it again
+from its recorded commit and params, and `arl track new <name> --from <id>`
+opens a track at the code and params of that experiment, kept or not. When an
+earlier result looks better in hindsight than the path taken since, that is a
+`branch` for the next introspection, not a reason to rework the current track
+by hand.
+
 ## Reporting to the person
 
 At a STOP, or when asked how it is going:
@@ -256,8 +273,10 @@ At a STOP, or when asked how it is going:
 
 Stop and say so, with what you saw, when: a metric is NaN or far outside its
 usual range; the same failure repeats across experiments; the contract check
-fails; a result is too good to be explained by the change; you would need to
-touch something `PROGRAM.md` puts out of scope. An escalation is an
+fails; `arl next` says `environment` (the one the contract names is gone, or a
+package it names is missing); a run fails on an import; a result is too good
+to be explained by the change; you would need to touch something `PROGRAM.md`
+puts out of scope. An escalation is an
 introspection:
 
 ```
