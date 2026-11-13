@@ -843,6 +843,22 @@ def test_repeating_the_baseline_never_moves_the_reference(project: Project):
     assert "does not replace the reference" in (p.ledger.exp_dir(eid) / "analysis.md").read_text()
 
 
+def test_a_draft_is_dropped_although_its_worktree_folder_is_gone(project: Project):
+    """Found by the walk: a named package changed, the draft was outdated, and dropping it
+    was refused for a folder that dropping does not need."""
+    p = project
+    h = p.started()
+    draft = p.draft("feature", hyps=(h,), offset=0.2)  # on a branch of its own, checked out in the worktree
+    wt = p.base / "wt" / "toy-main-line"
+    shutil.rmtree(wt)
+    p.arl("exp", "abandon", draft, "--reason", "its reference no longer counts")
+    assert p.record(draft)["status"] == "abandoned"
+    assert "is back, on track/main-line" in p.arl("track", "worktree", "main-line")
+    assert git(wt, "branch", "--show-current") == "track/main-line"
+    assert p.arl("verify").strip() == "ok"
+    assert "NEXT: hypothesize" in p.arl("next")
+
+
 def test_changed_data_asks_for_a_new_baseline(project: Project):
     p = project
     data = p.root / "data.txt"

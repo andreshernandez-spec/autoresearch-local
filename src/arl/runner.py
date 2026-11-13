@@ -407,11 +407,12 @@ def probe_env(ledger: Ledger) -> dict[str, Any] | None:
             text=True,
             timeout=120,
         )
-        found = json.loads(out.stdout) if out.returncode == 0 else None
+        # The last line: something a start-up file of the environment prints must not hide the answer.
+        found = json.loads(out.stdout.strip().splitlines()[-1]) if out.returncode == 0 and out.stdout.strip() else None
         detail = out.stderr.strip()[-600:]
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
         found, detail = None, str(e)[-600:]
-    if not isinstance(found, dict):
+    if not isinstance(found, dict) or not {"prefix", "python", "packages"} <= set(found):
         raise ArlError(f"python does not start in {where}" + (f":\n{detail}" if detail else "."))
     if prefix is not None and os.path.realpath(found["prefix"]) != os.path.realpath(prefix):
         raise ArlError(f"A job's python is {found['prefix']}, not the environment the contract names ({cfg.env_prefix}).")

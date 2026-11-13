@@ -1520,8 +1520,11 @@ def cmd_exp_abandon(args: argparse.Namespace) -> int:
             how = f" It ran: judge it ('{ARL} exp judge {eid} --verdict crash --reason \"...\"')." if rec["status"] in ("crashed", "paused") else ""
             raise ArlError(f"only a draft that never ran can be abandoned. {eid} is {rec['status']}.{how}")
         track = ledger.track(rec["track"])
-        path, wgit = _worktree(ledger, track)
-        if rec["branch"] != track["branch"] and wgit.branch() == rec["branch"]:
+        path = ledger.worktree_path(track["name"])
+        # The worktree only has to leave the draft's branch. A folder that is gone has
+        # nothing to leave: 'track worktree' puts it back on the track's branch.
+        wgit = Git(path) if path.exists() else None
+        if wgit is not None and rec["branch"] != track["branch"] and wgit.branch() == rec["branch"]:
             if wgit.dirty():
                 raise ArlError(f"{path} has uncommitted changes. Commit them to {rec['branch']} ('{ARL} exp commit {eid} -m \"...\"') or undo them first.")
             wgit.switch(track["branch"])
