@@ -51,6 +51,8 @@ a = p.parse_args()
 x = json.load(open(pathlib.Path(a.out, "prediction.json")))["x"]
 target = {"dev": 0.7, "confirm": 0.72}[a.split]
 json.dump({"score": 1 - abs(x - target), "cost": abs(x)}, open(a.metrics, "w"))
+if a.split == "dev":
+    pathlib.Path(a.out, "per_instance.csv").write_text("x,error\\n%r,%r\\n" % (x, abs(x - target)))
 """
 
 ARL_TOML = """\
@@ -64,7 +66,7 @@ git_email = "test@example.org"
 command = "{python} run.py --params {{params}} --out {{out}} --split {{split}}"
 timeout_s = {timeout}
 max_attempts = 2
-keep = ["*.json"]
+keep = ["*.json", "*.csv"]
 
 [eval]
 command = "{python} research/eval/evaluate.py --out {{out}} --metrics {{metrics}} --split {{split}}"

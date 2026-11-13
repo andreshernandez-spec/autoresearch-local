@@ -584,8 +584,7 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
             elif res["exit_code"] != 0:
                 failed = f"the run exited with code {res['exit_code']}"
             if not failed:
-                rec["kept"] = runner.keep_small(out, exp / "kept", cfg.keep, cfg.keep_max_kb)
-                rec["artifacts"] = runner.manifest(out)
+                rec["artifacts"] = runner.manifest(out)  # what the run left, before the evaluator adds to it
                 if scored and not rec["artifacts"]:
                     failed = "the run wrote nothing into its output folder"
             if not failed and scored:
@@ -620,6 +619,7 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
                 finish(ledger, f"{eid} failed, attempt {n}")
             else:
                 rec["status"] = "evaluated"
+                rec["kept"] = runner.keep_small(out, exp / "kept", cfg.keep, cfg.keep_max_kb)
                 kind = "scored" if scored else "diagnose"
                 facts = render.analysis_facts(ledger, rec)
                 (exp / "analysis.md").write_text(render.fill(render.template(f"analysis_{kind}.md"), id=eid, facts=facts))

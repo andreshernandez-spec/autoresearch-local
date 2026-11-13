@@ -42,7 +42,7 @@ def test_setup_to_first_reference(project: Project):
     assert rec["code_commit"] == git(wt, "rev-parse", "HEAD")
     assert rec["conditions"]["env"]["host"] and rec["contract"]["version"] == 1
     assert [a["path"] for a in rec["artifacts"]] == ["prediction.json", "weights.bin"]
-    assert rec["kept"] == ["prediction.json"]
+    assert rec["kept"] == ["per_instance.csv", "prediction.json"]  # the evaluator's small file too
 
     p.judge(eid, "keep")
     assert p.ledger.track("main-line")["head_experiment"] == eid
