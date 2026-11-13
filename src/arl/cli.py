@@ -466,14 +466,14 @@ def cmd_freeze(args: argparse.Namespace) -> int:
         print("Changes since contract v%d:" % old["version"])
         for line in shown:
             print(f"  {line}")
-        if input(f"Freeze these as contract v{old['version'] + 1}? [y/N] ").strip().lower() != "y":
+        if input(f"Freeze these as contract v{old['version'] + 1}? [y/N] ").strip().lower() not in ("y", "yes"):
             raise ArlError("not frozen")
     with ledger.locked():
         before = contract.load(ledger)
         try:
             runner.probe_env(ledger)  # a contract that names an environment nothing can run in is not frozen
         except ArlError as e:
-            raise ArlError(f"{e}\nNothing was frozen. Name an environment that is on this machine, with those packages in it.") from e
+            raise ArlError(f"{e}\nNothing was frozen. Name an environment that is on this machine.") from e
         lock = contract.freeze(ledger, args.reason, person, shown)
         try:
             write_text(ledger.status_path, render.status(ledger))
@@ -938,7 +938,7 @@ def cmd_exp_new(args: argparse.Namespace) -> int:
         lock = contract.require(ledger)
         cfg = ledger.cfg
         _gate_new_work(ledger)
-        probed = _env(ledger)
+        _env(ledger)  # nothing new is drafted while the environment cannot be used
         track = ledger.track(args.track)
         if track["status"] != "active":
             raise ArlError(f"track {args.track} is {track['status']}")
@@ -971,9 +971,8 @@ def cmd_exp_new(args: argparse.Namespace) -> int:
         if typ in ("tune", "feature"):
             if not hyps:
                 raise ArlError(f"a {typ} experiment tests a hypothesis: write one with 'arl hyp new' and pass --hyp")
-            data = _data(ledger)[1]
-            if rules.reference_for(ledger, track, lock["eval_digest"], data, (probed or {}).get("digest")) is None:
-                raise ArlError(f"{rules.why_no_reference(ledger, track, lock, data, probed)}: run a baseline first")
+            if rules.reference_for(ledger, track, lock["eval_digest"], _data(ledger)[1]) is None:
+                raise ArlError(f"track {args.track} has no reference under contract v{lock['version']} and the data as it is: run a baseline first")
         if args.command and typ != "diagnose":
             raise ArlError("--command is for diagnose experiments. Scored runs use the command in arl.toml.")
 
@@ -1138,7 +1137,6 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
             again = give_up if attempts else f"Abandon it ('{ARL} exp abandon {eid} --reason \"...\"') and draft again."
             fingerprint, data = _data(ledger)
             probed = _env(ledger)
-            env_digest = (probed or {}).get("digest")
             if resuming:
                 if code != rec["code_commit"]:
                     raise ArlError(f"{path} is at {code[:10]}, but {eid} was paused while running {rec['code_commit'][:10]}. A run continues the code it started with. {give_up}")
@@ -1146,9 +1144,6 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
                     raise ArlError(f"the contract was frozen anew since {eid} started (v{rec['contract']['version']} to v{lock['version']}), so it cannot be continued. {give_up}")
                 if rec["conditions"].get("data_digest") not in (None, data):
                     raise ArlError(f"the data files changed since {eid} started, so it cannot be continued. {give_up}")
-                if env_digest is not None and rec["conditions"].get("env_digest") != env_digest:
-                    changes = "; ".join(runner.env_changes(rec["conditions"].get("env"), probed)) or "see its record"
-                    raise ArlError(f"the packages changed since {eid} started ({changes}), so it cannot be continued. {give_up}")
             elif typ in ("baseline", "tune"):
                 if code != track["head_commit"]:
                     raise ArlError(f"track {rec['track']} moved since {eid} was drafted. {again}")
@@ -1177,10 +1172,8 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
             command = rec.get("command") or cfg.run_command
             # The files, not the commit: the same change committed twice is the same experiment.
             what = {"track": rec["track"], "tree": wgit.tree(code), "params": params_hash, "command": command, "eval": lock["eval_digest"] if scored else "", "split": split, "data": data}
-            if env_digest is not None:
-                what["env"] = env_digest  # the same run with other packages is not a known result
             key = sha256_text(canonical(what))
-            reference = rules.reference_for(ledger, track, lock["eval_digest"], data, env_digest)
+            reference = rules.reference_for(ledger, track, lock["eval_digest"], data)
             repeat = typ == "baseline" and reference is not None  # the track has a reference: this one shows the noise
             if not resuming:
                 for other in ledger.experiments():
@@ -1189,11 +1182,11 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
                         if not args.allow_duplicate:
                             raise ArlError(
                                 f"{eid} has the same code, params, data and evaluator as {other['id']}: the result is already known.\n"
-                                "To repeat it on purpose (to see the noise), pass --allow-duplicate \"why\"."
+                                "To repeat it on purpose (to see the noise, or after the environment changed), pass --allow-duplicate \"why\"."
                             )
                         rec["duplicate_of"], rec["duplicate_reason"] = other["id"], args.allow_duplicate
             if typ in ("tune", "feature") and reference is None:
-                raise ArlError(f"{rules.why_no_reference(ledger, track, lock, data, probed)}. {again} Then run a baseline first.")
+                raise ArlError(f"track {rec['track']} has no reference under contract v{lock['version']} and the data as it is. {again} Then run a baseline first.")
             reasons = runner.busy(cfg)
             if reasons:
                 raise ArlError(
@@ -1213,8 +1206,6 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
                     attempts.append(attempt)
                     rec["contract"] = {k: lock[k] for k in ("version", "digest", "eval_digest")}
                     rec["conditions"] = {"command": command, "split": split, "worktree": str(path), "data": fingerprint, "data_digest": data}
-                    if env_digest is not None:
-                        rec["conditions"]["env_digest"] = env_digest
                 n = attempt["n"]
                 part = {"started": now()}
                 attempt.setdefault("segments", []).append(part)
@@ -1577,8 +1568,7 @@ def cmd_exp_show(args: argparse.Namespace) -> int:
             print(f"  rerun {r['n']} on {r['split']}: {name} {value}" + (f", reproduced: {r['reproduced']}" if "reproduced" in r else "") + other)
     env = rec.get("conditions", {}).get("env")
     if env:
-        named = [f"{k} {v}" for k, v in (env.get("versions") or {}).items()]
-        what = [env.get("prefix") or "the python of the shell that ran it"] + ([f"python {env['python']}"] if env.get("python") else []) + named
+        what = [env.get("prefix") or "the python of the shell that ran it"] + ([f"python {env['python']}"] if env.get("python") else [])
         digest = env.get("listing") or env.get("packages")
         listing = f"; every package: {ledger.name}/envs/{digest}.txt" if digest else ""
         print(f"  environment: {', '.join(what)}{listing}")
@@ -1605,8 +1595,7 @@ def _contract_at(ledger: Ledger, version: int) -> str:
 
 
 def _env_lines(ledger: Ledger, env: dict[str, Any]) -> list[str]:
-    named = ", ".join(f"{k} {v}" for k, v in (env.get("versions") or {}).items())
-    lines = [f"  environment: {env.get('prefix') or 'not named by the contract'}" + (f", python {env['python']}" if env.get("python") else "") + (f", {named}" if named else "")]
+    lines = [f"  environment: {env.get('prefix') or 'not named by the contract'}" + (f", python {env['python']}" if env.get("python") else "")]
     lines.append(f"  machine: {env.get('host', 'not recorded')}, {env.get('platform', 'system not recorded')}")
     if env.get("gpu"):
         lines.append(f"  GPU and driver: {'; '.join(map(str, env['gpu']))}")

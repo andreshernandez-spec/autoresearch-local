@@ -1,9 +1,10 @@
 """The environment runs use, what an experiment records about its conditions, and
 going back to an old experiment.
 
-A contract can name the environment ([env] prefix) and the packages that must
-stay the same for two results to be compared ([env] packages). These tests use
-a real environment of their own, and fake a package version in it.
+A contract names the environment runs use ([env] prefix). Which packages it
+holds is not a setting: arl keeps the list with every run and says where two
+runs differ. These tests use a real environment of their own, and fake a
+package version in it.
 """
 
 from __future__ import annotations
@@ -17,11 +18,12 @@ from conftest import Project, env_table, git, install, make_env, pause_record
 
 
 def pinned(p: Project, *packages: str, **over) -> tuple:
-    """A project whose contract names an environment of its own. Returns (env, hypothesis)."""
+    """A project whose contract names an environment of its own, with these packages
+    in it at version 1.0. Returns (env, hypothesis)."""
     env = make_env(p.base / "env")
     for name in packages:
         install(env, name, "1.0")
-    return env, p.started(python="python", extra=env_table(env, *packages), **over)
+    return env, p.started(python="python", extra=env_table(env), **over)
 
 
 def observe(p: Project, command: str, name: str) -> str:
@@ -117,32 +119,31 @@ def test_reload_says_where_runs_happen(project: Project):
     assert "'python' in this shell is" in out and f"call {env}/bin/python" in out  # the tests run from another python
 
 
-# --- packages that must stay the same ---------------------------------------------------
+# --- packages are a record, not a setting ------------------------------------------------
 
 
-def test_a_changed_package_asks_for_a_new_baseline(project: Project):
+def test_a_changed_package_stops_nothing_and_is_said(project: Project):
     p = project
     env, h = pinned(p, "demo")
-    first = p.record("E0001")
-    assert first["conditions"]["env"]["versions"] == {"demo": "1.0"} and first["conditions"]["env_digest"]
-    p.tune(0.5, "keep", h)  # compared with the baseline: same packages
+    first = p.tune(0.5, "keep", h)
     draft = p.draft("tune", hyps=(h,), params={"x": 0.6})
     install(env, "demo", "2.0")  # somebody upgrades it
-    assert f"NEXT: outdated {draft}" in p.arl("next")
-    out = p.arl("exp", "run", draft, code=1)
-    assert "with other packages (demo 1.0 -> 2.0)" in out and "run a baseline first" in out
-    p.arl("exp", "abandon", draft, "--reason", "the packages changed")
-    out = p.arl("next")
-    assert "NEXT: baseline main-line" in out and "measured by E0002 with other packages (demo 1.0 -> 2.0)" in out
-    refused = p.arl("exp", "new", "--type", "tune", "--track", "main-line", "--title", "too early", "--hyp", h, code=1)
-    assert "with other packages (demo 1.0 -> 2.0)" in refused
-    again = p.baseline(params={"x": 0.5})  # the same code and params with another package: a new measurement
-    assert p.record(again)["comparison"]["outcome"] == "reference"
-    analysis = (p.ledger.exp_dir(again) / "analysis.md").read_text()  # did the change move the result? the facts to tell
-    assert "The track was last measured by E0002 (score 0.8), which no longer counts as its reference." in analysis
-    assert "The environment since then (1 difference): demo 1.0 -> 2.0." in analysis
-    assert p.record(again)["conditions"]["env"]["versions"] == {"demo": "2.0"}
-    p.tune(0.6, "keep", h)
+    assert f"NEXT: design {draft}" in p.arl("next")  # no gate: the draft runs as it is
+    p.arl("exp", "run", draft)
+    analysis = (p.ledger.exp_dir(draft) / "analysis.md").read_text()
+    assert f"The environment is not the one the reference {first} ran in (1 difference): demo 1.0 -> 2.0." in analysis
+    p.judge(draft, "keep", "--hyp", f"{h}=supported")
+    # Did the upgrade move the score? Measuring the track again says: the same code and params, on purpose.
+    again = p.draft("baseline", params={"x": 0.6})
+    refused = p.arl("exp", "run", again, code=1)
+    assert "already known" in refused and "or after the environment changed" in refused
+    install(env, "demo", "3.0")
+    p.arl("exp", "run", again, "--allow-duplicate", "demo was upgraded")
+    rec = p.record(again)
+    assert rec["comparison"]["outcome"] == "repeat" and rec["comparison"]["gain"] == 0
+    analysis = (p.ledger.exp_dir(again) / "analysis.md").read_text()
+    assert f"The environment is not the one the reference {draft} ran in (1 difference): demo 2.0 -> 3.0." in analysis
+    p.judge(again, "finding")  # a repeat shows the noise, or here the effect of the upgrade: it replaces nothing
     assert p.arl("verify").strip() == "ok"
 
 
@@ -159,39 +160,18 @@ def test_a_rerun_says_what_differs_from_the_environment_it_first_ran_in(project:
     assert "exp env E0001" in out
     rerun = p.record("E0001")["reruns"][1]
     assert rerun["env_changed"] == {"count": 2, "first": ["demo 1.0 -> 2.0", "other 0.3 added"]}
-    assert rerun["env"]["versions"] == {"demo": "2.0"} and rerun["env"]["listing"] != p.record("E0001")["conditions"]["env"]["listing"]
+    assert rerun["env"]["listing"] != p.record("E0001")["conditions"]["env"]["listing"]
     assert "rerun 2 on dev" in p.arl("exp", "show", "E0001") and "in another environment (2 differences: demo 1.0 -> 2.0; other 0.3 added)" in p.arl("exp", "show", "E0001")
 
 
-def test_a_paused_run_is_not_continued_with_other_packages(project: Project):
+def test_the_contract_does_not_name_packages(project: Project):
     p = project
-    env, h = pinned(p, "demo")
-    draft = p.draft("tune", hyps=(h,), params={"x": 0.5})
-    pause_record(p, draft)
-    install(env, "demo", "2.0")
-    out = p.arl("exp", "run", draft, code=1)
-    assert "the packages changed since E0002 started (demo 1.0 -> 2.0), so it cannot be continued" in out
-
-
-def test_a_named_package_has_to_be_installed(project: Project):
-    p = project
-    env = make_env(p.base / "env")
     p.arl("init")
-    p.contract(python="python", extra=env_table(env, "nothere"))
+    p.contract(extra='[env]\npackages = ["numpy"]\n')
     (p.research / "eval" / "evaluate.py").write_text("print('x')\n")
     p.fill(p.research / "PROGRAM.md")
     out = p.arl("freeze", "--reason", "initial", code=1)
-    assert "names the package nothere" in out and "not installed" in out
-
-
-def test_packages_are_asked_of_the_python_on_the_path_when_no_environment_is_named(project: Project, monkeypatch):
-    p = project
-    env = make_env(p.base / "env")
-    install(env, "demo", "1.0")
-    monkeypatch.setenv("PATH", f"{env}/bin:{os.environ['PATH']}")  # the shell has it active, the contract does not name it
-    p.started(python="python", extra='[env]\npackages = ["demo"]\n')
-    recorded = p.record("E0001")["conditions"]["env"]
-    assert recorded["versions"] == {"demo": "1.0"} and "prefix" not in recorded
+    assert "[env] packages is not an option" in out and "arl keeps the list of every package" in out
 
 
 # --- what a record holds, and going back to an old experiment -----------------------------
@@ -214,13 +194,13 @@ def test_show_says_what_an_experiment_ran_with_and_how_to_go_back_to_it(project:
     p.arl("exp", "run", eid)
     p.judge(eid, "discard", "--hyp", f"{h}=open")
     out = p.arl("exp", "show", eid)
-    assert f"environment: {env}, python {sys.version.split()[0]}, demo 1.0" in out
+    assert f"environment: {env}, python {sys.version.split()[0]}; every package: research/envs/" in out
     assert "ran under: contract v1 (frozen in " in out and f", arl {__version__}" in out and f"exp env {eid}" in out
     rec = p.record(eid)
     assert f"diff {rec['base_commit'][:10]} {rec['code_commit'][:10]} -- . ':(exclude)research'" in out
     assert f"exp reproduce {eid}" in out and f"track new <name> --from {eid}" in out
     analysis = (p.ledger.exp_dir(eid) / "analysis.md").read_text()
-    assert f"Environment: {env}, python {sys.version.split()[0]}, demo 1.0." in analysis
+    assert f"Environment: {env}, python {sys.version.split()[0]}." in analysis
 
 
 def test_a_track_starts_from_an_old_experiment(project: Project, monkeypatch):
@@ -371,7 +351,7 @@ def test_the_output_of_a_command_is_stored_beside_the_list(project: Project):
 
 
 def test_a_changed_environment_is_said_where_a_score_is_read(project: Project):
-    """Nothing is gated here (the contract names no packages), and nothing goes unsaid."""
+    """Nothing is gated, and nothing goes unsaid."""
     p = project
     env = make_env(p.base / "env")
     install(env, "extra", "1.0")

@@ -177,7 +177,7 @@ writing a new one.
 
 | Kind | Use it when | Changes | Scored | Merged |
 |---|---|---|---|---|
-| `baseline` | a track has no reference, the evaluator, the data or a package the contract names changed, or you want to see the noise | nothing | yes | the first one becomes the reference, a repeat never replaces it |
+| `baseline` | a track has no reference, the evaluator or the data changed, the environment changed and you need to know whether that moved the score, or you want to see the noise | nothing | yes | the first one becomes the reference, a repeat never replaces it |
 | `tune` | the claim is about a setting | `params.json` | yes | params, on keep |
 | `feature` | the claim needs new code | code in the worktree | yes | code and params, on keep |
 | `diagnose` | you do not know why something happens | instrumentation, or its own command | no | never |

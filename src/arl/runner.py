@@ -342,14 +342,8 @@ def tail(path: Path, lines: int = 120, max_bytes: int = 48_000) -> str:
 # --- the environment a job gets -----------------------------------------------------
 
 _PROBE = """\
-import importlib.metadata as m, json, sys
-found = {}
-for name in json.loads(sys.argv[1]):
-    try:
-        found[name] = m.version(name)
-    except m.PackageNotFoundError:
-        found[name] = None
-print(json.dumps({"prefix": sys.prefix, "python": sys.version.split()[0], "packages": found}))
+import json, sys
+print(json.dumps({"prefix": sys.prefix, "python": sys.version.split()[0]}))
 """
 _LISTING = """\
 import importlib.metadata as m, json, os, subprocess, sys
@@ -423,57 +417,28 @@ def job_env(ledger: Ledger) -> dict[str, str]:
 
 
 def probe_env(ledger: Ledger) -> dict[str, Any] | None:
-    """Ask the python a job would get what it is.
-
-    None when the contract names neither an environment nor packages. Otherwise
-    its version, the prefix as the contract writes it, and for [env] packages
-    their versions and one digest of them: results are compared only within
-    one digest. Raises when that python is not what the contract names.
-    """
+    """Ask the python a job would get what it is: its prefix, as the contract writes
+    it, and its version. None when the contract names no environment. Raises when
+    that python is not the environment the contract names."""
     cfg = ledger.cfg
     prefix = env_prefix(ledger)
-    if prefix is None and not cfg.env_packages:
+    if prefix is None:
         return None
-    where = f"the environment {cfg.env_prefix}" if prefix else "the python on the PATH"
-    if prefix is not None and not (prefix / "bin" / "python").exists():
+    if not (prefix / "bin" / "python").exists():
         raise ArlError(f"The contract names the environment {cfg.env_prefix} ([env] prefix), and it is not on this machine: no {prefix / 'bin' / 'python'}.")
     detail = ""
     try:
-        out = subprocess.run(
-            ["bash", "-c", 'exec python -I -c "$0" "$1"', _PROBE, json.dumps(cfg.env_packages)],
-            cwd=ledger.home,
-            env=job_env(ledger),
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
+        out = subprocess.run(["bash", "-c", 'exec python -I -c "$0"', _PROBE], cwd=ledger.home, env=job_env(ledger), capture_output=True, text=True, timeout=120)
         # The last line: something a start-up file of the environment prints must not hide the answer.
         found = json.loads(out.stdout.strip().splitlines()[-1]) if out.returncode == 0 and out.stdout.strip() else None
         detail = out.stderr.strip()[-600:]
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
         found, detail = None, str(e)[-600:]
-    if not isinstance(found, dict) or not {"prefix", "python", "packages"} <= set(found):
-        raise ArlError(f"python does not start in {where}" + (f":\n{detail}" if detail else "."))
-    if prefix is not None and os.path.realpath(found["prefix"]) != os.path.realpath(prefix):
+    if not isinstance(found, dict) or not {"prefix", "python"} <= set(found):
+        raise ArlError(f"python does not start in the environment {cfg.env_prefix}" + (f":\n{detail}" if detail else "."))
+    if os.path.realpath(found["prefix"]) != os.path.realpath(prefix):
         raise ArlError(f"A job's python is {found['prefix']}, not the environment the contract names ({cfg.env_prefix}).")
-    missing = [name for name, version in found["packages"].items() if version is None]
-    if missing:
-        raise ArlError(f"The contract names the package{'s' if len(missing) > 1 else ''} {', '.join(missing)} ([env] packages), not installed in {where}.")
-    info: dict[str, Any] = {"python": found["python"]}
-    if prefix is not None:
-        info["prefix"] = cfg.env_prefix
-    if cfg.env_packages:
-        info["versions"] = found["packages"]
-        info["digest"] = sha256_text(canonical({"python": found["python"], "packages": found["packages"]}))[:16]
-    return info
-
-
-def env_changes(old: dict[str, Any] | None, new: dict[str, Any] | None) -> list[str]:
-    """What differs between two recorded environments: python and the packages the contract names."""
-    before = {"python": (old or {}).get("python"), **((old or {}).get("versions") or {})}
-    after = {"python": (new or {}).get("python"), **((new or {}).get("versions") or {})}
-    names = ["python"] + sorted({*before, *after} - {"python"})
-    return [f"{n} {before.get(n) or 'not recorded'} -> {after.get(n) or 'not there'}" for n in names if before.get(n) != after.get(n)]
+    return {"python": found["python"], "prefix": cfg.env_prefix}
 
 
 def shell_python_elsewhere(ledger: Ledger) -> str | None:
@@ -537,7 +502,7 @@ LISTS = ("listing", "packages")  # arl's own list of what python sees, and the o
 def snapshot(ledger: Ledger, probed: dict[str, Any] | None = None, store: bool = True) -> tuple[dict[str, Any], dict[str, str]]:
     """Where and with what a run happens: what goes into a record, and the package lists as text.
 
-    probed: what probe_env answered, when the contract names an environment or packages.
+    probed: what probe_env answered, when the contract names an environment.
     store: keep the lists under research/envs/, once per distinct content. A command
     that only looks leaves it out.
     """
@@ -547,7 +512,7 @@ def snapshot(ledger: Ledger, probed: dict[str, Any] | None = None, store: bool =
         "arl": harness_version(),
         "arl_python": sys.version.split()[0],
     }
-    info.update({k: probed[k] for k in ("prefix", "python", "versions") if probed and k in probed})
+    info.update({k: probed[k] for k in ("prefix", "python") if probed and k in probed})
     gpu = _nvidia("name,driver_version")
     if gpu:
         info["gpu"] = [row.strip() for row in gpu]
@@ -661,8 +626,8 @@ def env_differences(ledger: Ledger, old: dict[str, Any] | None, new: dict[str, A
             else:
                 said = any(line.startswith("python ") for line in out)
                 out += [c for c in listing_changes(before, after) if not (said and c.startswith("python "))]
-    elif old.get("versions") and new.get("versions"):
-        out += [c for c in env_changes(old, new) if not c.startswith("python ")]
+    elif any(old.get(key) for key in LISTS) and any(new.get(key) for key in LISTS):
+        out.append("the package lists of the two are of different kinds and cannot be compared (one is arl's own, the other the output of [env] command)")
     return out
 
 

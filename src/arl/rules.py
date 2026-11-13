@@ -8,7 +8,7 @@ from typing import Any
 from . import contract
 from .config import Config
 from .ledger import Ledger
-from .runner import alive, env_changes
+from .runner import alive
 from .util import now, parse_time
 
 SCORED = ("baseline", "tune", "feature")
@@ -109,13 +109,8 @@ def allowed_verdicts(rec: dict[str, Any]) -> list[str]:
 # --- tracks -----------------------------------------------------------------------
 
 
-def reference_for(ledger: Ledger, track: dict[str, Any], eval_digest: str, data: str | None = None, env: str | None = None) -> dict[str, Any] | None:
-    """The experiment that measured the track head under the current evaluator, on the
-    current data and with the current versions of the packages the contract names.
-
-    data, env: the digests as they are now. None leaves that condition unchecked
-    (the caller does not have it at hand, or the contract names no packages).
-    """
+def reference_for(ledger: Ledger, track: dict[str, Any], eval_digest: str, data: str | None = None) -> dict[str, Any] | None:
+    """The experiment that measured the track head under the current evaluator, on the current data."""
     eid = track.get("head_experiment")
     if not eid:
         return None
@@ -125,24 +120,7 @@ def reference_for(ledger: Ledger, track: dict[str, Any], eval_digest: str, data:
     measured_on = rec.get("conditions", {}).get("data_digest")
     if data is not None and measured_on is not None and measured_on != data:
         return None
-    if env is not None and rec.get("conditions", {}).get("env_digest") != env:
-        return None
     return rec
-
-
-def why_no_reference(ledger: Ledger, track: dict[str, Any], lock: dict[str, Any], data: str | None, env: dict[str, Any] | None) -> str:
-    """Why a track has nothing a new result could be compared with."""
-    name, eid = track["name"], track.get("head_experiment")
-    general = f"track {name} has no reference under contract v{lock['version']} and the data as it is"
-    if not eid or not env or not env.get("digest"):
-        return general
-    if reference_for(ledger, track, lock["eval_digest"], data) is None:
-        return general  # the evaluator or the data: the packages are not the reason
-    measured = ledger.record(eid).get("conditions", {})
-    if "env_digest" not in measured:
-        return f"track {name} was measured by {eid} before the contract named packages ([env] packages): measure it again"
-    changes = env_changes(measured.get("env"), env)
-    return f"track {name} was measured by {eid} with other packages ({'; '.join(changes) or 'see its record'}): measure it again"
 
 
 def in_flight(ledger: Ledger, track: str | None = None) -> list[dict[str, Any]]:
@@ -271,8 +249,8 @@ def next_action(ledger: Ledger, data: str | None = None, env: dict[str, Any] | N
     A person's word first (the contract, a pause, a decision that waits for
     them), then work that is unfinished, then the gates, then new work.
     data: the digest of the data files, when the caller has it at hand.
-    env: what the python a job would get answered (its "digest"), or the
-    "problem" with it, when the caller has asked.
+    env: what the python a job would get answered, or the "problem" with it,
+    when the caller has asked.
     """
     if not ledger.exists():
         return {"stage": "setup", "why": f"no {ledger.name}/arl.toml in {ledger.home}"}
@@ -295,12 +273,12 @@ def next_action(ledger: Ledger, data: str | None = None, env: dict[str, Any] | N
         return {"stage": "wait", "target": state["waiting"], "why": state["reasons"][0], "stop": True}
 
     tracks = {t["name"]: t for t in ledger.tracks()}
-    env_digest, env_problem = (env or {}).get("digest"), (env or {}).get("problem")
+    env_problem = (env or {}).get("problem")
 
     def no_reference(e: dict[str, Any]) -> bool:
         if e["type"] not in ("tune", "feature") or e["track"] not in tracks:
             return False
-        return reference_for(ledger, tracks[e["track"]], lock["eval_digest"], data, env_digest) is None
+        return reference_for(ledger, tracks[e["track"]], lock["eval_digest"], data) is None
 
     for e in exps:
         if e["status"] == "judging":
@@ -359,6 +337,10 @@ def next_action(ledger: Ledger, data: str | None = None, env: dict[str, Any] | N
     if not active:
         return {"stage": "track", "why": "no active track"}
     for t in active:
-        if reference_for(ledger, t, lock["eval_digest"], data, env_digest) is None:
-            return {"stage": "baseline", "target": t["name"], "why": why_no_reference(ledger, t, lock, data, env)}
+        if reference_for(ledger, t, lock["eval_digest"], data) is None:
+            return {
+                "stage": "baseline",
+                "target": t["name"],
+                "why": f"track {t['name']} has no reference under contract v{lock['version']} and the data as it is",
+            }
     return {"stage": "hypothesize", "why": "nothing in flight, no gate closed"}

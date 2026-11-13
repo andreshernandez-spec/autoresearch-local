@@ -200,8 +200,7 @@ def _env_line(rec: dict[str, Any]) -> str:
     env = rec.get("conditions", {}).get("env") or {}
     if not env.get("python"):
         return ""
-    named = "".join(f", {k} {v}" for k, v in (env.get("versions") or {}).items())
-    return f" Environment: {env.get('prefix') or 'the python on the PATH'}, python {env['python']}{named}."
+    return f" Environment: {env.get('prefix') or 'the python on the PATH'}, python {env['python']}."
 
 
 def _reported(rec: dict[str, Any]) -> list[str]:

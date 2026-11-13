@@ -119,9 +119,8 @@ decision the agent may not take alone leaves the loop waiting for the user.
    - the primary metric, the smallest change that counts (`min_delta`), any
      constraints;
    - what the agent may change and what it may not;
-   - which environment runs use (`[env] prefix`), and which packages must stay
-     the same for two results to be compared (`[env] packages`: the ones the
-     method and the evaluator compute with);
+   - which environment runs use (`[env] prefix`). Packages are not named or
+     pinned in the contract: arl records what was there with every run;
    - the budget, how often to introspect, which decisions the agent may take
      alone;
    - how long a run may take, how often a job saves its state

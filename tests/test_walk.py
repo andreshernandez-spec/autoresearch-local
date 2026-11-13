@@ -332,7 +332,7 @@ class Walk:
         elif kind == "upgrade":
             if self.env.exists():
                 install(self.env, "demo", f"{self.name('')}.0")
-                self.log.append("# a package the contract names changes version")
+                self.log.append("# a package in the environment changes version")
         elif kind == "folder":
             there = [t["name"] for t in tracks if p.ledger.worktree_path(t["name"]).exists()]
             clean = [name for name in there if not git(p.ledger.worktree_path(name), "status", "--porcelain")]
@@ -435,7 +435,7 @@ def test_walk(project: Project, monkeypatch, seed: int):
     p = project
     env = make_env(p.base / "env")
     install(env, "demo", "1.0")
-    p.setup(every=5, stagnation=3, max_experiments=max(30, STEPS // 2), python="python", extra=env_table(env, "demo"))
+    p.setup(every=5, stagnation=3, max_experiments=max(30, STEPS // 2), python="python", extra=env_table(env))
     walk = Walk(p, seed, monkeypatch, env)
     walk.go(STEPS)
     walk.settle()
