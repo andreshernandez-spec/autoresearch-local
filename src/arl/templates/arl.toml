@@ -1,0 +1,80 @@
+# arl.toml: the machine-readable half of the contract.
+# Frozen together with PROGRAM.md and the evaluator. After 'arl freeze', a change
+# here blocks every run until a person freezes again.
+
+[project]
+name = "@NAME@"
+# Where track worktrees are made: relative to the project root, or absolute (~ allowed).
+worktrees = "../.worktrees"
+# The branch that holds research/. arl refuses to commit the ledger anywhere else.
+home_branch = "@BRANCH@"
+commit_prefix = "research"
+# Uncomment to refuse commits under any other identity.
+# git_email = "you@example.org"
+
+[run]
+# Runs inside the track's worktree and writes its results into {out}.
+# Placeholders: {params} {out} {split} {home} {research} {exp} {worktree}
+command = "python run.py --params {params} --out {out} --split {split}"
+timeout_s = 1800
+max_attempts = 3
+# Small files copied from {out} into the ledger and committed.
+keep = ["*.json", "*.txt", "*.csv", "*.md"]
+keep_max_kb = 256
+
+[eval]
+# Runs in the home checkout, never in a worktree. Reads {out} and writes {metrics}:
+# one JSON object with a number for every metric listed below.
+command = "python research/eval/evaluate.py --out {out} --metrics {metrics} --split {split}"
+timeout_s = 900
+# Files and folders that make up the evaluator. Hashed into frozen.lock.
+frozen = ["research/eval"]
+# The first split scores every experiment. The others are used only by
+# 'arl exp reproduce --split', to confirm a result on data the loop never tuned on.
+splits = ["dev"]
+
+[[metric]]
+name = "score"
+goal = "max"            # max or min
+role = "primary"        # exactly one metric is primary
+min_delta = 0.0         # smallest change that counts as better or worse
+# target = 0.95         # reaching it ends the program
+
+# [[metric]]
+# name = "seconds"
+# goal = "min"
+# role = "constraint"   # must hold for a result to be kept
+# limit = 60.0          # absolute bound
+# max_regression = 5.0  # or: at most this much worse than the track's reference
+
+# [[metric]]
+# name = "worth_watching"
+# goal = "max"
+# role = "info"
+
+[budget]
+max_experiments = 100
+max_run_hours = 50
+
+[review]
+every = 8               # judged experiments between reviews
+stagnation = 5          # scored experiments in a row without a keep, on one track
+max_days = 7
+# Decisions the agent may take alone. Any other waits for a person.
+agent_may = ["continue", "adjust", "branch", "pivot"]
+
+[machine]
+# A run does not start while the machine is busier than this.
+# max_loadavg = 8.0
+# min_free_ram_gb = 8
+# min_free_gpu_mb = 6000
+# One run at a time across every project that names this file.
+# lock = "~/.arl-run.lock"
+
+[env]
+# Its output is stored with each run, once per distinct content.
+command = "python -m pip freeze"
+
+[data]
+# Files the experiments read. Size and sha256 go into every record.
+# files = ["~/data/project/*.npy"]

@@ -1,0 +1,6 @@
+# Large or local files stay out of git. Their hashes are in each record.json.
+experiments/*/artifacts/
+experiments/*/logs/
+.cache/
+.arl.lock
+.run.lock
