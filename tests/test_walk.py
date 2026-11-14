@@ -10,7 +10,7 @@ things must hold: no traceback, `next` and `status` answer, the records agree
 with each other, and the step that `next` asks for is not refused for ever.
 
 More seeds or longer walks: ARL_WALK_SEEDS=40 ARL_WALK_STEPS=150 python -m pytest tests/test_walk.py
-On several machines at once, ARL_WALK_SHARD=1/4 runs every fourth walk, from the second on.
+On several machines at once, ARL_WALK_SHARD=2/4 is the second of four: every fourth walk, from the second on.
 """
 
 from __future__ import annotations
@@ -33,9 +33,10 @@ from arl.ledger import Ledger
 from conftest import NOTHING_NEW, Project, cut_off, env_table, git, install, make_env, pause_record
 
 SEEDS = range(int(os.environ.get("ARL_WALK_SEEDS", "6")))
-if os.environ.get("ARL_WALK_SHARD"):  # "1/4": one of four machines that share the walks out
+if os.environ.get("ARL_WALK_SHARD"):  # "2/4": the second of four machines that share the walks out
     _part, _of = map(int, os.environ["ARL_WALK_SHARD"].split("/"))
-    SEEDS = SEEDS[_part::_of]
+    assert 1 <= _part <= _of, "ARL_WALK_SHARD is <which machine>/<how many>, counted from 1"
+    SEEDS = SEEDS[_part - 1 :: _of]
 STEPS = int(os.environ.get("ARL_WALK_STEPS", "70"))
 STAGES = {
     "track", "baseline", "hypothesize", "design", "outdated", "judge", "crashed", "interrupted", "resume",

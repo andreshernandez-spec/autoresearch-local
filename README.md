@@ -478,9 +478,9 @@ Linux only: the tests, like arl itself, read `/proc` and use sessions and
 signals to stop jobs. They need pytest, git and bash, and nothing else.
 
 Every pull request runs them on GitHub (`.github/workflows/ci.yml`) on each
-Python from 3.11 to 3.15, together with a type check (pyright) and a longer
-random walk through the loop: 40 walks of 150 steps, where the suite itself
-takes 6 of 70.
+Python from 3.11 to the newest, together with a type check (pyright) and a
+longer random walk through the loop: 40 walks of 150 steps, where the suite
+itself takes 6 of 70.
 
 A toy project in a temporary git repository is driven through the real CLI.
 Every stage and every gate has a test (`tests/test_flow.py`,

@@ -75,13 +75,14 @@ jobs:
         run: pyright src
 
   walk:
-    name: wide walk (${{ matrix.shard }})
+    # no slash in the name: `gh run view --log` returns nothing for a job that has one
+    name: wide walk (${{ matrix.part }} of 4)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        shard: ["0/4", "1/4", "2/4", "3/4"]
+        part: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -93,7 +94,7 @@ jobs:
         env:
           ARL_WALK_SEEDS: 40
           ARL_WALK_STEPS: 150
-          ARL_WALK_SHARD: ${{ matrix.shard }}
+          ARL_WALK_SHARD: ${{ matrix.part }}/4
         run: ARL_WALK_REPORT="$RUNNER_TEMP/walks.jsonl" python -m pytest tests/test_walk.py
       - name: which stages the walks reached
         if: always()
