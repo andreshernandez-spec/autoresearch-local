@@ -9,13 +9,15 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import time
 
 import pytest
 
 from arl import cli, contract, gitops, render, runner
-from conftest import DEAD_PID, EVAL_PY, NOTHING_NEW, Project, cut_off, git, job_pid, launch, pid_alive
+from conftest import DEAD_PID, EVAL_PY, NOTHING_NEW, Project, cut_off, git, job_pid, launch, pid_alive, wait_for
 
 
 def new_exp(p: Project, typ: str, h: str | None = None, code: int = 0, track: str = "main-line") -> str:
@@ -23,14 +25,15 @@ def new_exp(p: Project, typ: str, h: str | None = None, code: int = 0, track: st
     return p.arl(*args, *(["--hyp", h] if h else []), code=code)
 
 
-def after_the_run(monkeypatch, action):
-    """Do something at the moment the run has ended and the evaluator has not started."""
+def after_the_run(monkeypatch, action, job: int = 1):
+    """Do something at the moment the run has ended and the evaluator has not started.
+    job=2: at the moment the evaluator has ended."""
     real, calls = runner.execute, []
 
     def execute(*args, **kwargs):
         result = real(*args, **kwargs)
         calls.append(1)
-        if len(calls) == 1:
+        if len(calls) == job:
             action()
         return result
 
@@ -902,3 +905,164 @@ def test_track_cut_off_between_its_branch_and_its_file(project: Project):
     (p.base / "wt" / "toy-plain").mkdir()
     assert "is not a worktree of track/plain" in p.arl("track", "new", "plain", code=1)
     assert sorted(t["name"] for t in p.ledger.tracks()) == ["far", "side"]
+
+
+# --- found by a review from outside ------------------------------------------------------
+
+QUIET = {"x": 0.5, "sleep": 60}  # a job that writes nothing, to its log or anywhere else, until it ends
+DATA = '[data]\nfiles = ["data.txt"]\n'
+
+
+def with_data(p: Project):
+    data = p.root / "data.txt"
+    data.write_text("one\n")
+    return data, p.started(extra=DATA)
+
+
+def test_verdict_given_while_a_rerun_is_going_stays(project: Project):
+    p = project
+    h = p.started()
+    eid = p.draft("tune", hyps=(h,), params={"x": 0.5, "steps": 30, "step_s": 0.1})
+    p.arl("exp", "run", eid)
+    proc = launch(p, "exp", "reproduce", eid)
+    job_pid(p, eid, "rerun-1-dev")  # the rerun is going, its evaluator has not started
+    p.judge(eid, "keep", "--hyp", f"{h}=supported")
+    out = proc.communicate(timeout=60)[0]
+    assert proc.returncode == 0, out
+    rec = p.record(eid)
+    # the rerun adds its own fields to the record as it is now, not to the copy it started with
+    assert rec["status"] == "judged" and rec["verdict"]["decision"] == "keep"
+    assert rec["reruns"][0]["reproduced"] is True and "rerun" not in rec
+    assert p.ledger.track("main-line")["head_experiment"] == eid
+    assert p.arl("verify").strip() == "ok"
+
+
+def test_verdict_given_while_a_rerun_is_going_stays_when_the_rerun_is_cut_short(project: Project):
+    p = project
+    h = p.started()
+    eid = p.draft("tune", hyps=(h,), params={"x": 0.5, "steps": 100, "step_s": 0.1})
+    p.arl("exp", "run", eid)
+    proc = launch(p, "exp", "reproduce", eid)
+    job = job_pid(p, eid, "rerun-1-dev")
+    p.judge(eid, "keep", "--hyp", f"{h}=supported")
+    os.kill(proc.pid, signal.SIGHUP)  # the terminal the rerun was started from goes away
+    proc.communicate(timeout=60)
+    assert proc.returncode == 130 and not pid_alive(job)
+    rec = p.record(eid)
+    assert rec["status"] == "judged" and rec["verdict"]["decision"] == "keep"
+    assert rec["reruns"][0]["failed"] == "interrupted" and "rerun" not in rec
+    assert p.arl("verify").strip() == "ok"
+
+
+def test_rerun_says_which_data_it_read(project: Project):
+    p = project
+    data, _ = with_data(p)
+    assert "reproduced: True" in p.arl("exp", "reproduce", "E0001")
+    rec = p.record("E0001")
+    assert rec["reruns"][0]["data_digest"] == rec["conditions"]["data_digest"]
+    data.write_text("two\n")
+    out = p.arl("exp", "reproduce", "E0001")  # the old code on other data: a number, not a reproduction
+    rerun = p.record("E0001")["reruns"][1]
+    assert "reproduced" not in rerun and rerun["data_digest"] != rec["conditions"]["data_digest"]
+    assert "the data files are not the ones it first ran on" in out and "reproduced:" not in out
+    data.unlink()  # a rerun reads the data too: without it nothing starts
+    assert "nothing matches 'data.txt'" in p.arl("exp", "reproduce", "E0001", code=1)
+    rec = p.record("E0001")
+    assert len(rec["reruns"]) == 2 and "rerun" not in rec
+
+
+def test_data_that_changes_during_a_run_fails_it(project: Project, monkeypatch):
+    p = project
+    data, h = with_data(p)
+    eid = p.draft("tune", hyps=(h,), params={"x": 0.5})
+    after_the_run(monkeypatch, lambda: data.write_text("two\n"))
+    out = p.arl("exp", "run", eid, code=2)
+    assert "the data files changed while the run was going" in out
+    rec = p.record(eid)
+    assert rec["status"] == "crashed" and "metrics" not in rec  # no score from an input nobody recorded
+    out = p.arl("next")
+    assert "NEXT: crashed E0002" in out and "has no reference any more" in out
+    p.judge(eid, "crash")
+    assert "NEXT: baseline main-line" in p.arl("next")
+
+
+def test_data_that_changes_during_the_evaluation_fails_it(project: Project, monkeypatch):
+    p = project
+    data, h = with_data(p)
+    eid = p.draft("tune", hyps=(h,), params={"x": 0.5})
+    after_the_run(monkeypatch, lambda: data.write_text("two\n"), job=2)
+    out = p.arl("exp", "run", eid, code=2)
+    assert "the data files changed while the evaluator was running" in out
+    rec = p.record(eid)
+    assert rec["status"] == "crashed" and "metrics" not in rec
+
+
+def test_data_that_changes_during_a_rerun_fails_it(project: Project, monkeypatch):
+    p = project
+    data, _ = with_data(p)
+    after_the_run(monkeypatch, lambda: data.write_text("two\n"))
+    out = p.arl("exp", "reproduce", "E0001", code=2)
+    assert "the data files changed during the rerun" in out
+    rerun = p.record("E0001")["reruns"][0]
+    assert "metrics" not in rerun and "reproduced" not in rerun
+
+
+def start_quiet_run(p: Project, h: str):
+    """A run in a process of its own whose job says nothing: no line in the log, no file."""
+    eid = p.draft("tune", hyps=(h,), params=QUIET)
+    proc = launch(p, "exp", "run", eid)
+    assert wait_for(lambda: "child" in p.record(eid)), proc.communicate(timeout=30)[0]
+    return eid, proc, p.record(eid)["child"]["sid"]
+
+
+def test_quiet_job_left_alone_is_charged_until_it_is_stopped(project: Project):
+    p = project
+    h = p.started()
+    eid, proc, sid = start_quiet_run(p, h)
+    time.sleep(1.0)
+    proc.kill()  # arl is gone, the job goes on alone
+    proc.communicate(timeout=30)
+    time.sleep(3.5)
+    assert runner.session_pids(sid)
+    p.arl("exp", "fail", eid, "--reason", "not needed any more")  # finds the job and stops it
+    assert not runner.session_pids(sid)
+    attempt = p.record(eid)["attempts"][0]
+    part = attempt["segments"][0]
+    # the job ran for all of that time, whatever its log says
+    assert part["ended_by"] == "interrupted" and part["seconds"] >= 4.0 and attempt["run_seconds"] >= 4.0
+
+
+def test_quiet_job_that_went_down_with_arl_is_charged_until_then(project: Project):
+    p = project
+    h = p.started()
+    eid, proc, sid = start_quiet_run(p, h)
+    time.sleep(3.0)
+    proc.kill()  # the machine goes down: arl and the job at the same moment
+    for pid in runner.session_pids(sid):
+        os.kill(pid, signal.SIGKILL)
+    proc.communicate(timeout=30)
+    time.sleep(3.0)
+    p.arl("exp", "fail", eid, "--reason", "not needed any more")
+    part = p.record(eid)["attempts"][0]["segments"][0]
+    # arl's own last sign of life, not the log's last line and not the moment somebody looked
+    assert part["ended_by"] == "interrupted" and 1.5 <= part["seconds"] <= 5.0
+
+
+def test_quiet_rerun_left_alone_is_charged_until_it_is_stopped(project: Project):
+    p = project
+    h = p.started()
+    eid = p.draft("tune", hyps=(h,), params={"x": 0.5, "sleep": 5})
+    p.arl("exp", "run", eid)
+    p.judge(eid, "keep", "--hyp", f"{h}=supported")
+    proc = launch(p, "exp", "reproduce", eid)
+    assert wait_for(lambda: "child" in p.record(eid).get("rerun", {})), proc.communicate(timeout=30)[0]
+    sid = p.record(eid)["rerun"]["child"]["sid"]
+    time.sleep(0.5)
+    proc.kill()
+    proc.communicate(timeout=30)
+    time.sleep(3.0)
+    assert runner.session_pids(sid)
+    assert "there is nothing to judge" in p.judge(eid, "keep", code=1)  # refused, and it stops what was left all the same
+    assert not runner.session_pids(sid)
+    rerun = p.record(eid)["reruns"][0]
+    assert rerun["failed"].startswith("interrupted") and rerun["interrupted"] is True and rerun["run_seconds"] >= 3.0

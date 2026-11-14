@@ -259,6 +259,7 @@ def execute(
     on_start: Callable[[int], None] | None = None,
     pause_file: Path | None = None,
     pause_grace: float = QUICK_GRACE,
+    heartbeat: Path | None = None,
 ) -> dict[str, Any]:
     """Run through bash in a session of its own, output to a file.
 
@@ -267,6 +268,10 @@ def execute(
     when it was asked to save and stop (a pause request, the machine running
     low on memory, or arl itself being interrupted). A paused job can be
     continued later; a stopped one failed.
+
+    heartbeat: a file marked every second while the job is watched. If arl
+    dies without a word, its time says how long the job had run by then,
+    whether or not the job ever wrote a line.
     """
     log.parent.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
@@ -284,6 +289,7 @@ def execute(
             start_new_session=True,
         )
         try:
+            mark(heartbeat)
             if on_start:
                 on_start(proc.pid)  # the session id of everything the job starts
             ticks = 0
@@ -294,6 +300,7 @@ def execute(
                 except subprocess.TimeoutExpired:
                     pass
                 ticks += 1
+                mark(heartbeat)
                 if time.monotonic() - start > timeout:
                     stopped = f"it passed its limit of {timeout:.0f} s"
                 elif pause_file is not None and pause_file.exists():
@@ -317,6 +324,30 @@ def execute(
         if not (stopped or paused) and session_pids(proc.pid):
             stop_session(proc.pid)  # the job ended and left something running: nothing outlives a run
     return {"exit_code": proc.returncode, "seconds": round(time.monotonic() - start, 2), "stopped": stopped, "paused": paused}
+
+
+def mark(path: Path | None) -> None:
+    """Leave a sign of life: the time of this file is when arl last saw the job going."""
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    except OSError:
+        pass  # the job matters more than its time sheet
+
+
+def last_sign(paths: list[Path]) -> float | None:
+    """The latest time anything was written to these files, or inside these folders."""
+    times = []
+    for path in paths:
+        try:
+            times.append(path.stat().st_mtime)
+            if path.is_dir():
+                times += [p.stat().st_mtime for p in path.rglob("*")]
+        except OSError:
+            continue
+    return max(times) if times else None
 
 
 def last_checkpoint(out: Path) -> float | None:
@@ -666,7 +697,7 @@ def data_fingerprint(ledger: Ledger) -> list[dict[str, Any]]:
         cache = read_json(cache_path) if cache_path.exists() else {}
     except (ArlError, json.JSONDecodeError):
         cache = {}
-    out = []
+    out, hashed = [], False
     for pattern in patterns:
         expanded = os.path.expanduser(pattern)
         if not os.path.isabs(expanded):
@@ -682,15 +713,26 @@ def data_fingerprint(ledger: Ledger) -> list[dict[str, Any]]:
             key = f"{path}|{stat.st_size}|{stat.st_mtime_ns}"
             if key not in cache:
                 cache[key] = sha256_file(path)
+                hashed = True
             out.append({"path": str(path), "bytes": stat.st_size, "sha256": cache[key]})
-    ledger.cache_root.mkdir(parents=True, exist_ok=True)
-    write_json(cache_path, cache)
+    if hashed:
+        ledger.cache_root.mkdir(parents=True, exist_ok=True)
+        write_json(cache_path, cache)
     return out
 
 
 def data_digest(fingerprint: list[dict[str, Any]]) -> str:
     """One hash for the data a run read. Results are compared only on the same data."""
     return sha256_text(canonical([(d["path"], d["sha256"]) for d in fingerprint]))
+
+
+def data_now(ledger: Ledger) -> str | None:
+    """The digest of the data files as they are at this moment. None when one is missing:
+    for a command that only reads, that is an answer and not an error."""
+    try:
+        return data_digest(data_fingerprint(ledger))
+    except ArlError:
+        return None
 
 
 def manifest(out_dir: Path, hash_up_to: int = 1 << 31) -> list[dict[str, Any]]:
