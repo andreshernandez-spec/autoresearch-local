@@ -8,8 +8,9 @@ import json
 
 from .. import contract, render, rules
 from ..config import DECISIONS
-from ..ledger import Ledger
-from ..util import ArlError, now, one_line, require_filled, write_front, write_text
+from ..ledger import Ledger, save_front
+from ..record import Introspection
+from ..util import ArlError, now, one_line, require_filled, write_text
 from . import common
 from .common import ARL
 
@@ -34,29 +35,29 @@ def cmd_introspect_new(args: argparse.Namespace) -> int:
         state = rules.introspection_state(ledger)
         if state["open"] or state["waiting"]:
             raise ArlError(f"{state['open'] or state['waiting']} is not finished yet")
-        pending = [e["id"] for e in ledger.experiments() if e["status"] in ("running", "evaluated", "judging")]
+        pending = [e.id for e in ledger.experiments() if e.status in ("running", "evaluated", "judging")]
         if pending:
             raise ArlError(f"finish {', '.join(pending)} first: an introspection needs their verdicts")
         nid = ledger.next_id("N")
         trigger = one_line(args.trigger, "--trigger") if args.trigger else "; ".join(state["reasons"]) or "asked for"
         ledger.intro_root.mkdir(parents=True, exist_ok=True)
         events = ledger.activity()
-        earlier = [n for n in ledger.introspections() if "activity_upto" in n]
-        activity_from = earlier[-1]["activity_upto"] if earlier else 0
-        meta = {
-            "id": nid,
-            "status": "open",
-            "trigger": trigger,
-            "opened": now(),
-            "window": state["window"],
-            "unconfirmed": state["unconfirmed"],
-            "activity_upto": len(events),
-            "knowledge_sha256": ledger.knowledge_hash(),
-            "lessons_general": len(ledger.lessons("general")),
-            "lessons_project": len(ledger.lessons("project")),
-        }
+        earlier = [n for n in ledger.introspections() if n.activity_upto is not None]
+        activity_from = (earlier[-1].activity_upto or 0) if earlier else 0
+        meta = Introspection(
+            id=nid,
+            status="open",
+            trigger=trigger,
+            opened=now(),
+            window=state["window"],
+            unconfirmed=state["unconfirmed"],
+            activity_upto=len(events),
+            knowledge_sha256=ledger.knowledge_hash(),
+            lessons_general=len(ledger.lessons("general")),
+            lessons_project=len(ledger.lessons("project")),
+        )
         facts = render.introspection_facts(ledger, trigger, state, activity_from)
-        write_front(ledger.intro_root / f"{nid}.md", meta, render.fill(render.template("introspection.md"), id=nid, facts=facts))
+        save_front(ledger.intro_root / f"{nid}.md", meta, render.fill(render.template("introspection.md"), id=nid, facts=facts))
         write_text(ledger.status_path, render.status(ledger))
     print(f"{nid} opened: {ledger.intro_root / f'{nid}.md'}")
     print("The facts are filled in. Write its parts with fresh eyes, below the +++ block:")
@@ -73,17 +74,17 @@ def cmd_introspect_close(args: argparse.Namespace) -> int:
         contract.require(ledger)  # who may decide what is in arl.toml: it has to be the frozen one
         common.gate_paused(ledger)
         meta, body = ledger.introspection(args.id)
-        if meta["status"] != "open":
-            raise ArlError(f"{args.id} is {meta['status']}")
+        if meta.status != "open":
+            raise ArlError(f"{args.id} is {meta.status}")
         require_filled(ledger.intro_path(args.id), f"introspection {args.id}")
-        added = len(ledger.lessons("general")) - meta.get("lessons_general", 0) + len(ledger.lessons("project")) - meta.get("lessons_project", 0)
+        added = len(ledger.lessons("general")) - (meta.lessons_general or 0) + len(ledger.lessons("project")) - (meta.lessons_project or 0)
         if added <= 0 and not args.no_lessons:
             raise ArlError(
                 f"Part 2 of {args.id} is not done: no lesson was recorded since it was opened.\n"
                 f"Record what deserves a standing instruction ('{ARL} lesson add --scope general|project ...'),\n"
                 "or pass --no-lessons \"why\" if this window taught nothing about the way of working."
             )
-        same_knowledge = ledger.knowledge_hash() == meta.get("knowledge_sha256")
+        same_knowledge = ledger.knowledge_hash() == meta.knowledge_sha256
         if same_knowledge and not args.knowledge_unchanged:
             raise ArlError(
                 f"Part 3 of {args.id} is not done: {ledger.knowledge_path} is as it was when the introspection was opened.\n"
@@ -92,16 +93,17 @@ def cmd_introspect_close(args: argparse.Namespace) -> int:
             )
         reopening = rules.introspection_state(ledger)["last_decision"] == "stop" and args.decision != "stop"
         alone = args.decision in ledger.cfg.agent_may and not reopening
-        meta.update(status="closed" if alone else "waiting", decision=args.decision, note=args.note or "", lessons_added=max(added, 0), knowledge_changed=not same_knowledge)
+        meta.status, meta.decision, meta.note = "closed" if alone else "waiting", args.decision, args.note or ""
+        meta.lessons_added, meta.knowledge_changed = max(added, 0), not same_knowledge
         if args.no_lessons:
-            meta["no_lessons"] = args.no_lessons
+            meta.no_lessons = args.no_lessons
         if args.knowledge_unchanged:
-            meta["knowledge_unchanged"] = args.knowledge_unchanged
+            meta.knowledge_unchanged = args.knowledge_unchanged
         if alone:
-            meta.update(closed=now(), decided_by="agent")
+            meta.closed, meta.decided_by = now(), "agent"
         else:
-            meta["proposed"] = now()
-        write_front(ledger.intro_path(args.id), meta, body)
+            meta.proposed = now()
+        save_front(ledger.intro_path(args.id), meta, body)
         common.finish(ledger, f"{args.id} introspection, {args.decision}" + ("" if alone else " proposed"))
     if alone:
         print(f"{args.id} closed: {args.decision}.")
@@ -121,10 +123,11 @@ def cmd_introspect_resolve(args: argparse.Namespace) -> int:
     with common.writing(ledger):
         contract.require(ledger)
         meta, body = ledger.introspection(args.id)
-        if meta["status"] != "waiting":
-            raise ArlError(f"{args.id} is {meta['status']}, not waiting")
-        meta.update(status="closed", proposed_decision=meta["decision"], decision=args.decision, closed=now(), decided_by="person", note=args.note)
-        write_front(ledger.intro_path(args.id), meta, body.rstrip("\n") + f"\n\n# Resolved\n\n{now()[:10]}: {args.decision}. {args.note}\n")
+        if meta.status != "waiting":
+            raise ArlError(f"{args.id} is {meta.status}, not waiting")
+        meta.proposed_decision, meta.decision = meta.decision, args.decision
+        meta.status, meta.closed, meta.decided_by, meta.note = "closed", now(), "person", args.note
+        save_front(ledger.intro_path(args.id), meta, body.rstrip("\n") + f"\n\n# Resolved\n\n{now()[:10]}: {args.decision}. {args.note}\n")
         common.finish(ledger, f"{args.id} resolved, {args.decision}")
     print(f"{args.id} closed: {args.decision}.")
     return 0

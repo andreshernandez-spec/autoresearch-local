@@ -12,6 +12,7 @@ from typing import Any, Generator
 from .. import contract, render, rules, runner
 from ..gitops import Git
 from ..ledger import Ledger
+from ..record import HeadMove, Record, Track, need
 from ..util import ArlError, canonical, now, read_front, read_json, sha256_file, sha256_text, write_text
 
 
@@ -46,11 +47,12 @@ def design_hashes(exp: Path) -> tuple[str, str]:
     return sha256_file(design), sha256_text(canonical(load_params(exp / "params.json")))
 
 
-def require_design_unchanged(ledger: Ledger, rec: dict[str, Any]) -> None:
-    exp = ledger.exp_dir(rec["id"])
-    if (rec["design"]["design_sha256"], rec["design"]["params_sha256"]) != design_hashes(exp):
+def require_design_unchanged(ledger: Ledger, rec: Record) -> None:
+    exp = ledger.exp_dir(rec.id)
+    design = need(rec.design)
+    if (design.design_sha256, design.params_sha256) != design_hashes(exp):
         raise ArlError(
-            f"design.md or params.json of {rec['id']} changed after its run started. The design is locked:\n"
+            f"design.md or params.json of {rec.id} changed after its run started. The design is locked:\n"
             f"put them back ('git -C {ledger.home} diff -- {ledger.rel(exp)}')."
         )
 
@@ -150,7 +152,7 @@ def gate_running(ledger: Ledger, first_attempt: bool) -> None:
 def authorized(ledger: Ledger, nid: str | None, decisions: tuple[str, ...], what: str) -> str:
     """Who allows a change of direction: nobody is needed before the first verdict,
     after it the latest closed introspection, or a person at a terminal."""
-    if not any(e["status"] == "judged" for e in ledger.experiments()):
+    if not any(e.status == "judged" for e in ledger.experiments()):
         return "setup"
     if nid:
         meta, _ = ledger.introspection(nid)
@@ -158,10 +160,10 @@ def authorized(ledger: Ledger, nid: str | None, decisions: tuple[str, ...], what
         pending = state["open"] or state["waiting"]
         if pending:
             raise ArlError(f"{pending} is not decided yet, so the one before it does not decide today. Finish {pending} first.")
-        if meta["status"] != "closed" or nid != state["last"]:
+        if meta.status != "closed" or nid != state["last"]:
             raise ArlError(f"{nid} is not the latest closed introspection ({state['last'] or 'there is none yet'}). An older one does not decide today.")
-        if decisions and meta.get("decision") not in decisions:
-            raise ArlError(f"{nid} decided '{meta.get('decision')}', not {' or '.join(decisions)}")
+        if decisions and meta.decision not in decisions:
+            raise ArlError(f"{nid} decided '{meta.decision}', not {' or '.join(decisions)}")
         return nid
     if interactive():
         return "person"
@@ -176,23 +178,23 @@ def authorized(ledger: Ledger, nid: str | None, decisions: tuple[str, ...], what
 # --- worktrees --------------------------------------------------------------------
 
 
-def worktree(ledger: Ledger, track: dict[str, Any]) -> tuple[Path, Git]:
-    path = ledger.worktree_path(track["name"])
+def worktree(ledger: Ledger, track: Track) -> tuple[Path, Git]:
+    path = ledger.worktree_path(track.name)
     if not path.exists():
         raise ArlError(
-            f"the worktree of track {track['name']} is missing: {path}\n"
-            f"Put it back with: {ARL} track worktree {track['name']}"
+            f"the worktree of track {track.name} is missing: {path}\n"
+            f"Put it back with: {ARL} track worktree {track.name}"
         )
     return path, Git(path)
 
 
-def park(ledger: Ledger, track: dict[str, Any], path: Path, wgit: Git) -> None:
+def park(ledger: Ledger, track: Track, path: Path, wgit: Git) -> None:
     """A worktree left on a branch that no experiment in flight owns (a draft that was cut
     off, a folder removed by hand): bring it back to the track's branch. The branch stays."""
     here = wgit.branch()
-    if here == track["branch"]:
+    if here == track.branch:
         return
-    if any(e["branch"] == here for e in rules.in_flight(ledger, track["name"])):
+    if any(e.branch == here for e in rules.in_flight(ledger, track.name)):
         return
     dirty = wgit.dirty()
     if dirty:
@@ -201,74 +203,74 @@ def park(ledger: Ledger, track: dict[str, Any], path: Path, wgit: Git) -> None:
             + "\n  ".join(dirty[:10])
             + f"\nSave what you need elsewhere and put the files back (git -C {path} restore <file>), then try again."
         )
-    wgit.switch(track["branch"])
+    wgit.switch(track.branch)
 
 
-def exp_worktree(ledger: Ledger, rec: dict[str, Any]) -> tuple[Path, Git]:
-    track = ledger.track(rec["track"])
+def exp_worktree(ledger: Ledger, rec: Record) -> tuple[Path, Git]:
+    track = ledger.track(rec.track)
     path, wgit = worktree(ledger, track)
     here = wgit.branch()
-    if here != rec["branch"]:
+    if here != rec.branch:
         # A draft whose branch was never made or never entered: finish what 'exp new' started.
-        fresh = rec["status"] == "draft" and not rec["attempts"] and here == track["branch"]
-        if fresh and wgit.head() == rec["base_commit"] and not wgit.dirty():
-            if ledger.git.branch_exists(rec["branch"]):
-                wgit.switch(rec["branch"])
+        fresh = rec.status == "draft" and not rec.attempts and here == track.branch
+        if fresh and wgit.head() == rec.base_commit and not wgit.dirty():
+            if ledger.git.branch_exists(rec.branch):
+                wgit.switch(rec.branch)
             else:
-                wgit.switch_new(rec["branch"], rec["base_commit"])
+                wgit.switch_new(rec.branch, rec.base_commit)
         else:
-            raise ArlError(f"{path} is on '{here}', but {rec['id']} lives on '{rec['branch']}'")
+            raise ArlError(f"{path} is on '{here}', but {rec.id} lives on '{rec.branch}'")
     return path, wgit
 
 
 # --- a verdict, once recorded, is carried out -------------------------------------
 
 
-def track_log(ledger: Ledger, meta: dict[str, Any], line: str) -> None:
-    body = read_front(ledger.track_path(meta["name"]))[1]
+def track_log(ledger: Ledger, meta: Track, line: str) -> None:
+    body = read_front(ledger.track_path(meta.name))[1]
     ledger.save_track(meta, body.rstrip("\n") + f"\n- {now()[:10]}: {' '.join(line.split())}\n")
 
 
-def finish_judge(ledger: Ledger, rec: dict[str, Any]) -> None:
+def finish_judge(ledger: Ledger, rec: Record) -> None:
     """Apply a recorded verdict: branch, track, hypotheses, then the record.
 
     Every step looks at what is already done, so it can be run again after a
     process died in the middle, and a different verdict can no longer be given.
     """
-    eid, verdict = rec["id"], rec["verdict"]
-    decision = verdict["decision"]
-    track = ledger.track(rec["track"])
+    eid, verdict = rec.id, need(rec.verdict)
+    decision = verdict.decision
+    track = ledger.track(rec.track)
     path, wgit = worktree(ledger, track)
     exp = ledger.exp_dir(eid)
-    if rec["branch"] != track["branch"]:
+    if rec.branch != track.branch:
         here = wgit.branch()
-        if here == rec["branch"]:
+        if here == rec.branch:
             changed = wgit.tracked_changes()
             if changed:
                 raise ArlError(f"tracked files in {path} were edited while the verdict of {eid} was being recorded:\n  " + "\n  ".join(changed[:10]) + f"\nPut them back (git -C {path} restore <file>), then run '{ARL} exp judge {eid}'.")
-            wgit.switch(track["branch"])
-        elif here != track["branch"]:
-            raise ArlError(f"{path} is on '{here}', neither the branch of {eid} nor the track's. Put it on '{track['branch']}' and run '{ARL} exp judge {eid}'.")
+            wgit.switch(track.branch)
+        elif here != track.branch:
+            raise ArlError(f"{path} is on '{here}', neither the branch of {eid} nor the track's. Put it on '{track.branch}' and run '{ARL} exp judge {eid}'.")
     if decision == "keep":
-        code = rec["code_commit"]
-        if rec["branch"] != track["branch"] and not wgit.is_ancestor(code, "HEAD"):
+        code = need(rec.code_commit)
+        if rec.branch != track.branch and not wgit.is_ancestor(code, "HEAD"):
             wgit.fast_forward(code)
         if wgit.head() != code:
-            raise ArlError(f"track {rec['track']} is at {wgit.head()[:10]}, not at the commit {eid} measured ({code[:10]}). The branch was moved by hand: put it back, then run '{ARL} exp judge {eid}'.")
-        track["head_commit"], track["head_experiment"] = code, eid
+            raise ArlError(f"track {rec.track} is at {wgit.head()[:10]}, not at the commit {eid} measured ({code[:10]}). The branch was moved by hand: put it back, then run '{ARL} exp judge {eid}'.")
+        track.head_commit, track.head_experiment = code, eid
         ledger.write_track_params(track, load_params(exp / "params.json"))
-        line = f"{eid} kept ({rec['type']}): {rec['title']}"
-        if line not in read_front(ledger.track_path(track["name"]))[1]:
+        line = f"{eid} kept ({rec.type}): {rec.title}"
+        if line not in read_front(ledger.track_path(track.name))[1]:
             track_log(ledger, track, line)
         else:
             ledger.save_track(track)
-    for hid, state in verdict.get("hypotheses", {}).items():
+    for hid, state in (verdict.hypotheses or {}).items():
         if state == "open":
             ledger.log_hypothesis(hid, f"{eid} ({decision}): left as it is")
         else:
             ledger.set_hypothesis(hid, state, f"{eid} ({decision})")
-    verdict["track_head"] = {"before": verdict.get("track_head", {}).get("before", track["head_commit"]), "after": track["head_commit"]}
-    rec["status"] = "judged"
+    verdict.track_head = HeadMove(before=verdict.track_head.before if verdict.track_head else track.head_commit, after=track.head_commit)
+    rec.status = "judged"
     ledger.save_record(rec)
     finish(ledger, f"{eid} {decision}")
 
@@ -278,6 +280,6 @@ def writing(ledger: Ledger, wait: float = 120.0) -> Generator[None, None, None]:
     """The ledger lock, after finishing any verdict an earlier command left half applied."""
     with ledger.locked(wait):
         for rec in ledger.experiments():
-            if rec["status"] == "judging":
+            if rec.status == "judging":
                 finish_judge(ledger, rec)
         yield

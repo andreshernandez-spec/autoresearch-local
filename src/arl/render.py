@@ -10,6 +10,7 @@ from typing import Any
 
 from . import contract, rules, runner
 from .ledger import Ledger
+from .record import Record, dump, need
 from .util import ArlError, fmt, now, read_text
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -44,33 +45,33 @@ def table(headers: list[str], rows: list[list[Any]]) -> str:
 # --- experiments and tracks as tables ---------------------------------------------
 
 
-def _primary(ledger: Ledger, rec: dict[str, Any] | None) -> str:
+def _primary(ledger: Ledger, rec: Record | None) -> str:
     name = ledger.cfg.primary.name
-    metrics = (rec or {}).get("metrics") or {}
+    metrics = (rec.metrics if rec else None) or {}
     return fmt(metrics[name]) if name in metrics else ""
 
 
-def _gain(rec: dict[str, Any]) -> str:
-    gain = rec.get("comparison", {}).get("gain")
+def _gain(rec: Record) -> str:
+    gain = rec.comparison.gain if rec.comparison else None
     return f"{gain:+.6g}" if gain is not None else ""
 
 
-def _verdict(rec: dict[str, Any]) -> str:
-    return rec["verdict"]["decision"] if rec["status"] == "judged" else f"({rec['status']})"
+def _verdict(rec: Record) -> str:
+    return need(rec.verdict).decision if rec.status == "judged" else f"({rec.status})"
 
 
-def exp_table(ledger: Ledger, exps: list[dict[str, Any]]) -> str:
+def exp_table(ledger: Ledger, exps: list[Record]) -> str:
     rows = [
         [
-            e["id"],
-            e["track"],
-            e["type"],
-            " ".join(e["hypotheses"]),
+            e.id,
+            e.track,
+            e.type,
+            " ".join(e.hypotheses),
             _primary(ledger, e),
             _gain(e),
-            e.get("comparison", {}).get("outcome", ""),
+            e.outcome or "",
             _verdict(e),
-            e["title"],
+            e.title,
         ]
         for e in exps
     ]
@@ -82,22 +83,22 @@ def track_table(ledger: Ledger, lock: dict[str, Any] | None) -> str:
     exps = ledger.experiments()
     rows = []
     for t in ledger.tracks():
-        mine = [e for e in exps if e["track"] == t["name"]]
+        mine = [e for e in exps if e.track == t.name]
         ref = rules.reference_for(ledger, t, lock["eval_digest"]) if lock else None
-        scored = [e for e in mine if e["status"] == "judged" and e["type"] in ("tune", "feature")]
+        scored = [e for e in mine if e.status == "judged" and e.type in ("tune", "feature")]
         run = 0
-        for e in sorted(scored, key=lambda e: (e["verdict"]["at"], e["id"])):
-            run = 0 if e["verdict"]["decision"] == "keep" else run + 1
+        for e in sorted(scored, key=lambda e: (need(e.verdict).at, e.id)):
+            run = 0 if e.decision == "keep" else run + 1
         rows.append(
             [
-                t["name"],
-                t["status"],
-                ref["id"] if ref else "none",
+                t.name,
+                t.status,
+                ref.id if ref else "none",
                 _primary(ledger, ref),
                 len(mine),
                 sum(rules.kept(e) for e in mine),
                 run,
-                t["head_commit"][:10],
+                t.head_commit[:10],
             ]
         )
     head = ["track", "status", "reference", ledger.cfg.primary.name, "experiments", "kept", "in a row without a keep", "head"]
@@ -123,27 +124,27 @@ def _target_line(ledger: Ledger, lock: dict[str, Any] | None, data: str | None) 
     return f"{goal}: {rules.claim_text(hit) if hit else 'not reached'}." + (f" Not confirmed: {'; '.join(fell)}." if fell else "")
 
 
-def summary(ledger: Ledger, rec: dict[str, Any]) -> str:
+def summary(ledger: Ledger, rec: Record) -> str:
     cfg = ledger.cfg
-    lines = [f"{rec['id']} {rec['title']} [{rec['type']} on {rec['track']}, {rec['status']}]"]
-    if "metrics" in rec:
-        comp = rec["comparison"]
+    lines = [f"{rec.id} {rec.title} [{rec.type} on {rec.track}, {rec.status}]"]
+    if rec.metrics is not None:
+        comp = need(rec.comparison)
         for m in cfg.metrics:
-            if m.name in rec["metrics"]:  # a metric added to the contract later is not in older records
-                lines.append(f"  {m.name:28s} {fmt(rec['metrics'][m.name])}" + ("  (primary)" if m.role == "primary" else ""))
-        if comp.get("reference"):
+            if m.name in rec.metrics:  # a metric added to the contract later is not in older records
+                lines.append(f"  {m.name:28s} {fmt(rec.metrics[m.name])}" + ("  (primary)" if m.role == "primary" else ""))
+        if comp.reference:
             lines.append(
-                f"  against {comp['reference']}: {comp['metric']} {fmt(comp['reference_value'])} -> {fmt(comp['value'])}, "
-                f"gain {comp['gain']:+.6g} (at least {fmt(comp['min_delta'])} counts)"
+                f"  against {comp.reference}: {comp.metric} {fmt(comp.reference_value)} -> {fmt(comp.value)}, "
+                f"gain {comp.gain:+.6g} (at least {fmt(comp.min_delta)} counts)"
             )
-        for g in comp["gate_failures"]:
+        for g in comp.gate_failures:
             lines.append(f"  constraint not met: {g}")
-        lines.append(f"  outcome: {comp['outcome']}")
-    if rec.get("train_metrics"):
-        lines.append("  reported by the run itself (not scored): " + ", ".join(f"{k} {fmt(v)}" for k, v in list(rec["train_metrics"].items())[:12]))
-    if rec["status"] in ("judged", "judging", "abandoned"):
-        v = rec["verdict"]
-        lines.append(f"  verdict: {v['decision']}. {v['reason']}")
+        lines.append(f"  outcome: {comp.outcome}")
+    if rec.train_metrics:
+        lines.append("  reported by the run itself (not scored): " + ", ".join(f"{k} {fmt(v)}" for k, v in list(rec.train_metrics.items())[:12]))
+    if rec.status in ("judged", "judging", "abandoned"):
+        v = need(rec.verdict)
+        lines.append(f"  verdict: {v.decision}. {v.reason}")
     return "\n".join(lines)
 
 
@@ -177,17 +178,17 @@ def status(ledger: Ledger) -> str:
 
     out += ["", "## Tracks", "", track_table(ledger, lock)]
     exps = ledger.experiments()
-    flying = [e for e in exps if e["status"] in rules.IN_FLIGHT]
-    out += ["## In flight", "", table(["id", "track", "type", "status", "title"], [[e["id"], e["track"], e["type"], e["status"], e["title"]] for e in flying])]
+    flying = [e for e in exps if e.status in rules.IN_FLIGHT]
+    out += ["## In flight", "", table(["id", "track", "type", "status", "title"], [[e.id, e.track, e.type, e.status, e.title] for e in flying])]
     latest = list(reversed(exps))[:20]
     out += [f"## Experiments (latest {len(latest)} of {len(exps)})", "", exp_table(ledger, latest)]
 
     tested: dict[str, list[str]] = {}
     for e in exps:
-        for h in e["hypotheses"]:
-            tested.setdefault(h, []).append(e["id"])
+        for h in e.hypotheses:
+            tested.setdefault(h, []).append(e.id)
     hyps = ledger.hypotheses()
-    rows = [[h["id"], h["status"], h["title"], " ".join(tested.get(h["id"], []))] for h in hyps]
+    rows = [[h.id, h.status, h.title, " ".join(tested.get(h.id, []))] for h in hyps]
     out += ["## Hypotheses", "", table(["id", "status", "title", "tested by"], rows)]
 
     ideas = ledger.ideas()
@@ -209,12 +210,12 @@ def state(ledger: Ledger) -> dict[str, Any]:
         "budget": rules.budget(ledger),
         "introspection": rules.introspection_state(ledger),
         "next": rules.next_action(ledger, runner.data_now(ledger)),
-        "tracks": ledger.tracks(),
+        "tracks": [dump(t) for t in ledger.tracks()],
         "experiments": [
             {k: e.get(k) for k in ("id", "title", "type", "track", "status", "hypotheses", "metrics", "comparison", "verdict")}
-            for e in ledger.experiments()
+            for e in map(dump, ledger.experiments())
         ],
-        "hypotheses": ledger.hypotheses(),
+        "hypotheses": [dump(h) for h in ledger.hypotheses()],
         "ideas": ledger.ideas(),
         "lessons": {scope: ledger.lessons(scope) for scope in ("general", "project")},
     }
@@ -223,58 +224,58 @@ def state(ledger: Ledger) -> dict[str, Any]:
 # --- facts written into records ---------------------------------------------------
 
 
-def _took(rec: dict[str, Any]) -> str:
-    attempt = rec["attempts"][-1]
-    took = f"Run {attempt.get('run_seconds', 0):.0f} s"
-    parts = len(attempt.get("segments", []))
+def _took(rec: Record) -> str:
+    attempt = rec.attempts[-1]
+    took = f"Run {(attempt.run_seconds or 0):.0f} s"
+    parts = len(attempt.segments)
     if parts > 1:
         took += f" in {parts} parts (paused and continued)"
-    if "eval_seconds" in attempt:
-        took += f", evaluation {attempt['eval_seconds']:.0f} s"
+    if attempt.eval_seconds is not None:
+        took += f", evaluation {attempt.eval_seconds:.0f} s"
     return took
 
 
-def _env_line(rec: dict[str, Any]) -> str:
+def _env_line(rec: Record) -> str:
     """The environment a run had, when the contract named one."""
-    env = rec.get("conditions", {}).get("env") or {}
+    env = rec.env or {}
     if not env.get("python"):
         return ""
     return f" Environment: {env.get('prefix') or 'the python on the PATH'}, python {env['python']}."
 
 
-def _reported(rec: dict[str, Any]) -> list[str]:
+def _reported(rec: Record) -> list[str]:
     """What the run says about itself in train_metrics.json."""
-    said = rec.get("train_metrics") or {}
+    said = rec.train_metrics or {}
     return ["Reported by the run itself (not scored): " + ", ".join(f"{k} {fmt(v)}" for k, v in list(said.items())[:20]) + "."] if said else []
 
 
-def _env_facts(ledger: Ledger, rec: dict[str, Any], ref: dict[str, Any] | None) -> list[str]:
+def _env_facts(ledger: Ledger, rec: Record, ref: Record | None) -> list[str]:
     """Where the environment of a run is not the one it is compared with. A changed
     package can explain a changed score, so the analysis starts from knowing it."""
     out = []
-    env = rec.get("conditions", {}).get("env")
+    env = rec.env
     primary = ledger.cfg.primary.name
     try:
-        if ref is not None and ref["id"] != rec["id"]:
-            differs = runner.env_differences(ledger, ref.get("conditions", {}).get("env"), env)
+        if ref is not None and ref.id != rec.id:
+            differs = runner.env_differences(ledger, ref.env, env)
             if differs:
                 out.append(
-                    f"The environment is not the one the reference {ref['id']} ran in ({runner.differences(len(differs))}): {runner.short(differs)}. "
-                    f"A difference in the scores may come from there. All of them: `arl exp env {ref['id']} {rec['id']}`."
+                    f"The environment is not the one the reference {ref.id} ran in ({runner.differences(len(differs))}): {runner.short(differs)}. "
+                    f"A difference in the scores may come from there. All of them: `arl exp env {ref.id} {rec.id}`."
                 )
-        elif rec.get("comparison", {}).get("outcome") == "reference":
-            last = ledger.track(rec["track"]).get("head_experiment")
-            if last and last != rec["id"]:
+        elif rec.outcome == "reference":
+            last = ledger.track(rec.track).head_experiment
+            if last and last != rec.id:
                 before = ledger.record(last)
-                differs = runner.env_differences(ledger, before.get("conditions", {}).get("env"), env)
-                value = f" ({primary} {fmt(before['metrics'][primary])})" if primary in before.get("metrics", {}) else ""
+                differs = runner.env_differences(ledger, before.env, env)
+                value = f" ({primary} {fmt(before.metrics[primary])})" if before.metrics and primary in before.metrics else ""
                 out.append(
                     f"The track was last measured by {last}{value}, which no longer counts as its reference. "
                     + (f"The environment since then ({runner.differences(len(differs))}): {runner.short(differs)}." if differs else "The environment is the same, as far as it was recorded.")
                 )
-        parts = rec["attempts"][-1].get("segments", [])
+        parts = rec.attempts[-1].segments
         if len(parts) > 1:
-            between = runner.env_differences(ledger, parts[0].get("env"), parts[-1].get("env"))
+            between = runner.env_differences(ledger, parts[0].env, parts[-1].env)
             if between:
                 out.append(f"The environment changed between the parts of this run ({runner.differences(len(between))}): {runner.short(between)}.")
     except (ArlError, KeyError, OSError, TypeError, ValueError) as e:
@@ -282,33 +283,33 @@ def _env_facts(ledger: Ledger, rec: dict[str, Any], ref: dict[str, Any] | None) 
     return out
 
 
-def analysis_facts(ledger: Ledger, rec: dict[str, Any]) -> str:
+def analysis_facts(ledger: Ledger, rec: Record) -> str:
     cfg = ledger.cfg
-    where = f"Code {rec['code_commit'][:10]} on `{rec['branch']}`, contract v{rec['contract']['version']}.{_env_line(rec)}"
+    where = f"Code {need(rec.code_commit)[:10]} on `{rec.branch}`, contract v{need(rec.contract).version}.{_env_line(rec)}"
     took = _took(rec)
-    if rec["type"] not in rules.SCORED:
-        kept = ", ".join(f"kept/{k}" for k in rec.get("kept", [])) or "none"
+    if rec.type not in rules.SCORED:
+        kept = ", ".join(f"kept/{k}" for k in (rec.kept or [])) or "none"
         extra = "".join(f"\n{line}" for line in _reported(rec) + _env_facts(ledger, rec, None))
         return f"Written by arl. Not scored. {took}. {where}\nSmall result files: {kept}. Everything else is under artifacts/.{extra}"
-    comp, metrics = rec["comparison"], rec["metrics"]
-    ref = ledger.record(comp["reference"]) if comp.get("reference") else None
-    head = ["metric", "role", "value"] + ([f"reference {ref['id']}", "gain"] if ref else [])
+    comp, metrics = need(rec.comparison), need(rec.metrics)
+    ref = ledger.record(comp.reference) if comp.reference else None
+    head = ["metric", "role", "value"] + ([f"reference {ref.id}", "gain"] if ref else [])
     rows = []
     for m in cfg.metrics:
         if m.name not in metrics:  # added to the contract after this run
             continue
         row = [m.name, m.role, fmt(metrics[m.name])]
         if ref:
-            before = ref["metrics"].get(m.name)
+            before = (ref.metrics or {}).get(m.name)
             row += [fmt(before) if before is not None else "", f"{m.gain(metrics[m.name], before):+.6g}" if before is not None else ""]
         rows.append(row)
-    lines = [f"Written by arl. Outcome: **{comp['outcome']}**.", "", table(head, rows)]
-    if comp["outcome"] == "repeat":
+    lines = [f"Written by arl. Outcome: **{comp.outcome}**.", "", table(head, rows)]
+    if comp.outcome == "repeat":
         lines.append("A repeat of the reference: it shows the noise of the measurement and does not replace the reference.")
     elif ref:
-        lines.append(f"A change of at least {fmt(comp['min_delta'])} on {comp['metric']} counts as better or worse.")
-    if comp["gate_failures"]:
-        lines.append("Constraints not met: " + "; ".join(comp["gate_failures"]) + ".")
+        lines.append(f"A change of at least {fmt(comp.min_delta)} on {comp.metric} counts as better or worse.")
+    if comp.gate_failures:
+        lines.append("Constraints not met: " + "; ".join(comp.gate_failures) + ".")
     lines += _reported(rec) + _env_facts(ledger, rec, ref)
     lines.append(f"{took}. {where}")
     return "\n".join(lines)
@@ -319,7 +320,7 @@ def _section(body: str, heading: str) -> str:
     return match.group(1).strip() if match else ""
 
 
-def _activity_facts(ledger: Ledger, events: list[dict[str, Any]], window: list[dict[str, Any]]) -> list[str]:
+def _activity_facts(ledger: Ledger, events: list[dict[str, Any]], window: list[Record]) -> list[str]:
     """Part 2 and part 3 start from this: what was refused, what failed, what was noted."""
     out = ["How the work went in this window (for part 2):", ""]
     refused = collections.Counter()
@@ -337,12 +338,12 @@ def _activity_facts(ledger: Ledger, events: list[dict[str, Any]], window: list[d
         out.append("Commands arl refused: none.")
     failures = []
     for e in window:
-        for a in e.get("attempts", []):
-            if a.get("failed"):
-                failures.append(f"- {e['id']} attempt {a['n']}: {str(a['failed']).splitlines()[0][:200]}")
-            for seg in a.get("segments", []):
-                if seg.get("ended_by") not in (None, "finished", "failed"):
-                    failures.append(f"- {e['id']} attempt {a['n']}: a part of the run ended early ({seg['ended_by']})")
+        for a in e.attempts:
+            if a.failed:
+                failures.append(f"- {e.id} attempt {a.n}: {str(a.failed).splitlines()[0][:200]}")
+            for seg in a.segments:
+                if seg.ended_by not in (None, "finished", "failed"):
+                    failures.append(f"- {e.id} attempt {a.n}: a part of the run ended early ({seg.ended_by})")
     out += ["", "Runs that failed or were cut short:" if failures else "Runs that failed or were cut short: none."] + failures
     for about, label in (("work", "Notes about the way of working"), ("problem", "Notes about the problem (for part 3)")):
         notes = [ev for ev in events if ev.get("kind") == "note" and ev.get("about") == about]
@@ -353,17 +354,17 @@ def _activity_facts(ledger: Ledger, events: list[dict[str, Any]], window: list[d
     return out
 
 
-def _env_window_facts(ledger: Ledger, window: list[dict[str, Any]]) -> list[str]:
+def _env_window_facts(ledger: Ledger, window: list[Record]) -> list[str]:
     """Where the environment changed from one run to the next, for the runs of this window."""
     try:
-        ran = [e for e in ledger.experiments() if e.get("conditions", {}).get("env") and e.get("attempts")]
-        ran.sort(key=lambda e: (e["attempts"][0]["started"], e["id"]))
-        inside, out = {e["id"] for e in window}, []
+        ran = [e for e in ledger.experiments() if e.env and e.attempts]
+        ran.sort(key=lambda e: (e.attempts[0].started, e.id))
+        inside, out = {e.id for e in window}, []
         for before, after in zip(ran, ran[1:]):
-            if after["id"] in inside:
-                differs = runner.env_differences(ledger, before["conditions"]["env"], after["conditions"]["env"])
+            if after.id in inside:
+                differs = runner.env_differences(ledger, before.env, after.env)
                 if differs:
-                    out.append(f"- between {before['id']} and {after['id']} ({runner.differences(len(differs))}): {runner.short(differs, 5)}")
+                    out.append(f"- between {before.id} and {after.id} ({runner.differences(len(differs))}): {runner.short(differs, 5)}")
     except (ArlError, KeyError, OSError, TypeError, ValueError) as e:
         return [f"Environment: the runs could not be compared ({e})."]
     if not out:
@@ -373,7 +374,7 @@ def _env_window_facts(ledger: Ledger, window: list[dict[str, Any]]) -> list[str]
 
 def introspection_facts(ledger: Ledger, trigger: str, state_: dict[str, Any], activity_from: int) -> str:
     lock = contract.load(ledger)
-    by_id = {e["id"]: e for e in ledger.experiments()}
+    by_id = {e.id: e for e in ledger.experiments()}
     window = [by_id[i] for i in state_["window"]]
     out = ["## Facts", "", f"Written by arl on {now()[:10]}. Trigger: {trigger}.", ""]
     out.append(f"Window: {len(window)} experiments judged since {state_['last'] or 'the start'}.")
@@ -382,12 +383,12 @@ def introspection_facts(ledger: Ledger, trigger: str, state_: dict[str, Any], ac
     goal = _target_line(ledger, lock, runner.data_now(ledger))
     if goal:
         out.append(f"Target: {goal}")
-    hyps = [h for h in ledger.hypotheses() if h["status"] == "open"]
-    out.append("Open hypotheses: " + ("; ".join(f"{h['id']} {h['title']}" for h in hyps) or "none") + ".")
+    hyps = [h for h in ledger.hypotheses() if h.status == "open"]
+    out.append("Open hypotheses: " + ("; ".join(f"{h.id} {h.title}" for h in hyps) or "none") + ".")
     ideas = [i for i in ledger.ideas() if i["status"] == "open"]
     out.append("Open ideas: " + ("; ".join(f"{i['id']} {i['title']}" for i in ideas) or "none") + ".")
     first = ledger.cfg.splits[0]
-    others = sum(1 for e in by_id.values() for r in e.get("reruns", []) if r.get("split") != first)
+    others = sum(1 for e in by_id.values() for r in e.reruns if r.split != first)
     if len(ledger.cfg.splits) > 1:
         out.append(f"Runs on a confirmation split so far: {others}.")
     out += [""] + _env_window_facts(ledger, window)
@@ -421,7 +422,7 @@ def reload_text(ledger: Ledger, handoff: dict[str, Any] | None = None, env: list
         (ledger.lessons_file("general"), "how to work with arl, in any project"),
     ):
         out += [f"==> {path}  ({label})", "", read_text(path).rstrip("\n") if path.exists() else "(not written yet)", ""]
-    tracks = ", ".join(f"{ledger.name}/tracks/{t['name']}.md" for t in ledger.tracks() if t["status"] == "active") or "none yet"
+    tracks = ", ".join(f"{ledger.name}/tracks/{t.name}.md" for t in ledger.tracks() if t.status == "active") or "none yet"
     out += env or []
     out += [
         "==> Also part of your instructions. Read them again if this session has not, or has been cut short since:",
@@ -463,20 +464,20 @@ def next_text(ledger: Ledger, action: dict[str, Any]) -> str:
     name = stage
     if stage in ("judge", "design", "crashed", "outdated", "interrupted", "resume", "unfinished", "running"):
         rec = ledger.record(action["target"])
-        ctx["track"] = rec["track"]
-        ctx["exp"] = ledger.exp_dir(rec["id"])
-        ctx["worktree"] = ledger.worktree_path(rec["track"])
-        ctx["branch"] = rec["branch"]
-        ctx["change_step"] = fill(_CHANGE[rec["type"]], **ctx)
-        ctx["outcome"] = rec.get("comparison", {}).get("outcome", "not scored")
+        ctx["track"] = rec.track
+        ctx["exp"] = ledger.exp_dir(rec.id)
+        ctx["worktree"] = ledger.worktree_path(rec.track)
+        ctx["branch"] = rec.branch
+        ctx["change_step"] = fill(_CHANGE[rec.type], **ctx)
+        ctx["outcome"] = rec.outcome or "not scored"
         ctx["allowed"] = ", ".join(rules.allowed_verdicts(rec))
         flags = ""
-        if rec["type"] in ("tune", "feature"):
-            flags = "".join(f" \\\n       --hyp {h}=<supported|refuted|inconclusive|open>" for h in rec["hypotheses"])
+        if rec.type in ("tune", "feature"):
+            flags = "".join(f" \\\n       --hyp {h}=<supported|refuted|inconclusive|open>" for h in rec.hypotheses)
         ctx["hyp_flags"] = flags
-        if stage == "crashed" and rec.get("attempts"):
-            ctx["why"] = f"{ctx['why']}. Last failure: {rec['attempts'][-1].get('failed', 'not recorded')}"
-        if stage == "judge" and (rec["type"] == "diagnose" or ctx["outcome"] == "repeat"):
+        if stage == "crashed" and rec.attempts:
+            ctx["why"] = f"{ctx['why']}. Last failure: {(rec.attempts[-1].failed or 'not recorded')}"
+        if stage == "judge" and (rec.type == "diagnose" or ctx["outcome"] == "repeat"):
             name = "judge_diagnose"
     if stage == "confirm":
         split, first = action.get("split", ""), ledger.cfg.splits[0]

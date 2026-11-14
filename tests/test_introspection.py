@@ -46,14 +46,14 @@ def test_closing_asks_for_every_part(project: Project):
     out = p.arl("introspect", "close", "N001", "--decision", "continue")
     assert "N001 closed: continue" in out and "NEXT: reload N001" in out
     meta = p.ledger.introspection("N001")[0]
-    assert meta["lessons_added"] == 1 and meta["knowledge_changed"] is True and "reloaded" not in meta
+    assert meta.lessons_added == 1 and meta.knowledge_changed is True and meta.reloaded is None
 
     # part 4: nothing new starts until what changed has been read again
     assert "has not been read again" in p.arl("exp", "new", "--type", "tune", "--track", "main-line", "--title", "t", "--hyp", h, code=1)
     out = p.arl("reload")
     assert "x near 0.7 scores best (E0002)" in out and "L001: run the evaluation in the background" in out
     assert "PROTOCOL.md" in out and "research/tracks/main-line.md" in out
-    assert "reloaded" in p.ledger.introspection("N001")[0]
+    assert p.ledger.introspection("N001")[0].reloaded is not None
     assert "NEXT: hypothesize" in p.arl("next")
     assert git(p.root, "status", "--porcelain", "--", "research") == ""
     assert "x near 0.7" in git(p.root, "show", "HEAD~1:research/KNOWLEDGE.md")  # the close committed it
@@ -67,8 +67,8 @@ def test_a_part_with_nothing_new_says_why(project: Project):
     assert "--no-lessons is empty" in p.arl("introspect", "close", "N001", "--decision", "continue", "--no-lessons", " ", "--knowledge-unchanged", "x", code=1)
     p.arl("introspect", "close", "N001", "--decision", "continue", "--no-lessons", "one baseline, nothing went wrong", "--knowledge-unchanged", "one baseline says nothing new")
     meta = p.ledger.introspection("N001")[0]
-    assert meta["no_lessons"] == "one baseline, nothing went wrong" and meta["knowledge_unchanged"] == "one baseline says nothing new"
-    assert meta["lessons_added"] == 0 and meta["knowledge_changed"] is False
+    assert meta.no_lessons == "one baseline, nothing went wrong" and meta.knowledge_unchanged == "one baseline says nothing new"
+    assert meta.lessons_added == 0 and meta.knowledge_changed is False
 
 
 def test_lessons_go_into_the_files_agents_load(project: Project):

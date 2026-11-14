@@ -8,7 +8,8 @@ from pathlib import Path
 
 from .. import contract, render, rules
 from ..ledger import Ledger
-from ..util import ArlError, now, write_front
+from ..record import Track
+from ..util import ArlError, now
 from . import common
 
 
@@ -28,13 +29,13 @@ def cmd_track_new(args: argparse.Namespace) -> int:
         if args.from_ref and re.fullmatch(r"E\d{4}", args.from_ref):
             # An experiment: the track starts at the code it ran and, unless told otherwise, its params.
             source = ledger.record(args.from_ref)
-            if source["type"] not in rules.SCORED:
-                raise ArlError(f"{source['id']} is a diagnose experiment: its code observes, it is not a method. Name a commit if you mean it.")
-            if not source.get("code_commit") or "design" not in source:
-                raise ArlError(f"{source['id']} never ran, so there is no code to start from")
+            if source.type not in rules.SCORED:
+                raise ArlError(f"{source.id} is a diagnose experiment: its code observes, it is not a method. Name a commit if you mean it.")
+            if not source.code_commit or source.design is None:
+                raise ArlError(f"{source.id} never ran, so there is no code to start from")
             common.require_design_unchanged(ledger, source)
-            start = git.head(source["code_commit"])
-            params = common.load_params(Path(args.params)) if args.params else common.load_params(ledger.exp_dir(source["id"]) / "params.json")
+            start = git.head(source.code_commit)
+            params = common.load_params(Path(args.params)) if args.params else common.load_params(ledger.exp_dir(source.id) / "params.json")
         else:
             start = git.head(args.from_ref or "HEAD")
             params = common.load_params(Path(args.params)) if args.params else {}
@@ -52,24 +53,22 @@ def cmd_track_new(args: argparse.Namespace) -> int:
             git.prune_worktrees()
             git.add_worktree(path, branch)
         ledger.track_root.mkdir(parents=True, exist_ok=True)
-        meta = {
-            "name": name,
-            "status": "active",
-            "branch": branch,
-            "created": now(),
-            "from_ref": args.from_ref or git.branch() or "HEAD",
-            "base_commit": start,
-            "head_commit": start,
-            "head_experiment": "",
-            "opened_by": opened_by,
-        }
+        meta = Track(
+            name=name,
+            status="active",
+            branch=branch,
+            created=now(),
+            from_ref=args.from_ref or git.branch() or "HEAD",
+            base_commit=start,
+            head_commit=start,
+            opened_by=opened_by,
+        )
         ledger.write_track_params(meta, params)
-        body = render.fill(render.template("track.md"), name=name, branch=branch, worktree=path)
-        write_front(ledger.track_path(name), meta, body)
+        ledger.save_track(meta, render.fill(render.template("track.md"), name=name, branch=branch, worktree=path))
         common.finish(ledger, f"open track {name}")
     print(f"Track {name}: branch {branch} at {start[:10]}, worktree {path}")
     if source:
-        print(f"It starts from {source['id']}: the code it ran and {'the params given' if args.params else 'its params'}. Its baseline should give the result of {source['id']} again.")
+        print(f"It starts from {source.id}: the code it ran and {'the params given' if args.params else 'its params'}. Its baseline should give the result of {source.id} again.")
     print(f"Now write {ledger.track_path(name)} (approach, premises, stop if), below the +++ block.")
     return 0
 
@@ -80,13 +79,13 @@ def cmd_track_set(args: argparse.Namespace) -> int:
         contract.require(ledger)
         common.gate_paused(ledger)
         track = ledger.track(args.name)
-        if track["status"] == args.status:
+        if track.status == args.status:
             raise ArlError(f"track {args.name} is already {args.status}")
         flying = rules.in_flight(ledger, args.name)
         if args.status != "active" and flying:
-            raise ArlError(f"{flying[0]['id']} is still in flight on track {args.name}")
+            raise ArlError(f"{flying[0].id} is still in flight on track {args.name}")
         by = common.authorized(ledger, args.introspection, (), "parking, closing or reopening a track")
-        track["status"] = args.status
+        track.status = args.status
         common.track_log(ledger, track, f"{args.status} (by {by}). {args.note}")
         common.finish(ledger, f"track {args.name} {args.status}")
     print(f"Track {args.name} is {args.status}.")
@@ -102,11 +101,11 @@ def cmd_track_sync(args: argparse.Namespace) -> int:
         track = ledger.track(args.name)
         if rules.in_flight(ledger, args.name):
             raise ArlError(f"an experiment is in flight on track {args.name}")
-        head = ledger.git.head(track["branch"])
-        if head == track["head_commit"]:
+        head = ledger.git.head(track.branch)
+        if head == track.head_commit:
             raise ArlError("the branch did not move")
-        old = track["head_commit"]
-        track["head_commit"], track["head_experiment"] = head, ""
+        old = track.head_commit
+        track.head_commit, track.head_experiment = head, ""
         common.track_log(ledger, track, f"branch moved outside arl from {old[:10]} to {head[:10]}. {args.note}")
         common.finish(ledger, f"track {args.name} synced to {head[:10]}")
     print(f"Track {args.name} now at {head[:10]}. It needs a new baseline.")
@@ -121,16 +120,16 @@ def cmd_track_worktree(args: argparse.Namespace) -> int:
         path = ledger.worktree_path(args.name)
         if path.exists():
             raise ArlError(f"{path} is there already")
-        flying = [e for e in rules.in_flight(ledger, args.name) if e["status"] != "judging"]
-        branch = flying[0]["branch"] if flying else track["branch"]
+        flying = [e for e in rules.in_flight(ledger, args.name) if e.status != "judging"]
+        branch = flying[0].branch if flying else track.branch
         git = ledger.git
         # A clone of the project brings the commits and not the local branches. The ledger
         # says where each one stood; an experiment's own branch may be further on where
         # the project was cloned from.
-        wanted = {track["branch"]: track["head_commit"]}
-        if flying and branch != track["branch"]:
+        wanted = {track.branch: track.head_commit}
+        if flying and branch != track.branch:
             there = f"refs/remotes/origin/{branch}"
-            wanted[branch] = git.head(there) if git.ok("rev-parse", "--verify", "--quiet", there) else flying[0].get("code_commit") or flying[0]["base_commit"]
+            wanted[branch] = git.head(there) if git.ok("rev-parse", "--verify", "--quiet", there) else flying[0].code_commit or flying[0].base_commit
         missing = {name: commit for name, commit in wanted.items() if not git.branch_exists(name)}
         for name, commit in missing.items():
             if not git.commit_exists(commit):
@@ -150,5 +149,5 @@ def cmd_track_list(args: argparse.Namespace) -> int:
     ledger = Ledger.locate()
     print(render.track_table(ledger, contract.load(ledger)), end="")
     for t in ledger.tracks():
-        print(f"{t['name']}: {ledger.worktree_path(t['name'])}")
+        print(f"{t.name}: {ledger.worktree_path(t.name)}")
     return 0

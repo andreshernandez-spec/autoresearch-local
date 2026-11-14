@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 
 from .. import render
-from ..ledger import Ledger
-from ..util import now, one_line, slugify, write_front
+from ..ledger import Ledger, save_front
+from ..record import Hypothesis
+from ..util import now, one_line, slugify
 from . import common
 
 
@@ -17,8 +18,8 @@ def cmd_hyp_new(args: argparse.Namespace) -> int:
         ledger.hyp_root.mkdir(parents=True, exist_ok=True)
         path = ledger.hyp_root / f"{hid}-{slugify(args.title)}.md"
         source = one_line(args.source, "--from") if args.source else ""
-        meta = {"id": hid, "title": args.title, "status": "open", "created": now(), "updated": now(), "source": source}
-        write_front(path, meta, render.fill(render.template("hypothesis.md"), id=hid, title=args.title))
+        meta = Hypothesis(id=hid, title=args.title, status="open", created=now(), updated=now(), source=source)
+        save_front(path, meta, render.fill(render.template("hypothesis.md"), id=hid, title=args.title))
     print(f"{hid}: write {path} (below the +++ block, which is arl's)")
     return 0
 
@@ -34,7 +35,7 @@ def cmd_hyp_set(args: argparse.Namespace) -> int:
 
 def cmd_hyp_list(args: argparse.Namespace) -> int:
     ledger = Ledger.locate()
-    rows = [[h["id"], h["status"], h["title"]] for h in ledger.hypotheses() if not args.status or h["status"] == args.status]
+    rows = [[h.id, h.status, h.title] for h in ledger.hypotheses() if not args.status or h.status == args.status]
     print(render.table(["id", "status", "title"], rows), end="")
     return 0
 

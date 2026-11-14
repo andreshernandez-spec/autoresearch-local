@@ -399,6 +399,13 @@ carry a stale copy of `research/` that nothing reads: arl always writes the
 home checkout, also when called from inside a worktree, and refuses experiment
 code that touches `research/`.
 
+What arl keeps about an experiment, a track, a hypothesis and an introspection
+has a fixed set of fields: `src/arl/record.py` lists them and says what each
+one is. A file with a field arl does not know, a value of the wrong kind, or
+fields that contradict its status (judged, and no verdict) is named by the
+next command, and nothing runs until the file is put back from git. So an
+older arl does not act on a record a newer one wrote.
+
 Lessons that hold for any project are in `skill/LESSONS.md`, next to the
 skill that agents load. That file is written by the loops on one machine and
 is not tracked: what was learned in one project, possibly a private one, never

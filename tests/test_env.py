@@ -218,7 +218,7 @@ def test_a_track_starts_from_an_old_experiment(project: Project, monkeypatch):
     monkeypatch.setattr(common, "interactive", lambda: False)
     p.fill(p.research / "tracks" / "back.md")
     track = p.ledger.track("back")
-    assert track["base_commit"] == p.record(good)["code_commit"] and track["from_ref"] == good
+    assert track.base_commit == p.record(good)["code_commit"] and track.from_ref == good
     assert p.ledger.track_params(track) == {"x": 0.2}
     assert git(p.base / "wt" / "toy-back", "rev-parse", "HEAD") == p.record(good)["code_commit"]
     again = p.baseline("back", params={"x": 0.2})
@@ -238,7 +238,7 @@ def test_a_track_does_not_start_from_what_has_no_method(project: Project, monkey
     p.judge(look, "finding")
     assert "its code observes" in p.arl("track", "new", "b", "--from", look, code=1)
     assert "no experiment E0999" in p.arl("track", "new", "c", "--from", "E0999", code=1)
-    assert [t["name"] for t in p.ledger.tracks()] == ["main-line"]
+    assert [t.name for t in p.ledger.tracks()] == ["main-line"]
 
 
 def test_naming_another_environment_asks_for_a_new_baseline(project: Project, monkeypatch):
@@ -418,7 +418,7 @@ def test_a_run_continued_in_a_changed_environment_says_so(project: Project):
     pause_record(p, eid)
     rec = p.record(eid)  # the first part of the run, with the environment it had
     rec["attempts"][-1]["segments"][0]["env"] = rec["conditions"]["env"] = runner.environment(p.ledger, runner.probe_env(p.ledger))
-    p.ledger.save_record(rec)
+    p.save_record(rec)
     install(env, "extra", "2.0")  # changed while the run was paused
     p.arl("exp", "run", eid)
     analysis = (p.ledger.exp_dir(eid) / "analysis.md").read_text()

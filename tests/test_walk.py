@@ -97,7 +97,7 @@ class Walk:
                 digest.update(rel.encode() + path.read_bytes())
         digest.update(git(p.root, "worktree", "list", "--porcelain").encode())
         for t in p.ledger.tracks():
-            wt = p.ledger.worktree_path(t["name"])
+            wt = p.ledger.worktree_path(t.name)
             digest.update(git(wt, "status", "--porcelain").encode() if wt.exists() else b"gone")
         return digest.hexdigest()
 
@@ -108,13 +108,13 @@ class Walk:
         assert git(p.root, "branch", "--show-current") == "main", self.story()
         exps = p.ledger.experiments()
         for e in exps:
-            assert e["status"] in STATUSES, self.story()
-            assert ("verdict" in e) == (e["status"] in ("judging", "judged", "abandoned")), f"{e['id']}\n{self.story()}"
+            assert e.status in STATUSES, self.story()
+            assert (e.verdict is not None) == (e.status in ("judging", "judged", "abandoned")), f"{e.id}\n{self.story()}"
         for t in p.ledger.tracks():
-            flying = [e["id"] for e in exps if e["track"] == t["name"] and e["status"] in rules.IN_FLIGHT]
+            flying = [e.id for e in exps if e.track == t.name and e.status in rules.IN_FLIGHT]
             assert len(flying) <= 1, f"{flying}\n{self.story()}"
-            if t["head_experiment"]:
-                head = p.record(t["head_experiment"])  # kept, or being kept by a verdict that was cut off
+            if t.head_experiment:
+                head = p.record(t.head_experiment)  # kept, or being kept by a verdict that was cut off
                 assert head["verdict"]["decision"] == "keep" and head["status"] in ("judged", "judging"), self.story()
 
     # --- what the agent does when it follows `next` ----------------------------------
@@ -132,12 +132,12 @@ class Walk:
         if analysis.exists():
             p.fill(analysis)
         self.worktree(rec["track"])
-        allowed = rules.allowed_verdicts(rec) or ["crash"]
+        allowed = rules.allowed_verdicts(p.ledger.record(eid)) or ["crash"]
         verdict = verdict or self.rng.choice(allowed)
         args = ["exp", "judge", eid, "--verdict", verdict, "--reason", "what the walk decided"]
         if rec["status"] == "evaluated" and rec["type"] in ("tune", "feature"):
             for h in rec["hypotheses"]:
-                dropped = p.ledger.hypothesis(h)[0]["status"] == "dropped"
+                dropped = p.ledger.hypothesis(h)[0].status == "dropped"
                 args += ["--hyp", f"{h}={'open' if dropped else self.rng.choice(['supported', 'refuted', 'inconclusive', 'open'])}"]
         if verdict == "keep" and rec.get("comparison", {}).get("outcome") == "neutral":
             args.append("--simpler")
@@ -219,7 +219,7 @@ class Walk:
             self.introspect(target)
         elif stage == "track":
             state = rules.introspection_state(p.ledger)
-            parked = [t["name"] for t in tracks if t["status"] == "parked"]
+            parked = [t.name for t in tracks if t.status == "parked"]
             if state["last"] and parked and rng.random() < 0.5:
                 self.worktree(parked[0])
                 self.call("track", "set", parked[0], "--status", "active", "--note", "one more try", "--introspection", state["last"])
@@ -235,13 +235,13 @@ class Walk:
             p.fill(p.research / "tracks" / f"{target}.md")
             self.call("exp", "new", "--type", "baseline", "--track", target, "--title", self.name("baseline "))
         elif stage == "hypothesize":
-            usable = [h["id"] for h in p.ledger.hypotheses() if h["status"] != "dropped"]
+            usable = [h.id for h in p.ledger.hypotheses() if h.status != "dropped"]
             if not usable or rng.random() < 0.4:
                 h = self.call("hyp", "new", "--title", self.name("claim "))[1].split(":")[0]
                 p.fill(p.ledger.hyp_path(h))
             else:
                 h = rng.choice(usable)
-            track = rng.choice([t["name"] for t in tracks if t["status"] == "active"])
+            track = rng.choice([t.name for t in tracks if t.status == "active"])
             self.worktree(track)
             typ = rng.choice(["tune"] * 5 + ["feature"] * 3 + ["diagnose", "diagnose", "baseline"])
             args = ["exp", "new", "--type", typ, "--track", track, "--title", self.name(f"{typ} ")]
@@ -300,9 +300,9 @@ class Walk:
         exps, tracks = p.ledger.experiments(), p.ledger.tracks()
         kind = rng.choice(["cut", "cut", "half", "pause", "contract", "refreeze", "folder", "gone", "upgrade", "typed", "typed", "typed", "typed"])
         if kind in ("cut", "half"):
-            drafts = [e for e in exps if e["status"] in ("draft", "crashed") and e["type"] in ("tune", "baseline") and p.ledger.worktree_path(e["track"]).exists()]
+            drafts = [e for e in exps if e.status in ("draft", "crashed") and e.type in ("tune", "baseline") and p.ledger.worktree_path(e.track).exists()]
             if drafts and not p.ledger.paused() and self.damaged is None:
-                eid = rng.choice(drafts)["id"]
+                eid = rng.choice(drafts).id
                 p.fill(p.ledger.exp_dir(eid) / "design.md")
                 if kind == "cut" or p.record(eid)["attempts"]:
                     cut_off(p, eid)  # the machine went down in the middle of its run
@@ -338,17 +338,17 @@ class Walk:
                 install(self.env, "demo", f"{self.name('')}.0")
                 self.log.append("# a package in the environment changes version")
         elif kind == "folder":
-            there = [t["name"] for t in tracks if p.ledger.worktree_path(t["name"]).exists()]
+            there = [t.name for t in tracks if p.ledger.worktree_path(t.name).exists()]
             clean = [name for name in there if not git(p.ledger.worktree_path(name), "status", "--porcelain")]
             if clean:
                 name = rng.choice(clean)
                 shutil.rmtree(p.ledger.worktree_path(name))
                 self.log.append(f"# the worktree folder of {name} removed by hand")
         else:
-            eid = rng.choice([e["id"] for e in exps] + ["E0999"])
-            hid = rng.choice([h["id"] for h in p.ledger.hypotheses()] + ["H999"])
-            nid = rng.choice([n["id"] for n in p.ledger.introspections()] + ["N999"])
-            track = rng.choice([t["name"] for t in tracks] + ["nowhere"])
+            eid = rng.choice([e.id for e in exps] + ["E0999"])
+            hid = rng.choice([h.id for h in p.ledger.hypotheses()] + ["H999"])
+            nid = rng.choice([n.id for n in p.ledger.introspections()] + ["N999"])
+            track = rng.choice([t.name for t in tracks] + ["nowhere"])
             self.call(
                 *rng.choice(
                     [
@@ -359,7 +359,7 @@ class Walk:
                         ("exp", "commit", eid, "-m", "typed without looking"),
                         ("exp", "show", eid),
                         ("exp", "env", eid),
-                        ("exp", "env", eid, rng.choice([e["id"] for e in exps] + ["E0999"])),
+                        ("exp", "env", eid, rng.choice([e.id for e in exps] + ["E0999"])),
                         ("exp", "log", eid),
                         ("exp", "pause"),
                         ("exp", "reproduce", eid),
@@ -428,11 +428,11 @@ class Walk:
             self.call("resume")
             self.person(False)
         for t in self.p.ledger.tracks():
-            self.worktree(t["name"])
+            self.worktree(t.name)
         for e in self.p.ledger.experiments():
-            if e["status"] == "judging":
+            if e.status == "judging":
                 assert "cut off before it was complete" in self.call("verify")[1], self.story()
-                assert self.call("exp", "judge", e["id"])[0] == 0, self.story()
+                assert self.call("exp", "judge", e.id)[0] == 0, self.story()
 
 
 @pytest.mark.parametrize("seed", SEEDS)
@@ -451,6 +451,6 @@ def test_walk(project: Project, monkeypatch, seed: int):
     assert (code, text.strip()) == (0, "ok"), walk.story()
     assert walk.call("next")[0] == 0
     if os.environ.get("ARL_WALK_REPORT"):  # which stages the walks reached, one line per walk
-        statuses = collections.Counter(e["status"] for e in p.ledger.experiments())
+        statuses = collections.Counter(e.status for e in p.ledger.experiments())
         with open(os.environ["ARL_WALK_REPORT"], "a") as f:
             f.write(json.dumps({"seed": seed, "seen": walk.seen, "experiments": statuses}) + "\n")

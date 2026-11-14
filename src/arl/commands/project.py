@@ -8,7 +8,8 @@ import json
 
 from .. import contract, render, rules, runner
 from ..ledger import Ledger
-from ..util import ArlError, read_json, write_text
+from ..record import need
+from ..util import ArlError, as_text, read_json, write_text
 from . import common
 from .common import ARL
 
@@ -78,7 +79,7 @@ def cmd_freeze(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     ledger = Ledger.locate()
     if args.json:
-        print(json.dumps(render.state(ledger), indent=2, default=str))
+        print(json.dumps(render.state(ledger), indent=2, default=as_text))
     else:
         print(render.status(ledger), end="")
     return 0
@@ -112,50 +113,50 @@ def cmd_verify(args: argparse.Namespace) -> int:
             bad.append("the environment: " + env["problem"].splitlines()[0])
     git = ledger.git
     for t in ledger.tracks():
-        if not git.branch_exists(t["branch"]):
-            bad.append(f"track {t['name']}: branch {t['branch']} is gone ('arl track worktree {t['name']}' makes it again where the ledger says it stood)")
-        elif t["status"] == "active" and git.head(t["branch"]) != t["head_commit"]:
-            bad.append(f"track {t['name']}: branch moved outside arl (run 'arl track sync {t['name']}')")
+        if not git.branch_exists(t.branch):
+            bad.append(f"track {t.name}: branch {t.branch} is gone ('arl track worktree {t.name}' makes it again where the ledger says it stood)")
+        elif t.status == "active" and git.head(t.branch) != t.head_commit:
+            bad.append(f"track {t.name}: branch moved outside arl (run 'arl track sync {t.name}')")
         try:
             ledger.track_params(t)
         except ArlError as e:
-            bad.append(f"track {t['name']}: {str(e).splitlines()[0]}")
-        if t.get("head_experiment"):
+            bad.append(f"track {t.name}: {str(e).splitlines()[0]}")
+        if t.head_experiment:
             try:
-                head = ledger.record(t["head_experiment"])
-                if not rules.kept(head) and head["status"] != "judging":  # a verdict cut off is named below
-                    bad.append(f"track {t['name']}: its reference {t['head_experiment']} was not kept")
+                head = ledger.record(t.head_experiment)
+                if not rules.kept(head) and head.status != "judging":  # a verdict cut off is named below
+                    bad.append(f"track {t.name}: its reference {t.head_experiment} was not kept")
             except ArlError as e:
-                bad.append(f"track {t['name']}: {str(e).splitlines()[0]}")
+                bad.append(f"track {t.name}: {str(e).splitlines()[0]}")
     for folder in sorted(ledger.exp_root.glob("E[0-9][0-9][0-9][0-9]*")) if ledger.exp_root.exists() else []:
         if not (folder / "record.json").exists():
             bad.append(f"{ledger.rel(folder)} has no record.json: a leftover, not an experiment")
     for e in ledger.experiments():
-        exp = ledger.exp_dir(e["id"])
-        if e["status"] == "judging":
-            bad.append(f"{e['id']}: its verdict ({e['verdict']['decision']}) was cut off before it was complete. '{ARL} exp judge {e['id']}' finishes it.")
-        if "design" in e:
+        exp = ledger.exp_dir(e.id)
+        if e.status == "judging":
+            bad.append(f"{e.id}: its verdict ({e.decision}) was cut off before it was complete. '{ARL} exp judge {e.id}' finishes it.")
+        if e.design is not None:
             try:
                 design_hash, params_hash = common.design_hashes(exp)
-                if design_hash != e["design"]["design_sha256"]:
-                    bad.append(f"{e['id']}: design.md changed after the run started")
-                if params_hash != e["design"]["params_sha256"]:
-                    bad.append(f"{e['id']}: params.json changed after the run started")
+                if design_hash != e.design.design_sha256:
+                    bad.append(f"{e.id}: design.md changed after the run started")
+                if params_hash != e.design.params_sha256:
+                    bad.append(f"{e.id}: params.json changed after the run started")
             except ArlError as err:
-                bad.append(f"{e['id']}: {str(err).splitlines()[0]}")
-        if e.get("code_commit") and not git.commit_exists(e["code_commit"]):
-            bad.append(f"{e['id']}: commit {e['code_commit'][:10]} is not in the repository")
-        if rules.kept(e) and e["type"] == "feature":
-            track = ledger.track(e["track"])
-            if git.branch_exists(track["branch"]) and not git.is_ancestor(e["code_commit"], track["branch"]):
-                bad.append(f"{e['id']}: kept, but its commit is not in {track['branch']}")
-        if "metrics" in e:
+                bad.append(f"{e.id}: {str(err).splitlines()[0]}")
+        if e.code_commit and not git.commit_exists(e.code_commit):
+            bad.append(f"{e.id}: commit {e.code_commit[:10]} is not in the repository")
+        if rules.kept(e) and e.type == "feature":
+            track = ledger.track(e.track)
+            if git.branch_exists(track.branch) and not git.is_ancestor(need(e.code_commit), track.branch):
+                bad.append(f"{e.id}: kept, but its commit is not in {track.branch}")
+        if e.metrics is not None:
             try:
                 stored = read_json(exp / "metrics.json") if (exp / "metrics.json").exists() else {}
             except (ArlError, json.JSONDecodeError):
                 stored = {}
-            if any(stored.get(k) != v for k, v in e["metrics"].items()):
-                bad.append(f"{e['id']}: metrics.json differs from the record")
+            if any(stored.get(k) != v for k, v in e.metrics.items()):
+                bad.append(f"{e.id}: metrics.json differs from the record")
     bad += ledger.idea_problems()
     if bad:
         print("\n".join(bad))

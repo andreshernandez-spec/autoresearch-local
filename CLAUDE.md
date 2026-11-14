@@ -9,7 +9,7 @@ enforced. `PROTOCOL.md` is what an agent reads before using it.
 - Standard library only. A project runs `bin/arl` from whatever Python 3.11+ it
   has, with nothing installed. The same holds for `helpers/arl_job.py`, which
   projects copy.
-- `python -m pytest` runs everything (about six minutes). The tests drive a
+- `python -m pytest` runs everything (about seven minutes). The tests drive a
   toy project in a temporary git repository through the real CLI.
 - Every gate has a test that hits it through the CLI and checks the message:
   `tests/test_flow.py` for the loop, `tests/test_introspection.py` for the
@@ -41,6 +41,14 @@ enforced. `PROTOCOL.md` is what an agent reads before using it.
   on a job goes there, never into one of the two commands. What a step took
   is booked the moment it ends, whatever ends it (`run_ended`,
   `evaluation_ended`).
+- A record is a typed object, not a dictionary (`record.py`): an experiment,
+  a track, a hypothesis, an introspection, and what an experiment holds
+  inside. A new field is declared there first, with a comment that says what
+  it is. The names of the fields are the keys in the files, and a field that
+  is None is not written: a field that is renamed or removed still has to be
+  read from old files. What a status promises (`contradiction`) is checked
+  when a record is read, which is what lets a command say `need(...)`.
+  `pyright src` stays at zero errors; a test runs it when pyright is there.
 - An interruption is not a failure. A part of a run that ends because arl or
   the job was stopped from outside leaves the run `paused`; only what the job
   itself did wrong uses up an attempt.
@@ -83,6 +91,7 @@ enforced. `PROTOCOL.md` is what an agent reads before using it.
 | `src/arl/commands/` the rest | `project.py` (init, freeze, status, next, verify), `session.py` (pause, resume, reload, notes, lessons), `tracks.py`, `hypotheses.py` (and ideas), `introspections.py` |
 | `src/arl/rules.py` | outcome of a result, allowed verdicts, when an introspection is due, the budget, what comes next |
 | `src/arl/contract.py` | `frozen.lock`: the two digests and who may freeze |
+| `src/arl/record.py` | what an experiment's record, a track, a hypothesis and an introspection hold, as types; reading and writing them; what a status promises |
 | `src/arl/ledger.py` | where each record lives, ids, the ideas, lessons and activity files, the pause file, ledger commits |
 | `src/arl/runner.py` | running a job in its own session with limits, stopping it, machine gates, the environment a job gets, conditions written into a record |
 | `src/arl/config.py` | `arl.toml`, every value checked when it is read |

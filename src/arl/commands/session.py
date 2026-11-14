@@ -6,8 +6,8 @@ from __future__ import annotations
 import argparse
 
 from .. import render, rules
-from ..ledger import SCOPES, Ledger
-from ..util import ArlError, now, one_line, write_front, write_json
+from ..ledger import SCOPES, Ledger, save_front
+from ..util import ArlError, now, one_line, write_json
 from . import common, jobs
 from .common import ARL
 
@@ -77,8 +77,8 @@ def _mark_reloaded(ledger: Ledger) -> str | None:
     nid = rules.introspection_state(ledger)["reload"]
     if nid:
         meta, body = ledger.introspection(nid)
-        meta["reloaded"] = now()
-        write_front(ledger.intro_path(nid), meta, body)
+        meta.reloaded = now()
+        save_front(ledger.intro_path(nid), meta, body)
     ledger.mark_reloaded()
     return nid
 

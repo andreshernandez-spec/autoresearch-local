@@ -16,12 +16,13 @@ from typing import Any, Callable, Generator
 from .. import contract, rules, runner
 from ..config import Config
 from ..ledger import Ledger
+from ..record import Record, Rerun
 from ..util import EXIT_BUSY, ArlError, now, parse_time
 from . import common
 from .common import ARL
 
 
-def run_env(ledger: Ledger, rec: dict[str, Any], values: dict[str, Any], resume: bool) -> dict[str, str]:
+def run_env(ledger: Ledger, rec: Record, values: dict[str, Any], resume: bool) -> dict[str, str]:
     env = runner.job_env(ledger)
     env.update(
         ARL_HOME=str(ledger.home),
@@ -30,8 +31,8 @@ def run_env(ledger: Ledger, rec: dict[str, Any], values: dict[str, Any], resume:
         ARL_OUT=str(values["out"]),
         ARL_PARAMS=str(values["params"]),
         ARL_SPLIT=str(values["split"]),
-        ARL_ID=rec["id"],
-        ARL_TRACK=rec["track"],
+        ARL_ID=rec.id,
+        ARL_TRACK=rec.track,
         ARL_RESUME="1" if resume else "0",
         ARL_CHECKPOINT_EVERY=f"{ledger.cfg.checkpoint_every:g}",
     )
@@ -215,7 +216,7 @@ def moved(ledger: Ledger, contract_digest: str | None, data: str | None, when: s
     return ""
 
 
-def amend(ledger: Ledger, eid: str, change: Callable[[dict[str, Any]], None], wait: float = 120.0) -> dict[str, Any]:
+def amend(ledger: Ledger, eid: str, change: Callable[[Record], None], wait: float = 120.0) -> Record:
     """Change one record from the middle of a job, or when it has just ended.
 
     The command that started the job read the record before it began, and another
@@ -255,25 +256,24 @@ def keep_outcome(ledger: Ledger, eid: str, write: Callable[[], None], message: s
 # --- what a dead or interrupted process left --------------------------------------
 
 
-def fail(rec: dict[str, Any], reason: str) -> None:
+def fail(rec: Record, reason: str) -> None:
     """The attempt failed: it counts, and the next one starts from nothing."""
-    attempt = rec["attempts"][-1]
-    attempt.setdefault("ended", now())
-    attempt["failed"] = reason
-    attempt.pop("paused", None)
-    rec["status"] = "crashed"
-    for key in ("pid", "pid_start", "child", "metrics", "comparison"):
-        rec.pop(key, None)
+    attempt = rec.attempts[-1]
+    attempt.ended = attempt.ended or now()
+    attempt.failed = reason
+    attempt.paused = None
+    rec.status = "crashed"
+    rec.forget_job()
+    rec.metrics = rec.comparison = None
 
 
-def pause_run(rec: dict[str, Any], how: str) -> None:
+def pause_run(rec: Record, how: str) -> None:
     """A part of the run ended early without failing: the run can be continued."""
-    attempt = rec["attempts"][-1]
-    attempt["paused"] = how
-    attempt["run_seconds"] = round(sum(s.get("seconds", 0) for s in attempt.get("segments", [])), 2)
-    rec["status"] = "paused"
-    for key in ("pid", "pid_start", "child"):
-        rec.pop(key, None)
+    attempt = rec.attempts[-1]
+    attempt.paused = how
+    attempt.run_seconds = round(attempt.ran(), 2)
+    rec.status = "paused"
+    rec.forget_job()
 
 
 def ran_for(started: str, signs: list[Path], until_now: bool = False) -> float:
@@ -307,49 +307,55 @@ def _signs(exp: Path, what: str, n: int, split: str = "") -> list[Path]:
     return [log.parent / "heartbeat", log, eval_log, out]
 
 
-def settle(ledger: Ledger, rec: dict[str, Any], certain: bool = False) -> bool:
+def settle(ledger: Ledger, rec: Record, certain: bool = False) -> bool:
     """A record says a job is going, but the arl that ran it is gone.
 
     Stop whatever it left behind, and leave the run where it can be continued.
     certain: the caller holds the run lock, so nothing can be running.
     """
     changed = False
-    exp = ledger.exp_dir(rec["id"])
-    gone = rec["status"] == "running" and (certain or rules.stale(rec))
-    left = gone and _stop_leftover(rec.get("child"), ledger.cfg.pause_grace)  # a run gets the time to save its state
-    if gone and not ("code_commit" in rec and "contract" in rec):
+    exp = ledger.exp_dir(rec.id)
+    gone = rec.status == "running" and (certain or rules.stale(rec))
+    left = gone and _stop_leftover(rec.child, ledger.cfg.pause_grace)  # a run gets the time to save its state
+    if gone and not (rec.code_commit is not None and rec.contract is not None):
         # It was marked as running and never got as far as starting: back to where it was.
-        rec["attempts"] = [a for a in rec.get("attempts", []) if a.get("code_commit")]
-        rec["status"] = "crashed" if rec["attempts"] else "draft"
-        for key in ("pid", "pid_start", "child"):
-            rec.pop(key, None)
+        rec.attempts = [a for a in rec.attempts if a.code_commit]
+        rec.status = "crashed" if rec.attempts else "draft"
+        rec.forget_job()
         changed = True
     elif gone:
-        attempt = rec["attempts"][-1]
-        parts = attempt.setdefault("segments", [])
-        if parts and "ended" not in parts[-1]:
-            parts[-1].update(ended=now(), ended_by="interrupted", seconds=ran_for(parts[-1]["started"], _signs(exp, "run", attempt["n"]), until_now=left))
+        attempt = rec.attempts[-1]
+        last = attempt.segments[-1] if attempt.segments else None
+        if last is not None and last.ended is None:
+            last.ended, last.ended_by = now(), "interrupted"
+            last.seconds = ran_for(last.started, _signs(exp, "run", attempt.n), until_now=left)
             if left:
-                parts[-1]["note"] = "the job it left behind was stopped"
+                last.note = "the job it left behind was stopped"
         pause_run(rec, "interrupted: the arl that ran it was gone" + (", the job it left behind was stopped" if left else ""))
         changed = True
-    rerun = rec.get("rerun")
-    if rerun and (certain or not runner.alive(rerun.get("pid"), rerun.get("pid_start"))):
-        left = _stop_leftover(rerun.get("child"))
-        tree = Path(rerun.get("tree", ""))
-        if rerun.get("tree") and tree.exists():
+    rerun = rec.rerun
+    if rerun and (certain or not runner.alive(rerun.pid, rerun.pid_start)):
+        left = _stop_leftover(rerun.child)
+        tree = Path(rerun.tree or "")
+        if rerun.tree and tree.exists():
             drop_tree(ledger, tree)
-        signs = _signs(exp, "rerun", rerun["n"], rerun["split"])
-        entry = {"n": rerun["n"], "at": now(), "split": rerun["split"], "run_seconds": ran_for(rerun["started"], signs, until_now=left)}
-        entry.update({k: rerun[k] for k in ("eval_digest", "data_digest") if k in rerun})
-        entry["failed"] = "interrupted: the arl that ran it was gone" + (", its job was stopped" if left else "")
-        entry["interrupted"] = True  # not a failure of the experiment: it does not count against a confirmation
-        rec.setdefault("reruns", []).append(entry)
-        rec.pop("rerun")
+        signs = _signs(exp, "rerun", rerun.n, rerun.split)
+        entry = Rerun(
+            n=rerun.n,
+            at=now(),
+            split=rerun.split,
+            eval_digest=rerun.eval_digest,
+            data_digest=rerun.data_digest,
+            run_seconds=ran_for(rerun.started, signs, until_now=left),
+            interrupted=True,  # not a failure of the experiment: it does not count against a confirmation
+            failed="interrupted: the arl that ran it was gone" + (", its job was stopped" if left else ""),
+        )
+        rec.reruns.append(entry)
+        rec.rerun = None
         changed = True
     if changed:
         ledger.save_record(rec)
-        common.finish(ledger, f"{rec['id']} interrupted")
+        common.finish(ledger, f"{rec.id} interrupted")
     return changed
 
 
@@ -357,7 +363,7 @@ def settle_all(ledger: Ledger) -> None:
     """Holding the run lock: every job a record still names is a leftover. Stop them all
     before anything starts, whichever experiment the command is about."""
     for rec in ledger.experiments():
-        if rec["status"] == "running" or rec.get("rerun"):
+        if rec.status == "running" or rec.rerun:
             settle(ledger, rec, certain=True)
 
 
@@ -377,19 +383,19 @@ def ask_to_pause(ledger: Ledger, only: str | None = None) -> list[tuple[str, str
     """Leave a request for every job that is going. Returns (experiment, "run" or "rerun")."""
     asked = []
     for rec in ledger.experiments():
-        if only not in (None, rec["id"]):
+        if only not in (None, rec.id):
             continue
-        rerun = rec.get("rerun")
-        if rec["status"] == "running" and not rules.stale(rec):
+        rerun = rec.rerun
+        if rec.status == "running" and not rules.stale(rec):
             kind = "run"
-        elif rerun and runner.alive(rerun.get("pid"), rerun.get("pid_start")):
+        elif rerun and runner.alive(rerun.pid, rerun.pid_start):
             kind = "rerun"
         else:
             continue
-        request = ledger.exp_dir(rec["id"]) / "logs" / "pause.request"
+        request = ledger.exp_dir(rec.id) / "logs" / "pause.request"
         request.parent.mkdir(parents=True, exist_ok=True)
         request.write_text(now())
-        asked.append((rec["id"], kind))
+        asked.append((rec.id, kind))
     return asked
 
 

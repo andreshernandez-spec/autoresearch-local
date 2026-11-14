@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from arl import config, rules, runner
+from arl import config, record, rules, runner
 from arl.gitops import Git
-from arl.util import ArlError, join_front, split_front, unfilled
+from arl.record import Comparison, Record
+from arl.util import ArlError, canonical, join_front, split_front, unfilled
 
 TOML = """
 [project]
@@ -38,12 +39,15 @@ def cfg(tmp_path):
 
 
 def ref(score, seconds, fails=()):
-    return {"id": "E0001", "metrics": {"score": score, "seconds": seconds}, "comparison": {"gate_failures": list(fails)}}
+    """A kept experiment, as far as a comparison looks at it."""
+    comparison = Comparison(metric="score", value=score, gate_failures=list(fails), target_met=False, outcome="reference")
+    made = dict(title="the reference", type="baseline", track="main-line", hypotheses=[], status="judged", created="", base_commit="", branch="")
+    return Record(id="E0001", metrics={"score": score, "seconds": seconds}, comparison=comparison, **made)
 
 
 def test_compare(cfg):
     def outcome(score, seconds, reference):
-        return rules.compare(cfg, {"score": score, "seconds": seconds}, reference)["outcome"]
+        return rules.compare(cfg, {"score": score, "seconds": seconds}, reference).outcome
 
     assert outcome(0.5, 1.0, None) == "reference"
     assert outcome(0.52, 1.0, ref(0.5, 1.0)) == "improve"
@@ -59,8 +63,8 @@ def test_min_goal(tmp_path):
     path = tmp_path / "arl.toml"
     path.write_text(TOML.replace('goal = "max"', 'goal = "min"'))
     cfg = config.load(path)
-    assert rules.compare(cfg, {"score": 0.4, "seconds": 1.0}, ref(0.5, 1.0))["outcome"] == "improve"
-    assert rules.compare(cfg, {"score": 0.6, "seconds": 1.0}, ref(0.5, 1.0))["outcome"] == "worse"
+    assert rules.compare(cfg, {"score": 0.4, "seconds": 1.0}, ref(0.5, 1.0)).outcome == "improve"
+    assert rules.compare(cfg, {"score": 0.6, "seconds": 1.0}, ref(0.5, 1.0)).outcome == "worse"
 
 
 @pytest.mark.parametrize(
@@ -194,3 +198,104 @@ def test_fill_markers():
 def test_placeholders_are_quoted():
     out = runner.substitute("run --out {out} --keep {other} ${HOME}", {"out": "/tmp/a b"})
     assert out == "run --out '/tmp/a b' --keep {other} ${HOME}"
+
+
+# --- records as types -------------------------------------------------------------
+
+RECORD = {
+    "id": "E0007",
+    "title": "x 0.5",
+    "type": "tune",
+    "track": "main-line",
+    "hypotheses": ["H001"],
+    "status": "judged",
+    "created": "2026-01-01T10:00:00+00:00",
+    "base_commit": "a" * 40,
+    "branch": "track/main-line",
+    "command": "",
+    "attempts": [
+        {
+            "n": 1,
+            "started": "2026-01-01T10:01:00+00:00",
+            "code_commit": "a" * 40,
+            "segments": [
+                {"started": "2026-01-01T10:01:00+00:00", "env": {"host": "here"}, "ended": "2026-01-01T10:01:02+00:00", "ended_by": "paused", "seconds": 1.5},
+                {"started": "2026-01-01T10:05:00+00:00", "env": {"host": "here"}, "ended": "2026-01-01T10:05:01+00:00", "ended_by": "finished", "seconds": 1},
+            ],
+            "exit_code": 0,
+            "run_seconds": 2.5,
+            "run_done": True,
+            "eval_seconds": 0.2,
+            "ended": "2026-01-01T10:05:02+00:00",
+        }
+    ],
+    "contract": {"version": 1, "digest": "d", "eval_digest": "e"},
+    "conditions": {"command": "run", "split": "dev", "worktree": "/wt", "data": [], "data_digest": "dd", "env": {"host": "here"}},
+    "code_commit": "a" * 40,
+    "dedup": "k",
+    "design": {"design_sha256": "1", "params_sha256": "2", "locked_at": "2026-01-01T10:01:00+00:00"},
+    "artifacts": [{"path": "prediction.json", "bytes": 12, "sha256": "3"}],
+    "metrics": {"score": 0.8, "cost": 0.5},
+    "comparison": {"metric": "score", "value": 0.8, "gate_failures": [], "target_met": False, "reference": "E0001", "reference_value": 0.3, "gain": 0.5, "min_delta": 0.01, "outcome": "improve"},
+    "kept": ["prediction.json"],
+    "verdict": {"decision": "keep", "reason": "it is better", "at": "2026-01-01T10:06:00+00:00", "hypotheses": {"H001": "supported"}, "track_head": {"before": "a" * 40, "after": "a" * 40}},
+    "reruns": [
+        {"n": 1, "at": "2026-01-02T10:00:00+00:00", "split": "confirm", "eval_digest": "e", "data_digest": "dd", "env_changed": {"count": 1, "first": ["python 3.12 -> 3.13"]}, "run_seconds": 1.0, "metrics": {"score": 0.78}, "meets_target": False},
+    ],
+}
+
+
+def test_a_record_is_written_back_as_it_was_read():
+    rec = record.load(Record, RECORD)
+    assert canonical(record.dump(rec)) == canonical(RECORD) and list(record.dump(rec)) == list(RECORD)
+    assert rec.attempts[0].segments[0].seconds == 1.5 and rec.attempts[0].ran() == 2.5
+    assert (rec.outcome, rec.decision, rec.eval_digest, rec.data_digest) == ("improve", "keep", "e", "dd")
+    assert rec.reruns[0].env_changed.count == 1 and rec.rerun is None and rec.pid is None
+    assert record.contradiction(rec) == ""
+
+
+@pytest.mark.parametrize(
+    "change, said",
+    [
+        (lambda r: r.update(staus="judged"), "this arl does not know staus"),
+        (lambda r: r["attempts"][0]["segments"][1].update(secs=3), "this arl does not know attempts[0].segments[1].secs"),
+        (lambda r: [r.pop("title"), r.pop("branch")], "no title, branch"),
+        (lambda r: r.update(staus=r.pop("status")), "no status; this arl does not know staus"),
+        (lambda r: r["attempts"][0].pop("n"), "no attempts[0].n"),
+        (lambda r: r.update(attempts={}), "attempts should be a list, not {}"),
+        (lambda r: r.update(status=3), "status should be text, not 3"),
+        (lambda r: r["attempts"][0].update(n=True), "attempts[0].n should be a whole number, not True"),
+        (lambda r: r.update(metrics=[0.8]), "metrics should be a table"),
+        (lambda r: r.update(reruns={"n": 1}), "reruns should be a list"),
+    ],
+)
+def test_a_record_that_cannot_be_read_says_why(change, said):
+    data = record.dump(record.load(Record, RECORD))
+    change(data)
+    with pytest.raises(ArlError, match=said.replace("[", r"\[").replace("]", r"\]")):
+        record.load(Record, data)
+
+
+@pytest.mark.parametrize(
+    "change, said",
+    [
+        (lambda r: setattr(r, "status", "done"), "its status is 'done'"),
+        (lambda r: setattr(r, "verdict", None), "it is judged and has no verdict"),
+        (lambda r: setattr(r, "code_commit", None), "it is judged and has no attempt or no code_commit"),
+        (lambda r: setattr(r, "conditions", None), "it has run and has no conditions"),
+        (lambda r: setattr(r, "design", None), "it has a result and no design"),
+        (lambda r: setattr(r, "comparison", None), "it has metrics and no comparison"),
+    ],
+)
+def test_what_a_status_promises(change, said):
+    rec = record.load(Record, RECORD)
+    change(rec)
+    assert record.contradiction(rec).startswith(said)
+
+
+def test_a_misspelt_field_fails_where_it_is_written():
+    rec = record.load(Record, RECORD)
+    with pytest.raises(AttributeError):
+        rec.staus = "judged"  # type: ignore[attr-defined]
+    with pytest.raises(TypeError, match="record.dump"):
+        canonical({"experiment": rec})  # a record that reaches a file unconverted is refused, not written as text

@@ -48,7 +48,9 @@ read it again before going on.
 
 Hypotheses, tracks and introspections are files with a block between `+++`
 lines at the top. That block is arl's. Write below it, and edit such a file in
-place rather than replacing it whole.
+place rather than replacing it whole. An experiment's `record.json` is arl's
+as a whole: read it, never edit it. A block or a record that holds something
+arl did not put there stops every command until the file is put back from git.
 
 ## Stopping and continuing
 

@@ -31,10 +31,11 @@ import re
 import time
 import tomllib
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any, Generator, TypeVar
 
 from . import config as config_mod
 from .gitops import Git
+from .record import Hypothesis, Introspection, Record, Track, contradiction, dump, load
 from .util import (
     ArlError,
     canonical,
@@ -62,29 +63,28 @@ GENERAL_LESSONS = Path(__file__).resolve().parents[2] / "skill" / "LESSONS.md"
 _IDEA_HEAD = re.compile(r"^## (I\d{3}): (.*)$", re.M)
 _IDEA_LIKE = re.compile(r"^## I\S*.*$", re.M)
 _LESSON_HEAD = {"general": re.compile(r"^## (G\d{3}): (.*)$", re.M), "project": re.compile(r"^## (L\d{3}): (.*)$", re.M)}
-_NEEDS = {
-    "hypothesis": ("id", "title", "status"),
-    "track": ("name", "status", "branch", "head_commit"),
-    "introspection": ("id", "status"),
-}
+R = TypeVar("R")
 
 
-def _front(path: Path, kind: str) -> tuple[dict[str, Any], str]:
-    """Front matter of a ledger file, or a message that says how to mend it."""
+def _front(path: Path, cls: type[R]) -> tuple[R, str]:
+    """The block between the +++ lines of a ledger file and the text below it, or a
+    message that says how to mend the block."""
     try:
         meta, body = read_front(path)
-        missing = [k for k in _NEEDS[kind] if k not in meta]
-        why = f"no {', '.join(missing)}" if missing else ""
+        return load(cls, meta), body
     except (ArlError, tomllib.TOMLDecodeError) as e:
-        meta, body, why = {}, "", str(e)
-    if why:
-        raise ArlError(
-            f"the block between the +++ lines at the top of {path} is missing or damaged ({why}).\n"
-            "arl keeps its fields there; write only below it. If the file was committed,\n"
-            f"'git diff -- {path}' shows the block that was lost. If it was new, remove the\n"
-            "file, create it again with arl and paste your text back."
-        )
-    return meta, body
+        why = str(e)
+    raise ArlError(
+        f"the block between the +++ lines at the top of {path} is missing or damaged ({why}).\n"
+        "arl keeps its fields there; write only below it. If the file was committed,\n"
+        f"'git diff -- {path}' shows the block that was lost. If it was new, remove the\n"
+        "file, create it again with arl and paste your text back."
+    )
+
+
+def save_front(path: Path, meta: Any, body: str) -> None:
+    """Write a track, a hypothesis or an introspection: its fields between the +++ lines, the text below."""
+    write_front(path, dump(meta), body)
 
 
 class Ledger:
@@ -285,13 +285,24 @@ class Ledger:
         return matches[0]
 
     @staticmethod
-    def _read_record(path: Path) -> dict[str, Any]:
+    def _read_record(path: Path) -> Record:
         try:
-            return read_json(path)
+            data = read_json(path)
         except json.JSONDecodeError as e:
             raise ArlError(f"{path} is damaged ({e}). arl writes that file; restore it from git.") from e
+        try:
+            rec = load(Record, data)
+            why = contradiction(rec)
+        except ArlError as e:
+            rec, why = None, str(e)
+        if rec is None or why:
+            raise ArlError(
+                f"{path} is not a record this arl can read ({why}).\n"
+                "arl writes that file: restore it from git, or update arl if a newer one wrote it."
+            )
+        return rec
 
-    def record(self, eid: str) -> dict[str, Any]:
+    def record(self, eid: str) -> Record:
         path = self.exp_dir(eid) / "record.json"
         if not path.exists():
             raise ArlError(
@@ -299,10 +310,10 @@ class Ledger:
             )
         return self._read_record(path)
 
-    def save_record(self, rec: dict[str, Any]) -> None:
-        write_json(self.exp_dir(rec["id"]) / "record.json", rec)
+    def save_record(self, rec: Record) -> None:
+        write_json(self.exp_dir(rec.id) / "record.json", dump(rec))
 
-    def experiments(self) -> list[dict[str, Any]]:
+    def experiments(self) -> list[Record]:
         if not self.exp_root.exists():
             return []
         paths = sorted(self.exp_root.glob("E[0-9][0-9][0-9][0-9]*/record.json"))
@@ -317,69 +328,69 @@ class Ledger:
             raise ArlError(f"no hypothesis {hid}")
         return matches[0]
 
-    def hypothesis(self, hid: str) -> tuple[dict[str, Any], str]:
-        return _front(self.hyp_path(hid), "hypothesis")
+    def hypothesis(self, hid: str) -> tuple[Hypothesis, str]:
+        return _front(self.hyp_path(hid), Hypothesis)
 
-    def hypotheses(self) -> list[dict[str, Any]]:
+    def hypotheses(self) -> list[Hypothesis]:
         if not self.hyp_root.exists():
             return []
-        return [_front(p, "hypothesis")[0] for p in sorted(self.hyp_root.glob("H[0-9][0-9][0-9]*.md"))]
+        return [_front(p, Hypothesis)[0] for p in sorted(self.hyp_root.glob("H[0-9][0-9][0-9]*.md"))]
 
     def set_hypothesis(self, hid: str, status: str, note: str) -> None:
         """Change a hypothesis's status and say why in its log. Doing it twice changes nothing."""
         if status not in HYP_STATES:
             raise ArlError(f"hypothesis status must be one of {', '.join(HYP_STATES)}")
         path = self.hyp_path(hid)
-        meta, body = _front(path, "hypothesis")
+        meta, body = _front(path, Hypothesis)
         line = f"{status}. {' '.join(note.split())}"
-        if meta.get("status") == status and line in body:
+        if meta.status == status and line in body:
             return
-        meta["status"], meta["updated"] = status, now()
-        write_front(path, meta, body.rstrip("\n") + f"\n- {now()[:10]}: {line}\n")
+        meta.status, meta.updated = status, now()
+        save_front(path, meta, body.rstrip("\n") + f"\n- {now()[:10]}: {line}\n")
 
     def log_hypothesis(self, hid: str, text: str) -> None:
         """A line in a hypothesis's log that leaves its status as it is."""
         path = self.hyp_path(hid)
-        meta, body = _front(path, "hypothesis")
+        meta, body = _front(path, Hypothesis)
         text = " ".join(text.split())
         if text not in body:
-            write_front(path, meta, body.rstrip("\n") + f"\n- {now()[:10]}: {text}\n")
+            save_front(path, meta, body.rstrip("\n") + f"\n- {now()[:10]}: {text}\n")
 
     # --- tracks ------------------------------------------------------------------
 
     def track_path(self, name: str) -> Path:
         return self.track_root / f"{name}.md"
 
-    def track(self, name: str) -> dict[str, Any]:
+    def track(self, name: str) -> Track:
         path = self.track_path(name)
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name or "") or not path.exists():
-            raise ArlError(f"no track '{name}'. Tracks: {', '.join(t['name'] for t in self.tracks()) or 'none'}")
-        return _front(path, "track")[0]
+            raise ArlError(f"no track '{name}'. Tracks: {', '.join(t.name for t in self.tracks()) or 'none'}")
+        return _front(path, Track)[0]
 
-    def tracks(self) -> list[dict[str, Any]]:
+    def tracks(self) -> list[Track]:
         if not self.track_root.exists():
             return []
-        return [_front(p, "track")[0] for p in sorted(self.track_root.glob("*.md"))]
+        return [_front(p, Track)[0] for p in sorted(self.track_root.glob("*.md"))]
 
-    def save_track(self, meta: dict[str, Any], body: str | None = None) -> None:
-        path = self.track_path(meta["name"])
+    def save_track(self, meta: Track, body: str | None = None) -> None:
+        path = self.track_path(meta.name)
         if body is None:
-            body = _front(path, "track")[1]
-        write_front(path, meta, body)
+            body = _front(path, Track)[1]
+        save_front(path, meta, body)
 
     def track_params_path(self, name: str) -> Path:
         return self.track_root / f"{name}.params.json"
 
-    def track_params(self, track: dict[str, Any]) -> dict[str, Any]:
+    def track_params(self, track: Track) -> dict[str, Any]:
         """The track's current params. arl wrote them; a hand edit is refused."""
-        path = self.track_params_path(track["name"])
+        path = self.track_params_path(track.name)
         try:
             params = read_json(path)
         except (OSError, json.JSONDecodeError) as e:
             raise ArlError(f"{path} is not valid JSON ({e}). arl writes that file; restore it from git.") from e
         if not isinstance(params, dict):
             raise ArlError(f"{path} must hold one JSON object. arl writes that file; restore it from git.")
-        recorded = track.get("params_sha256")
+        recorded = track.params_sha256
         if recorded and sha256_text(canonical(params)) != recorded:
             raise ArlError(
                 f"{path} was changed by hand. A track's params move only when an experiment is kept:\n"
@@ -387,10 +398,10 @@ class Ledger:
             )
         return params
 
-    def write_track_params(self, track: dict[str, Any], params: dict[str, Any]) -> None:
+    def write_track_params(self, track: Track, params: dict[str, Any]) -> None:
         """Write the params file and note its hash in the track's fields (the caller saves the track)."""
-        write_json(self.track_params_path(track["name"]), params)
-        track["params_sha256"] = sha256_text(canonical(params))
+        write_json(self.track_params_path(track.name), params)
+        track.params_sha256 = sha256_text(canonical(params))
 
     def worktree_root(self) -> Path:
         root = Path(os.path.expanduser(self.cfg.worktrees))
@@ -408,13 +419,13 @@ class Ledger:
             raise ArlError(f"no introspection {nid}")
         return path
 
-    def introspection(self, nid: str) -> tuple[dict[str, Any], str]:
-        return _front(self.intro_path(nid), "introspection")
+    def introspection(self, nid: str) -> tuple[Introspection, str]:
+        return _front(self.intro_path(nid), Introspection)
 
-    def introspections(self) -> list[dict[str, Any]]:
+    def introspections(self) -> list[Introspection]:
         if not self.intro_root.exists():
             return []
-        return [_front(p, "introspection")[0] for p in sorted(self.intro_root.glob("N[0-9][0-9][0-9].md"))]
+        return [_front(p, Introspection)[0] for p in sorted(self.intro_root.glob("N[0-9][0-9][0-9].md"))]
 
     # --- knowledge ---------------------------------------------------------------
 
