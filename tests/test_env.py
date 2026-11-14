@@ -13,7 +13,8 @@ import os
 import shutil
 import sys
 
-from arl import __version__, cli, runner
+from arl import __version__, runner
+from arl.commands import common
 from conftest import Project, env_table, git, install, make_env, pause_record
 
 
@@ -211,13 +212,13 @@ def test_a_track_starts_from_an_old_experiment(project: Project, monkeypatch):
     p.judge(good, "discard", "--hyp", f"{h}=open")
     p.tune(0.3, "keep", h)  # the track went on another way
     assert "comes out of an introspection" in p.arl("track", "new", "back", "--from", good, code=1)
-    monkeypatch.setattr(cli, "interactive", lambda: True)  # the person decides to go back to it
+    monkeypatch.setattr(common, "interactive", lambda: True)  # the person decides to go back to it
     out = p.arl("track", "new", "back", "--from", good)
     assert f"It starts from {good}" in out
-    monkeypatch.setattr(cli, "interactive", lambda: False)
+    monkeypatch.setattr(common, "interactive", lambda: False)
     p.fill(p.research / "tracks" / "back.md")
     track = p.ledger.track("back")
-    assert track["base_commit"] == p.record(good)["code_commit"] and track["from_ref"] == good
+    assert track.base_commit == p.record(good)["code_commit"] and track.from_ref == good
     assert p.ledger.track_params(track) == {"x": 0.2}
     assert git(p.base / "wt" / "toy-back", "rev-parse", "HEAD") == p.record(good)["code_commit"]
     again = p.baseline("back", params={"x": 0.2})
@@ -228,7 +229,7 @@ def test_a_track_starts_from_an_old_experiment(project: Project, monkeypatch):
 def test_a_track_does_not_start_from_what_has_no_method(project: Project, monkeypatch):
     p = project
     h = p.started()
-    monkeypatch.setattr(cli, "interactive", lambda: True)  # the person asks: what is refused is the source
+    monkeypatch.setattr(common, "interactive", lambda: True)  # the person asks: what is refused is the source
     draft = p.draft("tune", hyps=(h,), params={"x": 0.5})
     assert "never ran" in p.arl("track", "new", "a", "--from", draft, code=1)
     p.arl("exp", "abandon", draft, "--reason", "not needed")
@@ -237,7 +238,7 @@ def test_a_track_does_not_start_from_what_has_no_method(project: Project, monkey
     p.judge(look, "finding")
     assert "its code observes" in p.arl("track", "new", "b", "--from", look, code=1)
     assert "no experiment E0999" in p.arl("track", "new", "c", "--from", "E0999", code=1)
-    assert [t["name"] for t in p.ledger.tracks()] == ["main-line"]
+    assert [t.name for t in p.ledger.tracks()] == ["main-line"]
 
 
 def test_naming_another_environment_asks_for_a_new_baseline(project: Project, monkeypatch):
@@ -246,9 +247,9 @@ def test_naming_another_environment_asks_for_a_new_baseline(project: Project, mo
     other = make_env(p.base / "other")
     arl_toml = p.research / "arl.toml"
     arl_toml.write_text(arl_toml.read_text().replace(str(env), str(other)))
-    monkeypatch.setattr(cli, "interactive", lambda: True)  # the person moves the program to another environment
+    monkeypatch.setattr(common, "interactive", lambda: True)  # the person moves the program to another environment
     assert "every track needs a new baseline" in p.arl("freeze", "--reason", "another environment", "--yes")
-    monkeypatch.setattr(cli, "interactive", lambda: False)
+    monkeypatch.setattr(common, "interactive", lambda: False)
     assert "NEXT: baseline main-line" in p.arl("next")
     again = p.baseline()
     assert p.record(again)["comparison"]["outcome"] == "reference"
@@ -417,7 +418,7 @@ def test_a_run_continued_in_a_changed_environment_says_so(project: Project):
     pause_record(p, eid)
     rec = p.record(eid)  # the first part of the run, with the environment it had
     rec["attempts"][-1]["segments"][0]["env"] = rec["conditions"]["env"] = runner.environment(p.ledger, runner.probe_env(p.ledger))
-    p.ledger.save_record(rec)
+    p.save_record(rec)
     install(env, "extra", "2.0")  # changed while the run was paused
     p.arl("exp", "run", eid)
     analysis = (p.ledger.exp_dir(eid) / "analysis.md").read_text()

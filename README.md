@@ -202,7 +202,11 @@ arl track new again --from E0007    # a new line of work that starts there
   (`exp/E0007-<slug>`), and arl never deletes a branch. If the environment
   changed since, the rerun says how. If the data files are not the ones the
   experiment read, it says that too, and compares nothing: the recorded code
-  on other data is a number, not a repetition of the result.
+  on other data is a number, not a repetition of the result. A rerun goes the
+  way a run goes: the same limits, the same questions when the job and the
+  evaluator end (is the code still the recorded commit, the contract the
+  frozen one, the data what was read), so a rerun cannot pass where a run
+  would have failed.
 - **Start from it.** `track new --from E0007` opens a track at the code E0007
   ran, with its params. The first experiment there is a baseline, which
   measures that state again, and work goes on from it. Like every change of
@@ -359,7 +363,8 @@ ones, interrupted parts and reruns included. Without `max_run_hours` nothing
 bounds reruns. The time of a part nobody saw end (arl was killed, the machine
 went down) does not come from the log: while arl watches a job it marks a
 file every second, so a job that prints nothing is charged the time it ran,
-and a job found still going is charged until it is stopped.
+and a job found still going is charged until it is stopped. A job or an
+evaluation that is cut short is booked at that moment, for the time it took.
 
 Every value in `arl.toml` is checked when the file is read: a wrong type or an
 impossible number is named before the contract is frozen.
@@ -393,6 +398,13 @@ The ledger lives on the project's home branch. Track branches fork from it and
 carry a stale copy of `research/` that nothing reads: arl always writes the
 home checkout, also when called from inside a worktree, and refuses experiment
 code that touches `research/`.
+
+What arl keeps about an experiment, a track, a hypothesis and an introspection
+has a fixed set of fields: `src/arl/record.py` lists them and says what each
+one is. A file with a field arl does not know, a value of the wrong kind, or
+fields that contradict its status (judged, and no verdict) is named by the
+next command, and nothing runs until the file is put back from git. So an
+older arl does not act on a record a newer one wrote.
 
 Lessons that hold for any project are in `skill/LESSONS.md`, next to the
 skill that agents load. That file is written by the loops on one machine and

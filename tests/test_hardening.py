@@ -16,7 +16,8 @@ import time
 
 import pytest
 
-from arl import cli, contract, gitops, render, runner
+from arl import contract, gitops, render, runner
+from arl.commands import common
 from conftest import DEAD_PID, EVAL_PY, NOTHING_NEW, Project, cut_off, git, job_pid, launch, pid_alive, wait_for
 
 
@@ -82,7 +83,7 @@ def test_cut_off_run_is_settled_by_whichever_command_comes_next(project: Project
     cut_off(p, stuck)
     rec = p.record(stuck)
     rec.update(pid=1, pid_start=987654321)
-    p.ledger.save_record(rec)
+    p.save_record(rec)
     # pid 1 is alive but it is not the arl that started the run: a reused pid must not block for ever
     assert "NEXT: interrupted" in p.arl("next")
     p.judge(stuck, "crash")
@@ -96,7 +97,7 @@ def test_run_marked_as_started_that_never_got_going(project: Project):
     try:
         rec = p.record(eid)  # killed between "running" and the first line of the job
         rec.update(status="running", pid=DEAD_PID, pid_start=1, child=runner.child_ref(orphan.pid), attempts=[{"n": 1, "started": "2026-01-01T00:00:00+00:00"}])
-        p.ledger.save_record(rec)
+        p.save_record(rec)
         assert "only a draft that never ran" not in p.arl("exp", "abandon", eid, "--reason", "not wanted after all")
         assert orphan.wait(timeout=20) is not None
         assert p.record(eid)["status"] == "abandoned" and p.record(eid)["attempts"] == []
@@ -161,9 +162,9 @@ def test_refrozen_contract_with_work_pending(project: Project, monkeypatch):
     draft = p.draft("tune", hyps=(h,), params={"x": 0.5})
     evaluator = p.research / "eval" / "evaluate.py"
     evaluator.write_text(evaluator.read_text() + "\n# stricter\n")
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     p.arl("freeze", "--reason", "stricter", "--yes")
-    monkeypatch.setattr(cli, "interactive", lambda: False)
+    monkeypatch.setattr(common, "interactive", lambda: False)
     out = p.arl("next")
     assert "NEXT: outdated E0002" in out and "exp abandon E0002" in out
     assert "Abandon it" in p.arl("exp", "run", draft, code=1)
@@ -280,11 +281,11 @@ def test_same_code_on_two_tracks(project: Project):
     p = project
     p.setup()
     p.track("alpha")
-    start = p.ledger.track("alpha")["head_commit"]
+    start = p.ledger.track("alpha").head_commit
     p.track("beta", "--from", start)
     p.baseline("alpha")
     p.baseline("beta")  # the same commit and params, but its own reference
-    assert p.ledger.track("beta")["head_experiment"] == "E0002"
+    assert p.ledger.track("beta").head_experiment == "E0002"
 
 
 # --- gates ----------------------------------------------------------------------------
@@ -302,9 +303,9 @@ def test_parking_a_stalled_track_does_not_skip_the_introspection(project: Projec
     p.tune(-0.3, "discard", h, track="alpha")
     assert "An introspection comes first" in new_exp(p, "tune", h, code=1, track="beta")
     assert "comes out of an introspection" in p.arl("track", "set", "alpha", "--status", "parked", "--note", "stalled", code=1)
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     p.arl("track", "set", "alpha", "--status", "parked", "--note", "stalled")
-    monkeypatch.setattr(cli, "interactive", lambda: False)
+    monkeypatch.setattr(common, "interactive", lambda: False)
     assert "An introspection comes first" in new_exp(p, "tune", h, code=1, track="beta")
 
     assert p.introspect("adjust") == "N001"
@@ -347,7 +348,7 @@ def test_stop_budget_and_waiting_hold_for_existing_drafts(project: Project, monk
     draft = p.draft("tune", hyps=(h,), params={"x": 0.5})
     assert p.introspect("stop") == "N001"
     assert "waits for a person" in p.arl("exp", "run", draft, code=1)
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     p.arl("introspect", "resolve", "N001", "--decision", "stop", "--note", "enough")
     assert "NEXT: stopped N001" in p.arl("next")
     assert "Nothing runs until a person reopens it" in p.arl("exp", "run", draft, code=1)
@@ -413,7 +414,7 @@ def test_verdict_flags_must_fit(project: Project):
     assert "a crash says nothing about a hypothesis" in p.judge(crashed, "crash", "--hyp", f"{h}=supported", code=1)
     assert "--simpler is only for keeping a neutral result" in p.judge(crashed, "crash", "--simpler", code=1)
     p.judge(crashed, "crash", "--hyp", f"{h}=open")
-    assert p.ledger.hypothesis(h)[0]["status"] == "open"
+    assert p.ledger.hypothesis(h)[0].status == "open"
     worse = p.draft("tune", hyps=(h,), params={"x": -0.5})
     p.arl("exp", "run", worse)
     assert "--simpler is only" in p.judge(worse, "discard", "--simpler", "--hyp", f"{h}=open", code=1)
@@ -432,7 +433,7 @@ def test_refused_judge_changes_nothing(project: Project):
     p.fill(p.ledger.exp_dir(eid) / "analysis.md")
     p.ledger.hyp_path(h).unlink()
     assert "no hypothesis H001" in p.arl("exp", "judge", eid, "--verdict", "keep", "--reason", "r", "--hyp", f"{h}=supported", code=1)
-    assert p.record(eid)["status"] == "evaluated" and p.ledger.track("main-line")["head_experiment"] == "E0001"
+    assert p.record(eid)["status"] == "evaluated" and p.ledger.track("main-line").head_experiment == "E0001"
     assert git(wt, "branch", "--show-current").startswith("exp/E0002")
 
 
@@ -540,7 +541,7 @@ def test_text_that_is_typed(project: Project):
     p.arl("idea", "add", "--title", "Über größe αβγ 🚀 | pipes | {id}", "--body", "FILL: not a placeholder here")
     assert p.ledger.ideas()[1]["title"] == "Über größe αβγ 🚀 | pipes | {id}"
     out = p.arl("hyp", "new", "--title", 'He said "x = y"\\ then left')
-    assert p.ledger.hypothesis(out.split(":")[0])[0]["title"] == 'He said "x = y"\\ then left'
+    assert p.ledger.hypothesis(out.split(":")[0])[0].title == 'He said "x = y"\\ then left'
     assert p.arl("verify").strip() == "ok"
 
 
@@ -605,7 +606,7 @@ def test_older_records_survive_a_new_metric(project: Project, monkeypatch):
     evaluator.write_text(evaluator.read_text().replace('"cost": abs(x)}', '"cost": abs(x), "extra": 1.0}'))
     toml = p.research / "arl.toml"
     toml.write_text(toml.read_text().replace("[budget]", '[[metric]]\nname = "extra"\nrole = "info"\n\n[budget]'))
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     p.arl("freeze", "--reason", "one more metric", "--yes")
     assert "score" in p.arl("exp", "show", "E0001")
     assert "verdict: keep" in p.judge(eid, "keep", "--hyp", f"{h}=supported")
@@ -653,7 +654,7 @@ def test_crash_leaves_a_settled_hypothesis_alone(project: Project):
     p.arl("exp", "run", crashed, code=2)
     p.judge(crashed, "crash", "--hyp", f"{h}=open")
     meta, body = p.ledger.hypothesis(h)
-    assert meta["status"] == "supported" and "E0003 (crash): left as it is" in body
+    assert meta.status == "supported" and "E0003 (crash): left as it is" in body
 
 
 def test_same_change_committed_twice_is_the_same_experiment(project: Project):
@@ -712,7 +713,7 @@ def test_verdict_cut_off_in_the_middle_is_finished_later(project: Project, monke
     monkeypatch.setattr(gitops.Git, "fast_forward", dies)
     p.arl("exp", "judge", eid, "--verdict", "keep", "--reason", "better", "--hyp", f"{h}=supported", code=130)
     monkeypatch.setattr(gitops.Git, "fast_forward", real)
-    assert p.record(eid)["status"] == "judging" and p.ledger.track("main-line")["head_experiment"] == "E0001"
+    assert p.record(eid)["status"] == "judging" and p.ledger.track("main-line").head_experiment == "E0001"
     out = p.arl("next")
     assert f"NEXT: unfinished {eid}" in out and f"exp judge {eid}" in out
     assert f"{eid}: its verdict (keep) was cut off" in p.arl("verify", code=1)
@@ -721,7 +722,7 @@ def test_verdict_cut_off_in_the_middle_is_finished_later(project: Project, monke
     assert "was recorded before and cut off" in out and "'discard' was not applied" in out
     rec = p.record(eid)
     assert rec["status"] == "judged" and rec["verdict"]["decision"] == "keep"
-    assert p.ledger.track("main-line")["head_experiment"] == eid and p.ledger.hypothesis(h)[0]["status"] == "supported"
+    assert p.ledger.track("main-line").head_experiment == eid and p.ledger.hypothesis(h)[0].status == "supported"
     assert git(wt, "rev-parse", "HEAD") == rec["code_commit"] and git(wt, "branch", "--show-current") == "track/main-line"
     assert p.arl("verify").strip() == "ok"
 
@@ -729,7 +730,7 @@ def test_verdict_cut_off_in_the_middle_is_finished_later(project: Project, monke
     second = p.draft("tune", hyps=(h,), params={"x": 0.1})
     p.arl("exp", "run", second)
     p.fill(p.ledger.exp_dir(second) / "analysis.md")
-    monkeypatch.setattr(cli, "finish", lambda ledger, message: (_ for _ in ()).throw(KeyboardInterrupt))
+    monkeypatch.setattr(common, "finish", lambda ledger, message: (_ for _ in ()).throw(KeyboardInterrupt))
     p.arl("exp", "judge", second, "--verdict", "discard", "--reason", "worse", "--hyp", f"{h}=open", code=130)
     monkeypatch.undo()
     monkeypatch.chdir(p.root)
@@ -771,7 +772,7 @@ def test_freeze_that_cannot_be_committed_did_not_happen(project: Project, monkey
     p.baseline()
     evaluator = p.research / "eval" / "evaluate.py"
     evaluator.write_text(evaluator.read_text() + "\n# stricter\n")
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     index_lock.write_text("")
     assert "index.lock" in p.arl("freeze", "--reason", "stricter", "--yes", code=1)
     assert contract.load(p.ledger)["version"] == 1  # the old lock, so the change still shows as a change
@@ -791,7 +792,7 @@ def test_freeze_covers_only_what_was_shown(project: Project, monkeypatch):
         program.write_text(program.read_text() + "\nA rule that slipped in while the question was open.\n")
         return "y"
 
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     monkeypatch.setattr("builtins.input", answer)
     out = p.arl("freeze", "--reason", "one change", code=1)
     assert "changed: research/eval/evaluate.py" in out and "changed: research/PROGRAM.md" not in out
@@ -842,7 +843,7 @@ def test_repeating_the_baseline_never_moves_the_reference(project: Project):
     assert "outcome: repeat" in out and "finding" in out
     assert "the verdict can be finding, not keep" in p.judge(eid, "keep", code=1)
     p.judge(eid, "finding")
-    assert p.ledger.track("main-line")["head_experiment"] == "E0002"
+    assert p.ledger.track("main-line").head_experiment == "E0002"
     assert "does not replace the reference" in (p.ledger.exp_dir(eid) / "analysis.md").read_text()
 
 
@@ -889,7 +890,7 @@ def test_verdict_does_not_revive_a_dropped_hypothesis(project: Project):
     p.arl("hyp", "set", h, "--status", "dropped", "--note", "the claim was badly put")
     assert "was dropped" in p.judge(eid, "keep", "--hyp", f"{h}=supported", code=1)
     p.judge(eid, "keep", "--hyp", f"{h}=open")
-    assert p.ledger.hypothesis(h)[0]["status"] == "dropped"
+    assert p.ledger.hypothesis(h)[0].status == "dropped"
 
 
 def test_track_cut_off_between_its_branch_and_its_file(project: Project):
@@ -904,7 +905,7 @@ def test_track_cut_off_between_its_branch_and_its_file(project: Project):
     assert "exists already and is not at" in p.arl("track", "new", "used", code=1)
     (p.base / "wt" / "toy-plain").mkdir()
     assert "is not a worktree of track/plain" in p.arl("track", "new", "plain", code=1)
-    assert sorted(t["name"] for t in p.ledger.tracks()) == ["far", "side"]
+    assert sorted(t.name for t in p.ledger.tracks()) == ["far", "side"]
 
 
 # --- found by a review from outside ------------------------------------------------------
@@ -933,7 +934,7 @@ def test_verdict_given_while_a_rerun_is_going_stays(project: Project):
     # the rerun adds its own fields to the record as it is now, not to the copy it started with
     assert rec["status"] == "judged" and rec["verdict"]["decision"] == "keep"
     assert rec["reruns"][0]["reproduced"] is True and "rerun" not in rec
-    assert p.ledger.track("main-line")["head_experiment"] == eid
+    assert p.ledger.track("main-line").head_experiment == eid
     assert p.arl("verify").strip() == "ok"
 
 
@@ -1002,9 +1003,51 @@ def test_data_that_changes_during_a_rerun_fails_it(project: Project, monkeypatch
     data, _ = with_data(p)
     after_the_run(monkeypatch, lambda: data.write_text("two\n"))
     out = p.arl("exp", "reproduce", "E0001", code=2)
-    assert "the data files changed during the rerun" in out
+    assert "the data files changed while the rerun was going" in out
     rerun = p.record("E0001")["reruns"][0]
     assert "metrics" not in rerun and "reproduced" not in rerun
+
+
+def test_code_that_changes_during_a_rerun_fails_it(project: Project, monkeypatch):
+    """A rerun asks what a run asks: is the worktree still the commit that was recorded."""
+    p = project
+    p.started()
+    tree = p.base / "wt" / "toy-rerun-E0001-1"
+    after_the_run(monkeypatch, lambda: (tree / "run.py").write_text("print('not what was recorded')\n"))
+    out = p.arl("exp", "reproduce", "E0001", code=2)
+    assert "the code in the worktree changed while the rerun was going" in out
+    rerun = p.record("E0001")["reruns"][0]
+    assert "metrics" not in rerun and not tree.exists()
+
+
+def test_evaluation_cut_short_is_charged_and_only_it_is_done_again(project: Project, monkeypatch):
+    """arl is stopped while the evaluator is going: its time is booked, the run itself is
+    complete and is not made again."""
+    p = project
+    h = p.started()
+    eid = p.draft("tune", hyps=(h,), params={"x": 0.5})
+    real, calls = runner.execute, []
+
+    def execute(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:  # the evaluator
+            time.sleep(1.2)
+            raise KeyboardInterrupt
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "execute", execute)
+    p.arl("exp", "run", eid, code=130)
+    rec = p.record(eid)
+    attempt = rec["attempts"][0]
+    assert rec["status"] == "paused" and attempt["run_done"] is True and attempt["eval_seconds"] >= 1.0
+    assert [s["ended_by"] for s in attempt["segments"]] == ["finished"]
+    monkeypatch.setattr(runner, "execute", real)
+    ran = attempt["run_seconds"]
+    p.arl("exp", "run", eid)
+    rec = p.record(eid)
+    attempt = rec["attempts"][0]
+    assert rec["status"] == "evaluated" and attempt["run_seconds"] == ran and attempt["eval_seconds"] > 1.0
+    assert not (p.ledger.exp_dir(eid) / "logs" / "run-2.log").exists() and len(rec["attempts"]) == 1
 
 
 def start_quiet_run(p: Project, h: str):
@@ -1066,3 +1109,47 @@ def test_quiet_rerun_left_alone_is_charged_until_it_is_stopped(project: Project)
     assert not runner.session_pids(sid)
     rerun = p.record(eid)["reruns"][0]
     assert rerun["failed"].startswith("interrupted") and rerun["interrupted"] is True and rerun["run_seconds"] >= 3.0
+
+
+# --- records are typed --------------------------------------------------------------------
+
+
+def test_record_arl_cannot_read_is_named_before_anything_changes(project: Project):
+    """A field arl does not know, a field of the wrong kind, fields that contradict the status:
+    each stops every command with the file and the reason, and nothing is written."""
+    p = project
+    h = p.started()
+    eid = p.draft("tune", hyps=(h,), params={"x": 0.5})
+    good = p.record("E0001")
+    for change, said in (
+        (lambda r: r.update(staus="judged"), "this arl does not know staus"),
+        (lambda r: r.pop("verdict"), "it is judged and has no verdict"),
+        (lambda r: r["attempts"][0].update(n="one"), "attempts[0].n should be a whole number, not 'one'"),
+    ):
+        rec = json.loads(json.dumps(good))
+        change(rec)
+        p.save_record(rec)
+        for command in (("status",), ("next",), ("exp", "show", "E0001"), ("exp", "run", eid), ("verify",)):
+            out = p.arl(*command, code=1)
+            assert "record.json is not a record this arl can read" in out and said in out and "Traceback" not in out
+        assert p.record(eid)["status"] == "draft" and p.record("E0001") == rec
+    p.save_record(good)
+    assert p.arl("verify").strip() == "ok"
+
+
+def test_track_block_with_a_field_arl_does_not_know_is_named(project: Project):
+    p = project
+    p.started()
+    track = p.research / "tracks" / "main-line.md"
+    track.write_text(track.read_text().replace('status = "active"', 'status = "active"\ncolour = "red"', 1))
+    out = p.arl("next", code=1)
+    assert "main-line.md is missing or damaged (this arl does not know colour)" in out
+
+
+def test_exp_show_json_is_what_the_record_file_holds(project: Project):
+    p = project
+    p.started()
+    p.arl("exp", "reproduce", "E0001", "--split", "confirm")
+    assert json.loads(p.arl("exp", "show", "E0001", "--json")) == p.record("E0001")
+    state = json.loads(p.arl("status", "--json"))
+    assert state["tracks"][0]["head_experiment"] == "E0001" and state["experiments"][0]["verdict"]["decision"] == "keep"

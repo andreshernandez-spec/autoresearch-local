@@ -8,7 +8,8 @@ import time
 
 import pytest
 
-from arl import cli, runner
+from arl import runner
+from arl.commands import common
 from conftest import Project, git
 
 
@@ -45,7 +46,7 @@ def test_setup_to_first_reference(project: Project):
     assert rec["kept"] == ["per_instance.csv", "prediction.json"]  # the evaluator's small file too
 
     p.judge(eid, "keep")
-    assert p.ledger.track("main-line")["head_experiment"] == eid
+    assert p.ledger.track("main-line").head_experiment == eid
     assert "NEXT: hypothesize" in p.arl("next")
     assert p.arl("verify").strip() == "ok"
     assert git(p.root, "status", "--porcelain", "--", "research") == ""
@@ -65,7 +66,7 @@ def test_tune_outcomes_and_verdicts(project: Project):
     assert "say what this run did to each hypothesis" in p.judge(better, "keep", code=1)
     p.judge(better, "keep", "--hyp", f"{h}=supported")
     assert json.loads((p.research / "tracks" / "main-line.params.json").read_text()) == {"x": 0.5}
-    assert p.ledger.hypothesis(h)[0]["status"] == "supported"
+    assert p.ledger.hypothesis(h)[0].status == "supported"
 
     worse = p.draft("tune", hyps=(h,), params={"x": 0.2})
     p.arl("exp", "run", worse)
@@ -79,7 +80,7 @@ def test_tune_outcomes_and_verdicts(project: Project):
     assert p.record(same)["comparison"]["outcome"] == "neutral"
     assert "--simpler" in p.judge(same, "keep", "--hyp", f"{h}=open", code=1)
     p.judge(same, "keep", "--simpler", "--hyp", f"{h}=open")
-    assert p.ledger.track("main-line")["head_experiment"] == same
+    assert p.ledger.track("main-line").head_experiment == same
 
     outside = p.draft("tune", hyps=(h,), params={"x": -2.5})
     p.arl("exp", "run", outside)
@@ -162,7 +163,7 @@ def test_contract_is_frozen(project: Project, monkeypatch):
     p.arl("idea", "add", "--title", "noted", "--body", "text")
     assert git(p.root, "status", "--porcelain", "--", "research") == "M research/eval/evaluate.py"
 
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     assert "needs a new baseline" in p.arl("freeze", "--reason", "kinder", "--yes")
     assert "NEXT: baseline main-line" in p.arl("next")
     assert "no reference under contract v2" in new_exp(p, "tune", h, code=1)
@@ -265,7 +266,7 @@ def test_introspection_gate_and_new_tracks(project: Project):
 
     assert "No introspection due" in p.arl("introspect", "due")  # the count of failures starts again
     p.track("other", "--introspection", "N001")
-    assert p.ledger.track("other")["opened_by"] == "N001"
+    assert p.ledger.track("other").opened_by == "N001"
     p.tune(-0.4, "discard", h)
     p.arl("introspect", "new", "--trigger", "asked")
     assert "If two more tunes fail, park the track." in (p.research / "introspections" / "N002.md").read_text()
@@ -279,20 +280,37 @@ def test_some_decisions_wait_for_a_person(project: Project, monkeypatch):
     assert "waits for a person" in new_exp(p, "tune", h, code=1)
     assert "in a terminal" in p.arl("introspect", "resolve", "N001", "--decision", "continue", "--note", "go on", code=1)
 
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     p.arl("introspect", "resolve", "N001", "--decision", "stop", "--note", "enough")
     assert "NEXT: stopped N001" in p.arl("next")
     assert "decided to stop" in new_exp(p, "tune", h, code=1)
     # after a stop the agent can write an introspection, but reopening is the person's decision
-    monkeypatch.setattr(cli, "interactive", lambda: False)
+    monkeypatch.setattr(common, "interactive", lambda: False)
     p.introspect("continue")
-    assert p.ledger.introspection("N002")[0]["status"] == "waiting"
+    assert p.ledger.introspection("N002")[0].status == "waiting"
     assert "NEXT: wait N002" in p.arl("next")
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     p.arl("introspect", "resolve", "N002", "--decision", "continue", "--note", "go on")
     assert "NEXT: reload N002" in p.arl("next")
     p.arl("reload")
     assert "NEXT: hypothesize" in p.arl("next")
+
+
+def test_job_that_leaves_nothing_behind_fails(project: Project):
+    """A job that ends well and wrote nothing has no result to score, as a run and as a rerun."""
+    p = project
+    h = p.started()
+    eid = p.draft("tune", hyps=(h,), params={"x": 0.5, "silent": True})
+    assert "the run wrote nothing into its output folder" in p.arl("exp", "run", eid, code=2)
+    rec = p.record(eid)
+    assert rec["status"] == "crashed" and "metrics" not in rec and "eval_seconds" not in rec["attempts"][0]
+    p.judge(eid, "crash")
+    eid = p.draft("tune", hyps=(h,), params={"x": 0.5, "silent": "confirm"})
+    p.arl("exp", "run", eid)
+    out = p.arl("exp", "reproduce", eid, "--split", "confirm", code=2)
+    assert "the rerun wrote nothing into its output folder" in out
+    rerun = p.record(eid)["reruns"][0]
+    assert "metrics" not in rerun and "eval_seconds" not in rerun and "interrupted" not in rerun
 
 
 def test_crash_retry_and_limit(project: Project):
@@ -411,7 +429,7 @@ def test_run_marked_as_started_that_never_started(project: Project):
     eid = p.draft("tune", hyps=(h,), params={"x": 0.5})
     rec = p.record(eid)  # arl died between marking it and starting the job
     rec.update(status="running", pid=2**22 - 7, attempts=[{"n": 1, "started": "2026-01-01T00:00:00+00:00"}])
-    p.ledger.save_record(rec)
+    p.save_record(rec)
     assert "NEXT: interrupted E0002" in p.arl("next")
     p.arl("exp", "run", eid)
     rec = p.record(eid)
@@ -468,7 +486,7 @@ def test_target_missed_on_the_other_split_does_not_end_the_program(project: Proj
     nid = p.introspect("continue")
     assert "E0002 reached the target on dev and not on confirm" in (p.research / "introspections" / f"{nid}.md").read_text()
     assert "NEXT: hypothesize" in p.arl("next")
-    assert p.ledger.track("main-line")["head_experiment"] == "E0002"
+    assert p.ledger.track("main-line").head_experiment == "E0002"
     # a second run on that split does not turn the answer round
     p.arl("exp", "reproduce", "E0002", "--split", "confirm")
     assert "NEXT: hypothesize" in p.arl("next")
@@ -485,7 +503,7 @@ def test_rerun_that_does_not_say_what_it_read_confirms_nothing(project: Project)
     p.arl("exp", "reproduce", "E0002", "--split", "confirm")
     rec = p.record("E0002")
     del rec["reruns"][0]["data_digest"]  # as an older arl wrote it
-    p.ledger.save_record(rec)
+    p.save_record(rec)
     assert "NEXT: confirm E0002" in p.arl("next")
     p.arl("exp", "reproduce", "E0002", "--split", "confirm")
     assert "NEXT: target E0002" in p.arl("next")
@@ -543,7 +561,7 @@ def test_confirmation_waits_for_the_budget(project: Project):
     eid = p.tune(0.65, "keep", h, "supported")
     rec = p.record(eid)
     rec["attempts"][0]["run_seconds"] = 100.0  # 0.028 hours: nothing is left for the run that would confirm it
-    p.ledger.save_record(rec)
+    p.save_record(rec)
     out = p.arl("next")
     assert "NEXT: budget" in out and "E0002 reached the target on dev and is not confirmed yet" in out
     assert "The budget is spent" in p.arl("exp", "reproduce", eid, "--split", "confirm", code=1)
