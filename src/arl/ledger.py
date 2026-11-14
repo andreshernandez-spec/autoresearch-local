@@ -228,11 +228,13 @@ class Ledger:
                 write_text(path, read_text(TEMPLATES / name))
 
     @contextlib.contextmanager
-    def locked(self, wait: float = 120.0) -> Generator[None, None, None]:
-        """One writer at a time. Waits a while for the other one."""
-        if not self.exists():
-            raise ArlError(f"no {self.config_path}. Run 'arl init' in the project first.")
-        self.check_home()
+    def held(self, wait: float = 120.0) -> Generator[None, None, None]:
+        """The writer's lock and nothing else. Waits a while for the other one.
+
+        For a command in the middle of a job that has one field to add to a record:
+        it reads the record as it is now and writes it back, and checks nothing.
+        Never taken twice by one process: the second would wait for the first.
+        """
         with open(self.dir / ".arl.lock", "w") as f:
             deadline = time.monotonic() + wait
             while True:
@@ -243,6 +245,15 @@ class Ledger:
                     if time.monotonic() > deadline:
                         raise ArlError("another arl command is writing this ledger, try again") from e
                     time.sleep(0.2)
+            yield
+
+    @contextlib.contextmanager
+    def locked(self, wait: float = 120.0) -> Generator[None, None, None]:
+        """One writer at a time, on a ledger whose every record can be read."""
+        if not self.exists():
+            raise ArlError(f"no {self.config_path}. Run 'arl init' in the project first.")
+        self.check_home()
+        with self.held(wait):
             self.ensure_files()
             self.check_files()
             yield

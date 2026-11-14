@@ -168,15 +168,105 @@ def budget(ledger: Ledger) -> dict[str, Any]:
     }
 
 
-def target_met(ledger: Ledger) -> dict[str, Any] | None:
-    lock = contract.load(ledger)
-    if lock is None or ledger.cfg.primary.target is None:
+# --- the target -------------------------------------------------------------------
+# Reaching the target ends the program, so one result on the split the loop tunes on
+# is not enough. It is a claim, and the claim has to hold where the loop never looked.
+
+
+def meets_target(cfg: Config, metrics: dict[str, float]) -> bool:
+    """A result on its own against the target: the primary metric reaches it and every
+    absolute limit holds. Limits relative to a reference say nothing on another split."""
+    primary = cfg.primary
+    try:
+        return primary.target is not None and not gate_failures(cfg, metrics, None) and primary.meets(metrics[primary.name], primary.target)
+    except KeyError:
+        return False  # a metric the contract asks for is not in this result
+
+
+def confirming_splits(cfg: Config) -> list[str]:
+    """Where a result that met the target has to hold as well: every split the loop does
+    not score on, or the first one again when the contract has no other."""
+    return cfg.splits[1:] or cfg.splits[:1]
+
+
+def claim(ledger: Ledger, rec: dict[str, Any], lock: dict[str, Any]) -> dict[str, Any] | None:
+    """Where a kept result that met the target on the first split stands, or None when
+    the experiment makes no such claim under the evaluator as it is.
+
+    state "open": a run on "split" is still to do ('arl exp reproduce --split').
+    "confirmed": a run on every confirming split met the target as well.
+    "missed": a run on "split" did not. That settles it: a later run that does
+    better there does not turn the answer round, or the split would be tuned on.
+    "given up": the run on "split" failed as often as a run may, so nothing is
+    known. A run that succeeds later still decides.
+    Only reruns under the same evaluator and on the data the experiment read count.
+    """
+    cfg = ledger.cfg
+    if cfg.primary.target is None or not kept(rec) or not rec.get("comparison", {}).get("target_met"):
         return None
-    for e in ledger.experiments():
-        same = e.get("contract", {}).get("eval_digest") == lock["eval_digest"]
-        if kept(e) and same and e.get("comparison", {}).get("target_met"):
-            return e
-    return None
+    if rec.get("contract", {}).get("eval_digest") != lock["eval_digest"]:
+        return None
+    data = rec.get("conditions", {}).get("data_digest")
+    out: dict[str, Any] = {"id": rec["id"], "first": cfg.splits[0], "splits": confirming_splits(cfg), "state": "confirmed"}
+    todo, given_up = [], []
+    for split in out["splits"]:
+        mine = [
+            r
+            for r in rec.get("reruns", [])
+            if r.get("split") == split and r.get("eval_digest") == lock["eval_digest"] and (data is None or r.get("data_digest") == data)
+        ]
+        scored = [r for r in mine if "metrics" in r and not r.get("failed")]
+        missed = next((r for r in scored if not meets_target(cfg, r["metrics"])), None)
+        if missed:
+            return {**out, "state": "missed", "split": split, "rerun": missed["n"], "value": missed["metrics"].get(cfg.primary.name)}
+        if not scored:
+            failures = sum(1 for r in mine if r.get("failed") and not r.get("interrupted"))
+            (given_up if failures >= cfg.max_attempts else todo).append((split, failures))
+    if todo:
+        return {**out, "state": "open", "split": todo[0][0]}
+    if given_up:
+        return {**out, "state": "given up", "split": given_up[0][0], "failures": given_up[0][1]}
+    return out
+
+
+def claim_text(c: dict[str, Any]) -> str:
+    """A claim in one line, for a reason, a brief or a table."""
+    again = c.get("split") == c["first"]  # one split only: the same run, made once more
+    where = "when it was run again" if again else f"on {c.get('split')}"
+    if c["state"] == "missed":
+        value = f" ({c['value']:.6g})" if isinstance(c.get("value"), (int, float)) else ""
+        return f"{c['id']} reached the target on {c['first']} and not {where}{value}"
+    if c["state"] == "given up":
+        return f"{c['id']} reached the target on {c['first']} and could not be confirmed {where} (the run there failed {c['failures']} times)"
+    if c["state"] == "open":
+        return f"{c['id']} reached the target on {c['first']} and is not confirmed yet"
+    done = "running it again" if c["splits"] == [c["first"]] else f"the run{'s' if len(c['splits']) > 1 else ''} on {' and '.join(c['splits'])}"
+    return f"{c['id']} reached the target on {c['first']}, and {done} confirmed it"
+
+
+def claims(ledger: Ledger, lock: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Every claim on the target under the evaluator as it is, oldest first."""
+    if lock is None or ledger.cfg.primary.target is None:
+        return []
+    return [c for c in (claim(ledger, e, lock) for e in ledger.experiments()) if c]
+
+
+def target_claim(ledger: Ledger, lock: dict[str, Any] | None, data: str | None = None) -> dict[str, Any] | None:
+    """The claim that counts now: reached under the evaluator as it is and on the data as
+    it is, and confirmed or still to be confirmed. A confirmed one comes first.
+
+    data: the digest of the data files, when the caller has it at hand. A result
+    reached on other data says nothing about the data as they are.
+    """
+    by_id = {e["id"]: e for e in ledger.experiments()} if lock else {}
+    standing = []
+    for c in claims(ledger, lock):
+        measured_on = by_id[c["id"]].get("conditions", {}).get("data_digest")
+        if data is not None and measured_on is not None and measured_on != data:
+            continue
+        if c["state"] in ("confirmed", "open"):
+            standing.append(c)
+    return next((c for c in standing if c["state"] == "confirmed"), standing[0] if standing else None)
 
 
 # --- introspections ---------------------------------------------------------------
@@ -201,12 +291,17 @@ def introspection_state(ledger: Ledger) -> dict[str, Any]:
     exps = ledger.experiments()
     recent = [e for e in exps if e["status"] == "judged" and e["id"] not in covered]
     recent.sort(key=lambda e: (e["verdict"]["at"], e["id"]))
+    # A result that met the target where the loop tunes and not where it never looked is
+    # the clearest sign that the loop fits its first split: how to go on is decided here.
+    seen = {eid for n in closed for eid in n.get("unconfirmed", [])}
+    unconfirmed = [c for c in claims(ledger, contract.load(ledger)) if c["state"] in ("missed", "given up") and c["id"] not in seen]
 
     reasons = []
     if waiting:
         reasons.append(f"{waiting['id']} waits for a person to decide")
     if opened:
         reasons.append(f"{opened['id']} is open")
+    reasons += [claim_text(c) for c in unconfirmed]
     if len(recent) >= cfg.intro_every:
         start = last["id"] if last else "the start"
         reasons.append(f"{len(recent)} experiments judged since {start}, an introspection is due every {cfg.intro_every}")
@@ -237,6 +332,7 @@ def introspection_state(ledger: Ledger) -> dict[str, Any]:
         "judged_since": len(recent),
         "window": [e["id"] for e in recent],
         "stagnant": stagnant,
+        "unconfirmed": [c["id"] for c in unconfirmed],
     }
 
 
@@ -312,10 +408,12 @@ def next_action(ledger: Ledger, data: str | None = None, env: dict[str, Any] | N
     changed = ledger.changed_since_reload()
     if changed:
         return {"stage": "reload", "why": f"{', '.join(changed)} changed since the last reload"}
-    hit = target_met(ledger)
-    if hit:
-        return {"stage": "target", "target": hit["id"], "why": f"{hit['id']} reached the target", "stop": True}
+    hit = target_claim(ledger, lock, data)
+    if hit and hit["state"] == "confirmed":
+        return {"stage": "target", "target": hit["id"], "why": claim_text(hit), "stop": True}
     spent = budget(ledger)
+    if hit and not spent["hours_spent"]:  # the run that confirms it takes hours like any other
+        return {"stage": "confirm", "target": hit["id"], "split": hit["split"], "why": claim_text(hit)}
     for e in exps:
         if e["status"] == "paused":
             if spent["hours_spent"]:
@@ -323,7 +421,7 @@ def next_action(ledger: Ledger, data: str | None = None, env: dict[str, Any] | N
             how = (e.get("attempts") or [{}])[-1].get("paused", "it was interrupted")
             return {"stage": "resume", "target": e["id"], "why": how}
     if spent["spent"]:
-        return {"stage": "budget", "why": "; ".join(spent["spent"]), "stop": True}
+        return {"stage": "budget", "why": "; ".join(spent["spent"] + ([claim_text(hit)] if hit else [])), "stop": True}
     for e in exps:
         if e["status"] == "draft":
             if no_reference(e):

@@ -143,6 +143,11 @@ what you had only in your head. So write things down when they happen:
     steps, every setting. Nothing comes from the clock, an environment
     variable of your shell or a file that is not tracked. Only then can
     `arl exp reproduce` say whether a result holds.
+15. **A target reached once is a claim.** `arl next` says `confirm`, and the
+    experiment is run one more time where the loop never looked. One run
+    decides: do not repeat it to get another answer, and do not send
+    experiments to a confirming split to see how they would do there. A
+    split that is looked at until it agrees has been tuned on.
 
 ## Temptations
 
@@ -161,6 +166,7 @@ what you had only in your head. So write things down when they happen:
 | "That command was refused, I will find another way to get the same thing." | The refusal is the rule speaking. Do what its message says, and note it (`arl note --about work`). |
 | "Everyone knows that lesson, no need to record it." | The next session knows nothing. `arl lesson add`. |
 | "I will add a line to KNOWLEDGE.md for this result." | It is a distillation, not a log. Revise the statement the result changes, or move it between sections. |
+| "The confirming run missed the target by a hair. One more and it may pass." | One run decides, and a later, better one does not count. The result did not hold where the loop never looked: that is what the introspection is for. |
 | "A package is missing. One install and the run goes through." | The environment is the person's, and an install changes every later comparison. Stop and say what is missing. |
 | "It works in another environment, I will run it there." | Then the result is not this program's. Runs use the environment the contract names. Stop and say what is wrong with it. |
 | "I was told to stop, but this run is nearly done." | `arl pause` now. The run saves its state and continues later. |
@@ -216,6 +222,18 @@ what differs, and a baseline in the environment as it is now settles it. Before 
 the work was done: the run time is plausible, the instances were all scored,
 nothing was skipped. Results that flatter the method deserve the hardest look.
 
+**Confirm** (`arl exp reproduce <id> --split <name>`). Only when the contract
+sets a target. A kept result that reaches it on the first split is a claim,
+and `arl next` says `confirm`. The run it names takes the recorded code and
+params once more, on a split no experiment was scored on (on the first split
+again when the contract has no other). Met there as well, the program ends
+at `target`, a STOP. Missed, the target counts as not reached: the result
+stays the reference of its track, and an introspection is due. Its part 1
+asks why one split said yes and the other no: a gain smaller than the noise,
+or a method fitted to the split it was tuned on. A result reached under
+another evaluator or on other data files makes no claim: after either
+changes, the tracks are measured again.
+
 **Introspection** (`arl introspect new`, `arl introspect close`, `arl reload`).
 Due after a set number of judged experiments, after a run of experiments
 without a keep on one track, after a set number of days, or when you open one
@@ -265,8 +283,9 @@ away.
 **Going back.** Nothing that ran is lost. `arl exp show <id>` says what an old
 experiment was and what it ran with, `arl exp env <id>` what has changed in
 the environment since, `arl exp reproduce <id>` runs it again from its
-recorded commit and params (in the environment as it is now, and it says what
-differs), and `arl track new <name> --from <id>`
+recorded commit and params (in the environment and on the data files as they
+are now: it says what differs, and on other data it compares nothing), and
+`arl track new <name> --from <id>`
 opens a track at the code and params of that experiment, kept or not. When an
 earlier result looks better in hindsight than the path taken since, that is a
 `branch` for the next introspection, not a reason to rework the current track
@@ -287,8 +306,10 @@ At a STOP, or when asked how it is going:
 
 Stop and say so, with what you saw, when: a metric is NaN or far outside its
 usual range; the same failure repeats across experiments; the contract check
-fails; `arl next` says `environment` (the one the contract names is gone, or a
-package it names is missing); a run fails on an import; a result is too good
+fails; `arl next` says `environment` (the one the contract names is gone, or
+its python is another one); a run fails on an import; a run fails because the
+data files changed while it was going (somebody is writing them: find out
+who before running again); a result is too good
 to be explained by the change; you would need to touch something `PROGRAM.md`
 puts out of scope. An escalation is an
 introspection:

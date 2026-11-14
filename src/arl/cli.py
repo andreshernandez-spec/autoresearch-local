@@ -26,7 +26,7 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any, Callable, Generator
 
 from . import contract, render, rules, runner
 from .config import DECISIONS
@@ -104,10 +104,40 @@ def _data(ledger: Ledger) -> tuple[list[dict[str, Any]], str]:
 
 def _data_digest_or_none(ledger: Ledger) -> str | None:
     """For commands that only read: a missing data file must not stop them."""
-    try:
-        return _data(ledger)[1]
-    except ArlError:
-        return None
+    return runner.data_now(ledger)
+
+
+def _moved(ledger: Ledger, contract_digest: str | None, data: str | None, when: str) -> str:
+    """What changed under a job while it was going, in words, or "" when the contract and
+    the data files are what they were when it started. A run and a rerun ask this the
+    same way, after the job and after its evaluation: a result made while one of them
+    changed belongs to nothing that was recorded, and is not kept.
+
+    contract_digest: None for a job that is not scored. data: None when the record is
+    from before data files were written down.
+    """
+    if contract_digest is not None:
+        lock = contract.require(ledger)  # raises when the files no longer match the lock: the job touched them
+        if lock["digest"] != contract_digest:
+            return f"the contract was frozen anew {when} (it is v{lock['version']} now), so the result belongs to no contract that was recorded"
+    if data is not None and runner.data_now(ledger) != data:
+        return f"the data files changed {when}, so the result belongs to no data that was recorded"
+    return ""
+
+
+def _amend(ledger: Ledger, eid: str, change: Callable[[dict[str, Any]], None], wait: float = 120.0) -> dict[str, Any]:
+    """Change one record from the middle of a job, or when it has just ended.
+
+    The command that started the job read the record before it began, and another
+    command may have written to it since: a verdict given while a rerun is going.
+    So the change is made to the record as it is now, under the ledger lock, and
+    never by writing back the copy from before.
+    """
+    with ledger.held(wait):
+        rec = ledger.record(eid)
+        change(rec)
+        ledger.save_record(rec)
+    return rec
 
 
 ENV_IS_THE_CONTRACTS = (
@@ -172,9 +202,11 @@ def _gate_new_work(ledger: Ledger) -> None:
         raise ArlError(f"{state['last']} decided to stop the program. Only a person can reopen it.")
     if state["reload"]:
         raise ArlError(f"{state['reload']} is closed, but what it changed has not been read again. Run '{ARL} reload' first.")
-    hit = rules.target_met(ledger)
+    hit = rules.target_claim(ledger, contract.load(ledger), runner.data_now(ledger))
+    if hit and hit["state"] == "confirmed":
+        raise ArlError(f"{rules.claim_text(hit)}. That ends the program: run '{ARL} next'.")
     if hit:
-        raise ArlError(f"{hit['id']} reached the target. Run '{ARL} next'.")
+        raise ArlError(f"{hit['id']} reached the target on {hit['first']}. That has to be confirmed first: run '{ARL} next'.")
     spent = rules.budget(ledger)["spent"]
     if spent:
         raise ArlError("The budget is spent: " + "; ".join(spent))
@@ -293,10 +325,19 @@ def _pause_run(rec: dict[str, Any], how: str) -> None:
         rec.pop(key, None)
 
 
-def _seconds_since(started: str, log: Path) -> float:
-    """How long a part ran that nobody saw end: until its log was last written."""
+def _ran_for(started: str, signs: list[Path], until_now: bool = False) -> float:
+    """How long a job ran that nobody saw end.
+
+    until_now: it was still going when it was found, so it ran until this moment.
+    Otherwise until its last sign of life: the file arl marks every second while it
+    watches a job, the log, or what the job wrote into its output folder. A job
+    that says nothing is charged the time it ran all the same.
+    """
     try:
-        end = dt.datetime.fromtimestamp(log.stat().st_mtime).astimezone()
+        last = dt.datetime.now().timestamp() if until_now else runner.last_sign(signs)
+        if last is None:
+            return 0.0
+        end = dt.datetime.fromtimestamp(last).astimezone()
         return max(0.0, round((end - parse_time(started)).total_seconds(), 2))
     except (OSError, ValueError):
         return 0.0
@@ -310,6 +351,7 @@ def _settle(ledger: Ledger, rec: dict[str, Any], certain: bool = False) -> bool:
     """
     changed = False
     exp = ledger.exp_dir(rec["id"])
+    logs = exp / "logs"
     gone = rec["status"] == "running" and (certain or rules.stale(rec))
     if gone:
         sid = runner.session_of(rec.get("child"))
@@ -326,8 +368,8 @@ def _settle(ledger: Ledger, rec: dict[str, Any], certain: bool = False) -> bool:
         parts = attempt.setdefault("segments", [])
         if parts and "ended" not in parts[-1]:
             n = attempt["n"]
-            log = exp / "logs" / (f"eval-{n}.log" if attempt.get("run_done") else f"run-{n}.log")
-            parts[-1].update(ended=now(), ended_by="interrupted", seconds=_seconds_since(parts[-1]["started"], log))
+            signs = [logs / "heartbeat", logs / f"run-{n}.log", logs / f"eval-{n}.log", exp / "artifacts" / f"run-{n}"]
+            parts[-1].update(ended=now(), ended_by="interrupted", seconds=_ran_for(parts[-1]["started"], signs, until_now=left))
             if left:
                 parts[-1]["note"] = "the job it left behind was stopped"
         _pause_run(rec, "interrupted: the arl that ran it was gone" + (", the job it left behind was stopped" if left else ""))
@@ -339,9 +381,12 @@ def _settle(ledger: Ledger, rec: dict[str, Any], certain: bool = False) -> bool:
         tree = Path(rerun.get("tree", ""))
         if rerun.get("tree") and tree.exists():
             _drop_tree(ledger, tree)
-        seconds = _seconds_since(rerun["started"], exp / "logs" / f"rerun-{rerun['n']}.log")
-        entry = {"n": rerun["n"], "at": now(), "split": rerun["split"], "run_seconds": seconds}
+        n = rerun["n"]
+        signs = [logs / "heartbeat", logs / f"rerun-{n}.log", logs / f"rerun-eval-{n}.log", exp / "artifacts" / f"rerun-{n}-{rerun['split']}"]
+        entry = {"n": n, "at": now(), "split": rerun["split"], "run_seconds": _ran_for(rerun["started"], signs, until_now=left)}
+        entry.update({k: rerun[k] for k in ("eval_digest", "data_digest") if k in rerun})
         entry["failed"] = "interrupted: the arl that ran it was gone" + (", its job was stopped" if left else "")
+        entry["interrupted"] = True  # not a failure of the experiment: it does not count against a confirmation
         rec.setdefault("reruns", []).append(entry)
         rec.pop("rerun")
         changed = True
@@ -1227,11 +1272,14 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
         values = {"params": exp / "params.json", "out": out, "split": split, "home": ledger.home, "research": ledger.dir, "exp": exp, "worktree": path, "metrics": exp / "metrics.json"}
         env = _run_env(ledger, rec, values, resume=len(attempt["segments"]) > 1)
         limits = {"max_rss_gb": cfg.max_run_rss_gb, "min_free_ram_gb": cfg.stop_below_free_ram_gb}
-        pausing = {"pause_file": logs / "pause.request", "pause_grace": cfg.pause_grace}
+        pausing = {"pause_file": logs / "pause.request", "pause_grace": cfg.pause_grace, "heartbeat": logs / "heartbeat"}
         failed = paused = ""
         clock = time.monotonic()
+        measured_on = rec["conditions"].get("data_digest")
 
         def started(pid: int) -> None:
+            # No other command writes a record that says "running": each of them refuses it.
+            # So the copy held here is the record, until the outcome is written.
             rec["child"] = runner.child_ref(pid)  # so a later arl can stop the job if this one is killed
             ledger.save_record(rec)
 
@@ -1278,10 +1326,8 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
                     attempt["warning"] = "; ".join(filter(None, [attempt.get("warning"), note]))
                 if scored and not [a for a in rec["artifacts"] if not a["path"].startswith("checkpoint/")]:
                     failed = "the run wrote nothing into its output folder"
-            if not failed and not paused and scored:
-                lock_now = contract.require(ledger)  # the run itself must not have touched the evaluator
-                if lock_now["digest"] != rec["contract"]["digest"]:
-                    failed = f"the contract was frozen anew while the run was going (v{rec['contract']['version']} to v{lock_now['version']}), so this run cannot be scored"
+            if not failed and not paused:
+                failed = _moved(ledger, rec["contract"]["digest"] if scored else None, measured_on, "while the run was going")
             if not failed and not paused and scored:
                 (exp / "metrics.json").unlink(missing_ok=True)
                 ev = runner.execute(runner.substitute(cfg.eval_command, values), ledger.home, env, cfg.eval_timeout, logs / f"eval-{n}.log", on_start=started, **limits, **pausing)
@@ -1293,8 +1339,8 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
                     failed = f"the evaluator was stopped: {ev['stopped']}"
                 elif ev["exit_code"] != 0:
                     failed = f"the evaluator exited with code {ev['exit_code']}"
-                elif contract.require(ledger)["digest"] != rec["contract"]["digest"]:
-                    failed = "the contract was frozen anew while the evaluator was running, so this score cannot be trusted"
+                elif moved := _moved(ledger, rec["contract"]["digest"], measured_on, "while the evaluator was running"):
+                    failed = moved
                 else:
                     rec["metrics"] = runner.read_metrics(exp / "metrics.json", cfg)
                     rec["comparison"] = rules.compare(cfg, rec["metrics"], reference, repeat=repeat)
@@ -1565,6 +1611,10 @@ def cmd_exp_show(args: argparse.Namespace) -> int:
             value = fmt(r["metrics"][name]) if name in r.get("metrics", {}) else "not reported"
             changed = r.get("env_changed")
             other = f", in another environment ({runner.differences(changed['count'])}: {runner.short(changed['first'], 3)})" if changed else ""
+            if r.get("data_digest") not in (None, rec.get("conditions", {}).get("data_digest")):
+                other += ", on other data than the experiment read"
+            if "meets_target" in r:
+                other += ", meets the target" if r["meets_target"] else ", does not meet the target"
             print(f"  rerun {r['n']} on {r['split']}: {name} {value}" + (f", reproduced: {r['reproduced']}" if "reproduced" in r else "") + other)
     env = rec.get("conditions", {}).get("env")
     if env:
@@ -1679,6 +1729,7 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
             split = args.split or cfg.splits[0]
             if split not in cfg.splits:
                 raise ArlError(f"arl.toml knows the splits {cfg.splits}, not '{split}'")
+            fingerprint, data = _data(ledger)  # a rerun reads the data too: a file that is gone stops it here
             reasons = runner.busy(cfg)
             if reasons:
                 raise ArlError("The machine is busy, not starting:\n  " + "\n  ".join(reasons), EXIT_BUSY)
@@ -1692,15 +1743,29 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
                 _drop_tree(ledger, tree)
             (logs / "pause.request").unlink(missing_ok=True)  # an old request is not meant for this rerun
             env_now = runner.environment(ledger, probed)
-            rec["rerun"] = {"n": n, "split": split, "started": now(), "pid": os.getpid(), "pid_start": runner.proc_start(os.getpid()), "tree": str(tree)}
+            rec["rerun"] = {
+                "n": n,
+                "split": split,
+                "started": now(),
+                "pid": os.getpid(),
+                "pid_start": runner.proc_start(os.getpid()),
+                "tree": str(tree),
+                "eval_digest": lock["eval_digest"],
+                "data_digest": data,
+            }
             ledger.save_record(rec)
 
+        # From here on the record belongs to whoever writes it next: a verdict may be given
+        # while the rerun is going. 'rec' is read, never written back; see _amend.
         out.mkdir(parents=True)
         metrics_path = out / "metrics.json"
         values = {"params": exp / "params.json", "out": out, "split": split, "home": ledger.home, "research": ledger.dir, "exp": exp, "worktree": tree, "metrics": metrics_path}
         env = _run_env(ledger, rec, values, resume=False)
-        limits = {"max_rss_gb": cfg.max_run_rss_gb, "min_free_ram_gb": cfg.stop_below_free_ram_gb, "pause_file": logs / "pause.request", "pause_grace": cfg.pause_grace}
-        entry: dict[str, Any] = {"n": n, "at": now(), "split": split, "eval_digest": lock["eval_digest"], "env": env_now}
+        limits = {"max_rss_gb": cfg.max_run_rss_gb, "min_free_ram_gb": cfg.stop_below_free_ram_gb, "pause_file": logs / "pause.request", "pause_grace": cfg.pause_grace, "heartbeat": logs / "heartbeat"}
+        entry: dict[str, Any] = {"n": n, "at": now(), "split": split, "eval_digest": lock["eval_digest"], "data_digest": data, "env": env_now}
+        same_data = rec["conditions"].get("data_digest") in (None, data)
+        if not same_data:
+            entry["data"] = fingerprint  # what it read instead
         # A rerun does not put the old environment back. It says what is different now,
         # since that can explain a different result. Both package lists are in the ledger.
         differs = runner.env_differences(ledger, rec["conditions"].get("env"), env_now)
@@ -1714,8 +1779,19 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
         clock, failed, metrics = time.monotonic(), "", {}
 
         def started(pid: int) -> None:
-            rec["rerun"]["child"] = runner.child_ref(pid)
-            ledger.save_record(rec)
+            ref = runner.child_ref(pid)  # so a later arl can stop the job if this one is killed
+
+            def note(now_rec: dict[str, Any]) -> None:
+                if now_rec.get("rerun", {}).get("n") == n:
+                    now_rec["rerun"]["child"] = ref
+
+            _amend(ledger, eid, note)
+
+        def close(now_rec: dict[str, Any]) -> None:
+            """Put the rerun into the record as it is now. Once: a second call finds it done."""
+            if now_rec.get("rerun", {}).get("n") == n:
+                now_rec.setdefault("reruns", []).append(entry)
+                now_rec.pop("rerun")
 
         try:
             tree.parent.mkdir(parents=True, exist_ok=True)
@@ -1726,15 +1802,19 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
             entry["run_seconds"] = res["seconds"]
             if res["stopped"] or res["paused"] or res["exit_code"] != 0:
                 failed = f"the rerun failed ({why(res)})"
+                entry["interrupted"] = bool(res["paused"])
             elif not runner.manifest(out):
                 failed = "the rerun wrote nothing into its output folder"
+            else:
+                failed = _moved(ledger, lock["digest"], data, "during the rerun")
             if not failed:
                 ev = runner.execute(runner.substitute(cfg.eval_command, values), ledger.home, env, cfg.eval_timeout, logs / f"rerun-eval-{n}.log", on_start=started, **limits)
                 entry["eval_seconds"] = ev["seconds"]
                 if ev["stopped"] or ev["paused"] or ev["exit_code"] != 0:
                     failed = f"the evaluator failed on the rerun ({why(ev)})"
-                elif contract.require(ledger)["digest"] != lock["digest"]:
-                    failed = "the contract was frozen anew during the rerun"
+                    entry["interrupted"] = bool(ev["paused"])
+                elif moved := _moved(ledger, lock["digest"], data, "during the rerun"):
+                    failed = moved
                 else:
                     metrics = runner.read_metrics(metrics_path, cfg)
                     reported = runner.read_train_metrics(out / "train_metrics.json")[0]
@@ -1744,10 +1824,9 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
             failed = str(e).splitlines()[0]
         except BaseException:
             entry.setdefault("run_seconds", round(time.monotonic() - clock, 2))
-            entry["failed"] = "interrupted"
-            rec.setdefault("reruns", []).append(entry)
-            rec.pop("rerun", None)
-            ledger.save_record(rec)
+            entry.update(failed="interrupted", interrupted=True)
+            with contextlib.suppress(ArlError):
+                _amend(ledger, eid, close, wait=20)  # if the lock is taken, the next command finds the rerun and settles it
             with contextlib.suppress(ArlError):
                 _drop_tree(ledger, tree)
             raise
@@ -1756,29 +1835,35 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
                 with contextlib.suppress(ArlError):
                     _drop_tree(ledger, tree)
         entry.setdefault("run_seconds", round(time.monotonic() - clock, 2))
+        if not entry.get("interrupted"):
+            entry.pop("interrupted", None)
         primary = cfg.primary
+        same_eval = rec["contract"]["eval_digest"] == lock["eval_digest"]
         if failed:
             entry["failed"] = failed
         else:
             entry["metrics"] = metrics
-            if split == cfg.splits[0] and rec["contract"]["eval_digest"] == lock["eval_digest"]:
+            if split == cfg.splits[0] and same_eval and same_data:
                 diff = abs(metrics[primary.name] - rec["metrics"][primary.name])
                 entry["difference"] = diff
                 entry["reproduced"] = bool(diff <= max(primary.min_delta, 1e-12))
-
-        def store() -> None:
-            now_rec = ledger.record(eid)
-            now_rec.setdefault("reruns", []).append(entry)
-            now_rec.pop("rerun", None)
-            ledger.save_record(now_rec)
+            if primary.target is not None:
+                entry["meets_target"] = rules.meets_target(cfg, metrics)
 
         try:
             with ledger.locked(wait=900):
-                store()
+                now_rec = ledger.record(eid)
+                close(now_rec)
+                ledger.save_record(now_rec)
                 finish(ledger, f"{eid} rerun on {split}" + (" failed" if failed else ""))
         except ArlError as e:
-            if "rerun" in ledger.record(eid):
-                store()  # the result is kept even if it cannot be committed now
+            # The result is kept even if it cannot be committed now, or the ledger cannot be read.
+            try:
+                _amend(ledger, eid, close, wait=30)
+            except ArlError:
+                now_rec = ledger.record(eid)
+                close(now_rec)
+                ledger.save_record(now_rec)
             print(f"{eid}: the rerun is saved but could not be committed:\n  {e}", file=sys.stderr)
     if failed:
         print(f"{eid} rerun on split '{split}' FAILED: {failed}. Log: {logs / f'rerun-{n}.log'}")
@@ -1789,10 +1874,24 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
         print(f"  all of them: {ARL} exp env {eid}")
     else:
         print("  the environment is the one it first ran in, as far as it was recorded")
+    if not same_data:
+        print("  the data files are not the ones it first ran on: this is the recorded code on other data, not a repetition of the result")
     if "reproduced" in entry:
         print(f"  recorded {fmt(rec['metrics'][primary.name])}, difference {entry['difference']:.3g}, reproduced: {entry['reproduced']}")
     else:
-        print("  not compared with the recorded result (another split or another evaluator). Never used for a verdict.")
+        print("  not compared with the recorded result (another split, another evaluator or other data). Never used for a verdict.")
+    hit = rules.claim(ledger, ledger.record(eid), lock) if same_data else None
+    if hit and split in hit["splits"]:
+        goal = fmt(float(primary.target))
+        if entry["meets_target"] and hit["state"] == "missed":
+            print(f"  it meets the target of {goal} here, and rerun {hit['rerun']} on '{hit['split']}' did not. That run settled it: the target counts as not reached by {eid}.")
+        elif entry["meets_target"]:
+            print(f"  it meets the target of {goal} as well" + (": the target is confirmed." if hit["state"] == "confirmed" else "."))
+        else:
+            print(f"  it does not meet the target of {goal} here: the target counts as not reached by {eid}.")
+            print(f"  {eid} stays the reference of its track. Another run on '{split}' does not change this answer.")
+        print()
+        print(render.next_text(ledger, _next(ledger)), end="")
     return 0
 
 
@@ -1834,6 +1933,7 @@ def cmd_introspect_new(args: argparse.Namespace) -> int:
             "trigger": trigger,
             "opened": now(),
             "window": state["window"],
+            "unconfirmed": state["unconfirmed"],
             "activity_upto": len(events),
             "knowledge_sha256": ledger.knowledge_hash(),
             "lessons_general": len(ledger.lessons("general")),

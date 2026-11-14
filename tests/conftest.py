@@ -7,6 +7,7 @@ how close that is to a target it keeps to itself. Enough to exercise every gate.
 from __future__ import annotations
 
 import contextlib
+import datetime
 import io
 import json
 import re
@@ -104,13 +105,14 @@ keep = ["*.json", "*.csv"]
 command = "{python} research/eval/evaluate.py --out {{out}} --metrics {{metrics}} --split {{split}}"
 timeout_s = 60
 frozen = ["research/eval"]
-splits = ["dev", "confirm"]
+splits = [{splits}]
 
 [[metric]]
 name = "score"
 goal = "max"
 role = "primary"
 min_delta = 0.01
+{target}
 
 [[metric]]
 name = "cost"
@@ -158,7 +160,7 @@ class Project:
         path.write_text(_FILL.sub("Written for the test.", path.read_text()))
 
     def contract(self, **over) -> None:
-        cfg = dict(worktrees=str(self.base / "wt"), python=sys.executable, timeout=60, max_experiments=40, every=6, stagnation=4, extra="", grace=5, budget="")
+        cfg = dict(worktrees=str(self.base / "wt"), python=sys.executable, timeout=60, max_experiments=40, every=6, stagnation=4, extra="", grace=5, budget="", splits='"dev", "confirm"', target="")
         cfg.update(over)
         (self.research / "arl.toml").write_text(ARL_TOML.format(**cfg))
 
@@ -248,7 +250,9 @@ def cut_off(p: "Project", eid: str, child: dict | None = None) -> None:
     rec = p.record(eid)
     wt = p.ledger.worktree_path(rec["track"])
     code = git(wt, "rev-parse", "HEAD")
-    rec["attempts"].append({"n": len(rec["attempts"]) + 1, "started": LONG_AGO, "code_commit": code, "segments": [{"started": LONG_AGO}]})
+    # A job that is still going is charged until it is stopped: it started a moment ago, not last winter.
+    began = datetime.datetime.now().astimezone().isoformat(timespec="seconds") if child else LONG_AGO
+    rec["attempts"].append({"n": len(rec["attempts"]) + 1, "started": began, "code_commit": code, "segments": [{"started": began}]})
     rec.update(status="running", pid=DEAD_PID, pid_start=1, code_commit=code)
     rec.setdefault("contract", {k: lock[k] for k in ("version", "digest", "eval_digest")})
     rec.setdefault("conditions", {"command": p.ledger.cfg.run_command, "split": "dev", "worktree": str(wt), "data": [], "data_digest": runner.data_digest([])})

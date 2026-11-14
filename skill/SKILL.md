@@ -52,6 +52,9 @@ the user later says to go on, start at step 2 above with `arl resume`.
 - **The evaluator and the contract are not yours.** If `arl` says the frozen
   files changed, put them back or stop and tell the user. Never try to freeze.
 - **Scores come only from `arl exp run`.** No side runs of the evaluator.
+- **A target reached once is confirmed first.** `next` says `confirm`: one
+  run of that experiment on a split the loop never scored on. Do not repeat
+  it for a better answer; a miss goes to the introspection.
 - **Write the prediction before the run.** `design.md` is locked when the run
   starts, `params.json` too.
 - **Code changes go in the track's worktree** (the path is in the brief), are
@@ -115,7 +118,8 @@ decision the agent may not take alone leaves the loop waiting for the user.
 2. Write the contract with the user. Ask, do not guess:
    - the goal, and what "done" looks like;
    - what is measured, on which data, and which data is held back (a second
-     split for confirmation, if there is enough);
+     split for confirmation, if there is enough: a target ends the program
+     only once a run there says the same);
    - the primary metric, the smallest change that counts (`min_delta`), any
      constraints;
    - what the agent may change and what it may not;

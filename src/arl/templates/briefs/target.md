@@ -1,5 +1,4 @@
-STOP. {target} reached the target set in arl.toml.
+STOP. The target set in arl.toml is reached: {why}.
 
-Confirm it before telling anyone:  {arl} exp reproduce {target}
-and, if the contract has a second split, also with --split <name>.
-Then open an introspection, propose "stop", and report to the program owner.
+Nothing more is drafted or run. Open an introspection, propose "stop", and report to the program
+owner what was reached and where:  {arl} exp show {target}
