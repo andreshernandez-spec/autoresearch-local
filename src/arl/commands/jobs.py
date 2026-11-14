@@ -1,16 +1,22 @@
-"""A job arl started: what it is given, what may not change under it, and what is
-left to do when the arl that ran it is gone."""
+"""A job arl started: what it is given, the one path it takes from its start to its
+metrics, what may not change under it, and what is left to do when the arl that
+ran it is gone."""
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import datetime as dt
 import shutil
+import sys
+import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Generator
 
 from .. import contract, rules, runner
+from ..config import Config
 from ..ledger import Ledger
-from ..util import ArlError, now, parse_time
+from ..util import EXIT_BUSY, ArlError, now, parse_time
 from . import common
 from .common import ARL
 
@@ -30,6 +36,165 @@ def run_env(ledger: Ledger, rec: dict[str, Any], values: dict[str, Any], resume:
         ARL_CHECKPOINT_EVERY=f"{ledger.cfg.checkpoint_every:g}",
     )
     return env
+
+
+def places(exp: Path, what: str, n: int, split: str = "") -> tuple[Path, Path, Path]:
+    """Where a job writes: its output folder, its log and the evaluator's log.
+    what: "run" for attempt n of the experiment, "rerun" for its rerun n on a split."""
+    logs = exp / "logs"
+    if what == "run":
+        return exp / "artifacts" / f"run-{n}", logs / f"run-{n}.log", logs / f"eval-{n}.log"
+    return exp / "artifacts" / f"rerun-{n}-{split}", logs / f"rerun-{n}.log", logs / f"rerun-eval-{n}.log"
+
+
+def require_free_machine(cfg: Config) -> None:
+    reasons = runner.busy(cfg)
+    if reasons:
+        raise ArlError(
+            "The machine is busy, not starting:\n  " + "\n  ".join(reasons) + "\nWait and try again. Leave other jobs alone.",
+            EXIT_BUSY,
+        )
+
+
+# --- the one path of a job --------------------------------------------------------
+
+
+@dataclasses.dataclass
+class Step:
+    """One process of a job, the run or the evaluation of what it left: how long it
+    took and how it ended."""
+
+    seconds: float = 0.0
+    ended_by: str = ""  # finished, failed, paused or interrupted
+    exit_code: int | None = None  # None when the process never started, or nobody saw it end
+
+
+@dataclasses.dataclass
+class Job:
+    """What measure() is told about a run or a rerun."""
+
+    what: str  # "run" or "rerun": the word the messages use
+    command: str  # the run command, its placeholders not filled yet
+    cwd: Path  # the worktree it runs in
+    values: dict[str, Any]  # what fills the placeholders of the run command and the evaluator's
+    env: dict[str, str]
+    log: Path
+    eval_log: Path
+    contract: str | None  # the digest of the contract it is scored under. None: not scored, so not evaluated
+    data: str | None  # the digest of the data files it reads. None: a record from before they were written down
+    timeout: float  # seconds the run may take, over all its parts
+    used: float = 0.0  # seconds the earlier parts of the run took
+    on_start: Callable[[int], None] | None = None  # told the pid of each process when it starts
+    run_ended: Callable[[Step], None] | None = None  # told how the run ended, once, the moment it does
+    evaluation_ended: Callable[[Step], None] | None = None  # the same for the evaluation
+    same_code: Callable[[], bool] | None = None  # whether the worktree still holds the commit that was recorded
+
+
+@dataclasses.dataclass
+class Outcome:
+    """What came of a job."""
+
+    failed: str = ""  # why it does not count
+    paused: str = ""  # why it stopped early without failing, when it did
+    artifacts: list[dict[str, Any]] | None = None  # what the run left, before the evaluator added to it
+    train_metrics: dict[str, float] = dataclasses.field(default_factory=dict)  # what the run says about itself
+    note: str = ""  # why that could not be read, when it could not
+    metrics: dict[str, float] | None = None  # the evaluator's numbers
+
+    @property
+    def went_on(self) -> bool:
+        return not (self.failed or self.paused)
+
+
+@contextlib.contextmanager
+def _booked(ended: Callable[[Step], None] | None) -> Generator[Step, None, None]:
+    """One step of a job. However it ends, it ends once and what it took is told at that
+    moment: "failed" when arl refused something in the middle, "interrupted" when arl
+    itself is being stopped. Time that nobody books is time the budget never sees."""
+    step, clock = Step(), time.monotonic()
+    try:
+        yield step
+    except ArlError:
+        step.ended_by = "failed"
+        raise
+    except BaseException:
+        step.ended_by = "interrupted"
+        raise
+    finally:
+        if step.exit_code is None:  # the process did not come back: count the time until now
+            step.seconds = round(time.monotonic() - clock, 2)
+        if ended is not None:
+            ended(step)
+
+
+def measure(ledger: Ledger, job: Job, run: bool = True) -> Outcome:
+    """Run a job and evaluate what it left. A run and a rerun both go this way.
+
+    The job, within its limits. Then what must still be as it was recorded: the
+    code, the contract, the data files. Then the evaluator, the same questions
+    again, and the metrics. Whatever goes wrong on the way is the reason the job
+    failed. A job that was asked to save its state and stop has not failed: it
+    is paused.
+
+    run: False when an earlier part of the run finished the job itself and only
+    the evaluation is left.
+    Raises only when arl itself is being stopped. The step that was going is
+    booked before that, like any other.
+    """
+    cfg, got = ledger.cfg, Outcome()
+    out, metrics = Path(job.values["out"]), Path(job.values["metrics"])
+    watch: dict[str, Any] = {
+        "max_rss_gb": cfg.max_run_rss_gb,
+        "min_free_ram_gb": cfg.stop_below_free_ram_gb,
+        "pause_file": job.log.parent / "pause.request",
+        "pause_grace": cfg.pause_grace,
+        "heartbeat": job.log.parent / "heartbeat",
+        "on_start": job.on_start,
+    }
+    try:
+        if run:
+            with _booked(job.run_ended) as step:
+                left = job.timeout - job.used
+                if left <= 0:
+                    got.failed = f"the {job.what} passed its limit of {job.timeout:.0f} s over all its parts"
+                else:
+                    res = runner.execute(runner.substitute(job.command, job.values), job.cwd, job.env, left, job.log, **watch)
+                    step.seconds, step.exit_code = res["seconds"], res["exit_code"]
+                    if res["paused"]:
+                        got.paused = res["paused"]
+                    elif res["stopped"]:
+                        got.failed = f"the {job.what} was stopped: {res['stopped']}"
+                    elif res["exit_code"] != 0:
+                        got.failed = f"the {job.what} exited with code {res['exit_code']}"
+                    elif job.same_code is not None and not job.same_code():
+                        got.failed = f"the code in the worktree changed while the {job.what} was going, so the result does not belong to the recorded commit"
+                step.ended_by = "paused" if got.paused else "failed" if got.failed else "finished"
+        if got.went_on:
+            got.artifacts = runner.manifest(out)
+            got.train_metrics, got.note = runner.read_train_metrics(out / "train_metrics.json")
+            if job.contract is not None and not [a for a in got.artifacts if not a["path"].startswith("checkpoint/")]:
+                got.failed = f"the {job.what} wrote nothing into its output folder"  # saved state is not a result
+            else:
+                got.failed = moved(ledger, job.contract, job.data, f"while the {job.what} was going")
+        if got.went_on and job.contract is not None:
+            metrics.unlink(missing_ok=True)
+            with _booked(job.evaluation_ended) as step:
+                ev = runner.execute(runner.substitute(cfg.eval_command, job.values), ledger.home, job.env, cfg.eval_timeout, job.eval_log, **watch)
+                step.seconds, step.exit_code = ev["seconds"], ev["exit_code"]
+                if ev["paused"]:
+                    got.paused = f"{ev['paused']} (during the evaluation; the {job.what} itself is complete)"
+                elif ev["stopped"]:
+                    got.failed = f"the evaluator was stopped: {ev['stopped']}"
+                elif ev["exit_code"] != 0:
+                    got.failed = f"the evaluator exited with code {ev['exit_code']}"
+                else:
+                    got.failed = moved(ledger, job.contract, job.data, "while the evaluator was running")
+                if got.went_on:
+                    got.metrics = runner.read_metrics(metrics, cfg)
+                step.ended_by = "paused" if got.paused else "failed" if got.failed else "finished"
+    except ArlError as e:
+        got.failed = str(e)
+    return got
 
 
 def moved(ledger: Ledger, contract_digest: str | None, data: str | None, when: str) -> str:
@@ -63,6 +228,28 @@ def amend(ledger: Ledger, eid: str, change: Callable[[dict[str, Any]], None], wa
         change(rec)
         ledger.save_record(rec)
     return rec
+
+
+def keep_outcome(ledger: Ledger, eid: str, write: Callable[[], None], message: str, what: str = "outcome") -> None:
+    """The job is over: put what came of it into the record and commit.
+
+    The outcome must not be lost because git or the home checkout is in the way.
+    Then it is saved all the same, and the next command that writes the ledger
+    commits it.
+    write: puts the outcome into the record and saves it. It is called a second
+    time when the first could not be committed, and must then change nothing.
+    """
+    try:
+        with ledger.locked(wait=900):
+            write()
+            common.finish(ledger, message)
+    except ArlError as e:
+        try:
+            with ledger.held(30):
+                write()
+        except ArlError:
+            write()  # the lock is taken or the ledger cannot be read: the record of this experiment is written anyway
+        print(f"{eid}: the {what} is saved but could not be committed:\n  {e}\nFix that; the next arl command that writes the ledger commits it.", file=sys.stderr)
 
 
 # --- what a dead or interrupted process left --------------------------------------
@@ -107,6 +294,19 @@ def ran_for(started: str, signs: list[Path], until_now: bool = False) -> float:
         return 0.0
 
 
+def _stop_leftover(child: dict[str, Any] | None, grace: float = runner.QUICK_GRACE) -> bool:
+    """Stop the job a dead arl left behind. True when something was still going."""
+    sid = runner.session_of(child)
+    return bool(sid and runner.stop_session(sid, grace))
+
+
+def _signs(exp: Path, what: str, n: int, split: str = "") -> list[Path]:
+    """Where a job leaves signs of life: the file arl marks while it watches, the two logs,
+    the output folder."""
+    out, log, eval_log = places(exp, what, n, split)
+    return [log.parent / "heartbeat", log, eval_log, out]
+
+
 def settle(ledger: Ledger, rec: dict[str, Any], certain: bool = False) -> bool:
     """A record says a job is going, but the arl that ran it is gone.
 
@@ -115,11 +315,8 @@ def settle(ledger: Ledger, rec: dict[str, Any], certain: bool = False) -> bool:
     """
     changed = False
     exp = ledger.exp_dir(rec["id"])
-    logs = exp / "logs"
     gone = rec["status"] == "running" and (certain or rules.stale(rec))
-    if gone:
-        sid = runner.session_of(rec.get("child"))
-        left = bool(sid and runner.stop_session(sid, ledger.cfg.pause_grace))
+    left = gone and _stop_leftover(rec.get("child"), ledger.cfg.pause_grace)  # a run gets the time to save its state
     if gone and not ("code_commit" in rec and "contract" in rec):
         # It was marked as running and never got as far as starting: back to where it was.
         rec["attempts"] = [a for a in rec.get("attempts", []) if a.get("code_commit")]
@@ -131,23 +328,19 @@ def settle(ledger: Ledger, rec: dict[str, Any], certain: bool = False) -> bool:
         attempt = rec["attempts"][-1]
         parts = attempt.setdefault("segments", [])
         if parts and "ended" not in parts[-1]:
-            n = attempt["n"]
-            signs = [logs / "heartbeat", logs / f"run-{n}.log", logs / f"eval-{n}.log", exp / "artifacts" / f"run-{n}"]
-            parts[-1].update(ended=now(), ended_by="interrupted", seconds=ran_for(parts[-1]["started"], signs, until_now=left))
+            parts[-1].update(ended=now(), ended_by="interrupted", seconds=ran_for(parts[-1]["started"], _signs(exp, "run", attempt["n"]), until_now=left))
             if left:
                 parts[-1]["note"] = "the job it left behind was stopped"
         pause_run(rec, "interrupted: the arl that ran it was gone" + (", the job it left behind was stopped" if left else ""))
         changed = True
     rerun = rec.get("rerun")
     if rerun and (certain or not runner.alive(rerun.get("pid"), rerun.get("pid_start"))):
-        sid = runner.session_of(rerun.get("child"))
-        left = bool(sid and runner.stop_session(sid))
+        left = _stop_leftover(rerun.get("child"))
         tree = Path(rerun.get("tree", ""))
         if rerun.get("tree") and tree.exists():
             drop_tree(ledger, tree)
-        n = rerun["n"]
-        signs = [logs / "heartbeat", logs / f"rerun-{n}.log", logs / f"rerun-eval-{n}.log", exp / "artifacts" / f"rerun-{n}-{rerun['split']}"]
-        entry = {"n": n, "at": now(), "split": rerun["split"], "run_seconds": ran_for(rerun["started"], signs, until_now=left)}
+        signs = _signs(exp, "rerun", rerun["n"], rerun["split"])
+        entry = {"n": rerun["n"], "at": now(), "split": rerun["split"], "run_seconds": ran_for(rerun["started"], signs, until_now=left)}
         entry.update({k: rerun[k] for k in ("eval_digest", "data_digest") if k in rerun})
         entry["failed"] = "interrupted: the arl that ran it was gone" + (", its job was stopped" if left else "")
         entry["interrupted"] = True  # not a failure of the experiment: it does not count against a confirmation

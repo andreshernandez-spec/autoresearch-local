@@ -34,9 +34,13 @@ enforced. `PROTOCOL.md` is what an agent reads before using it.
   verdict given while a rerun is going). It changes the record as it is
   now, under the ledger lock (`jobs.amend`). The one exception is `exp run`,
   because every other command refuses a record that says `running`.
-- What must still be as recorded when a job ends (the contract, the data
-  files) is asked in one place, `jobs.moved`, by runs and reruns alike, after
-  the job and after its evaluation. A new condition goes there.
+- A run and a rerun take one path from the start of the job to its metrics,
+  `jobs.measure`: the job within its limits, what must still be as recorded
+  (the code in the worktree, and in `jobs.moved` the contract and the data
+  files), the evaluator, the same questions again, the metrics. A new check
+  on a job goes there, never into one of the two commands. What a step took
+  is booked the moment it ends, whatever ends it (`run_ended`,
+  `evaluation_ended`).
 - An interruption is not a failure. A part of a run that ends because arl or
   the job was stopped from outside leaves the run `paused`; only what the job
   itself did wrong uses up an attempt.
@@ -73,8 +77,8 @@ enforced. `PROTOCOL.md` is what an agent reads before using it.
 |---|---|
 | `src/arl/cli.py` | the parser, and what happens to what was typed |
 | `src/arl/commands/common.py` | what every command leans on: who is asking, the gates, the worktrees, the ledger lock that finishes a verdict left half applied |
-| `src/arl/commands/jobs.py` | a job arl started: what may not change under it (`moved`), writing to a record in the middle of one (`amend`), what a dead or interrupted process left (`settle`) |
-| `src/arl/commands/runs.py` | `exp run` and `exp reproduce`, and the order of their checks |
+| `src/arl/commands/jobs.py` | a job arl started: the one path a run and a rerun take (`measure`), what may not change under it (`moved`), writing to a record in the middle of one (`amend`), keeping its outcome (`keep_outcome`), what a dead or interrupted process left (`settle`) |
+| `src/arl/commands/runs.py` | `exp run` and `exp reproduce`: the checks before a job starts, and where each writes what came of it |
 | `src/arl/commands/experiments.py` | an experiment from its draft to its verdict (`exp judge` and the order of its checks), and looking one up |
 | `src/arl/commands/` the rest | `project.py` (init, freeze, status, next, verify), `session.py` (pause, resume, reload, notes, lessons), `tracks.py`, `hypotheses.py` (and ideas), `introspections.py` |
 | `src/arl/rules.py` | outcome of a result, allowed verdicts, when an introspection is due, the budget, what comes next |

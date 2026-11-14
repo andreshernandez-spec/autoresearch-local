@@ -1003,9 +1003,51 @@ def test_data_that_changes_during_a_rerun_fails_it(project: Project, monkeypatch
     data, _ = with_data(p)
     after_the_run(monkeypatch, lambda: data.write_text("two\n"))
     out = p.arl("exp", "reproduce", "E0001", code=2)
-    assert "the data files changed during the rerun" in out
+    assert "the data files changed while the rerun was going" in out
     rerun = p.record("E0001")["reruns"][0]
     assert "metrics" not in rerun and "reproduced" not in rerun
+
+
+def test_code_that_changes_during_a_rerun_fails_it(project: Project, monkeypatch):
+    """A rerun asks what a run asks: is the worktree still the commit that was recorded."""
+    p = project
+    p.started()
+    tree = p.base / "wt" / "toy-rerun-E0001-1"
+    after_the_run(monkeypatch, lambda: (tree / "run.py").write_text("print('not what was recorded')\n"))
+    out = p.arl("exp", "reproduce", "E0001", code=2)
+    assert "the code in the worktree changed while the rerun was going" in out
+    rerun = p.record("E0001")["reruns"][0]
+    assert "metrics" not in rerun and not tree.exists()
+
+
+def test_evaluation_cut_short_is_charged_and_only_it_is_done_again(project: Project, monkeypatch):
+    """arl is stopped while the evaluator is going: its time is booked, the run itself is
+    complete and is not made again."""
+    p = project
+    h = p.started()
+    eid = p.draft("tune", hyps=(h,), params={"x": 0.5})
+    real, calls = runner.execute, []
+
+    def execute(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:  # the evaluator
+            time.sleep(1.2)
+            raise KeyboardInterrupt
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "execute", execute)
+    p.arl("exp", "run", eid, code=130)
+    rec = p.record(eid)
+    attempt = rec["attempts"][0]
+    assert rec["status"] == "paused" and attempt["run_done"] is True and attempt["eval_seconds"] >= 1.0
+    assert [s["ended_by"] for s in attempt["segments"]] == ["finished"]
+    monkeypatch.setattr(runner, "execute", real)
+    ran = attempt["run_seconds"]
+    p.arl("exp", "run", eid)
+    rec = p.record(eid)
+    attempt = rec["attempts"][0]
+    assert rec["status"] == "evaluated" and attempt["run_seconds"] == ran and attempt["eval_seconds"] > 1.0
+    assert not (p.ledger.exp_dir(eid) / "logs" / "run-2.log").exists() and len(rec["attempts"]) == 1
 
 
 def start_quiet_run(p: Project, h: str):

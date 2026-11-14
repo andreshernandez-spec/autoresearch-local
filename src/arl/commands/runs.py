@@ -8,25 +8,13 @@ import datetime as dt
 import json
 import os
 import shutil
-import sys
 import time
 from typing import Any
 
 from .. import contract, render, rules, runner
+from ..gitops import Git
 from ..ledger import Ledger
-from ..util import (
-    EXIT_BUSY,
-    EXIT_CRASH,
-    EXIT_PAUSED,
-    ArlError,
-    canonical,
-    check_id,
-    fmt,
-    now,
-    require_filled,
-    sha256_text,
-    write_text,
-)
+from ..util import EXIT_CRASH, EXIT_PAUSED, ArlError, canonical, check_id, fmt, now, require_filled, sha256_text, write_text
 from . import common, jobs
 from .common import ARL
 
@@ -123,12 +111,7 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
                         rec["duplicate_of"], rec["duplicate_reason"] = other["id"], args.allow_duplicate
             if typ in ("tune", "feature") and reference is None:
                 raise ArlError(f"track {rec['track']} has no reference under contract v{lock['version']} and the data as it is. {again} Then run a baseline first.")
-            reasons = runner.busy(cfg)
-            if reasons:
-                raise ArlError(
-                    "The machine is busy, not starting:\n  " + "\n  ".join(reasons) + "\nWait and try again. Leave other jobs alone.",
-                    EXIT_BUSY,
-                )
+            jobs.require_free_machine(cfg)
 
             # All checks passed. Mark it as running and lock the design; if that
             # cannot be committed, nothing ran and nothing is counted.
@@ -158,15 +141,9 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
                 ledger.save_record(json.loads(before))
                 raise
 
-        out, logs = exp / "artifacts" / f"run-{n}", exp / "logs"
+        out, log, eval_log = jobs.places(exp, "run", n)
         out.mkdir(parents=True, exist_ok=True)
         values = {"params": exp / "params.json", "out": out, "split": split, "home": ledger.home, "research": ledger.dir, "exp": exp, "worktree": path, "metrics": exp / "metrics.json"}
-        env = jobs.run_env(ledger, rec, values, resume=len(attempt["segments"]) > 1)
-        limits = {"max_rss_gb": cfg.max_run_rss_gb, "min_free_ram_gb": cfg.stop_below_free_ram_gb}
-        pausing = {"pause_file": logs / "pause.request", "pause_grace": cfg.pause_grace, "heartbeat": logs / "heartbeat"}
-        failed = paused = ""
-        clock = time.monotonic()
-        measured_on = rec["conditions"].get("data_digest")
 
         def started(pid: int) -> None:
             # No other command writes a record that says "running": each of them refuses it.
@@ -174,96 +151,80 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
             rec["child"] = runner.child_ref(pid)  # so a later arl can stop the job if this one is killed
             ledger.save_record(rec)
 
-        def close_part(how: str, seconds: float) -> None:
-            part.update(ended=now(), ended_by=how, seconds=round(part.get("seconds", 0) + seconds, 2))
+        def run_ended(step: jobs.Step) -> None:
+            part.update(ended=now(), ended_by=step.ended_by, seconds=round(part.get("seconds", 0) + step.seconds, 2))
             attempt["run_seconds"] = round(sum(s.get("seconds", 0) for s in attempt["segments"]), 2)
+            if step.exit_code is None:
+                return  # it was not started, or arl was stopped while it was going
+            attempt["exit_code"] = step.exit_code
+            if step.ended_by == "finished":
+                attempt["run_done"] = True
+            write_text(exp / "run.tail.txt", runner.tail(log))
+            saved = runner.last_checkpoint(out)
+            if saved:
+                attempt["last_checkpoint"] = dt.datetime.fromtimestamp(saved).astimezone().isoformat(timespec="seconds")
+            elif cfg.checkpoint_every and step.seconds > 3 * cfg.checkpoint_every:
+                attempt["warning"] = f"this part ran {step.seconds:.0f} s and saved no state under {{out}}/checkpoint: a pause loses that work"
 
+        def evaluation_ended(step: jobs.Step) -> None:
+            attempt["eval_seconds"] = round(attempt.get("eval_seconds", 0) + step.seconds, 2)
+            if step.exit_code is not None:
+                write_text(exp / "eval.tail.txt", runner.tail(eval_log))
+
+        job = jobs.Job(
+            what="run",
+            command=command,
+            cwd=path,
+            values=values,
+            env=jobs.run_env(ledger, rec, values, resume=len(attempt["segments"]) > 1),
+            log=log,
+            eval_log=eval_log,
+            contract=rec["contract"]["digest"] if scored else None,
+            data=rec["conditions"].get("data_digest"),
+            timeout=cfg.run_timeout,
+            used=sum(s.get("seconds", 0) for s in attempt["segments"][:-1]),
+            on_start=started,
+            run_ended=run_ended,
+            evaluation_ended=evaluation_ended,
+            same_code=lambda: wgit.branch() == rec["branch"] and wgit.head() == code and not wgit.tracked_changes(),
+        )
         try:
-            if not attempt.get("run_done"):
-                used = sum(s.get("seconds", 0) for s in attempt["segments"][:-1])
-                left = cfg.run_timeout - used
-                if left <= 0:
-                    close_part("failed", 0)
-                    failed = f"the run passed its limit of {cfg.run_timeout:.0f} s over all its parts"
-                else:
-                    res = runner.execute(runner.substitute(command, values), path, env, left, logs / f"run-{n}.log", on_start=started, **limits, **pausing)
-                    attempt["exit_code"] = res["exit_code"]
-                    write_text(exp / "run.tail.txt", runner.tail(logs / f"run-{n}.log"))
-                    saved = runner.last_checkpoint(out)
-                    if saved:
-                        attempt["last_checkpoint"] = dt.datetime.fromtimestamp(saved).astimezone().isoformat(timespec="seconds")
-                    elif cfg.checkpoint_every and res["seconds"] > 3 * cfg.checkpoint_every:
-                        attempt["warning"] = f"this part ran {res['seconds']:.0f} s and saved no state under {{out}}/checkpoint: a pause loses that work"
-                    if res["paused"]:
-                        paused = res["paused"]
-                        close_part("paused", res["seconds"])
-                    elif res["stopped"]:
-                        failed = f"the run was stopped: {res['stopped']}"
-                    elif res["exit_code"] != 0:
-                        failed = f"the run exited with code {res['exit_code']}"
-                    elif wgit.branch() != rec["branch"] or wgit.head() != code or wgit.tracked_changes():
-                        failed = "the code in the worktree changed while the run was going, so the result does not belong to the recorded commit"
-                    if failed:
-                        close_part("failed", res["seconds"])
-                    elif not paused:
-                        close_part("finished", res["seconds"])
-                        attempt["run_done"] = True
-            if not failed and not paused:
-                rec["artifacts"] = runner.manifest(out)  # what the run left, before the evaluator adds to it
-                reported, note = runner.read_train_metrics(out / "train_metrics.json")
-                if reported:
-                    rec["train_metrics"] = reported  # what the run says about itself: kept, never compared
-                if note:
-                    attempt["warning"] = "; ".join(filter(None, [attempt.get("warning"), note]))
-                if scored and not [a for a in rec["artifacts"] if not a["path"].startswith("checkpoint/")]:
-                    failed = "the run wrote nothing into its output folder"
-            if not failed and not paused:
-                failed = jobs.moved(ledger, rec["contract"]["digest"] if scored else None, measured_on, "while the run was going")
-            if not failed and not paused and scored:
-                (exp / "metrics.json").unlink(missing_ok=True)
-                ev = runner.execute(runner.substitute(cfg.eval_command, values), ledger.home, env, cfg.eval_timeout, logs / f"eval-{n}.log", on_start=started, **limits, **pausing)
-                attempt["eval_seconds"] = round(attempt.get("eval_seconds", 0) + ev["seconds"], 2)
-                write_text(exp / "eval.tail.txt", runner.tail(logs / f"eval-{n}.log"))
-                if ev["paused"]:
-                    paused = f"{ev['paused']} (during the evaluation; the run itself is complete)"
-                elif ev["stopped"]:
-                    failed = f"the evaluator was stopped: {ev['stopped']}"
-                elif ev["exit_code"] != 0:
-                    failed = f"the evaluator exited with code {ev['exit_code']}"
-                elif moved := jobs.moved(ledger, rec["contract"]["digest"], measured_on, "while the evaluator was running"):
-                    failed = moved
-                else:
-                    rec["metrics"] = runner.read_metrics(exp / "metrics.json", cfg)
-                    rec["comparison"] = rules.compare(cfg, rec["metrics"], reference, repeat=repeat)
-        except ArlError as e:
-            failed = str(e)
-            if "ended" not in part:
-                close_part("failed", time.monotonic() - clock)
+            got = jobs.measure(ledger, job, run=not attempt.get("run_done"))
+            if got.artifacts is not None:
+                rec["artifacts"] = got.artifacts
+            if got.train_metrics:
+                rec["train_metrics"] = got.train_metrics  # what the run says about itself: kept, never compared
+            if got.note:
+                attempt["warning"] = "; ".join(filter(None, [attempt.get("warning"), got.note]))
+            if got.metrics is not None:
+                rec["metrics"] = got.metrics
+                rec["comparison"] = rules.compare(cfg, got.metrics, reference, repeat=repeat)
         except BaseException:
             # arl itself is being stopped (a closed terminal, Ctrl-C). The job was given the
             # time to save its state. This is an interruption, not a failure.
-            if "ended" not in part:
-                close_part("interrupted", time.monotonic() - clock)
             jobs.pause_run(rec, "interrupted: arl was stopped while the run was going")
             ledger.save_record(rec)
             with contextlib.suppress(ArlError):
                 with ledger.locked():
                     common.finish(ledger, f"{eid} interrupted")
             raise
+        failed, paused = got.failed, got.paused
 
-        def write_outcome() -> str:
+        def write_outcome() -> None:
+            if rec["status"] != "running":
+                return  # written already, and it could not be committed then
             attempt["ended"] = now()
             for key in ("pid", "pid_start", "child"):
                 rec.pop(key, None)
             if failed:
                 jobs.fail(rec, failed)
                 ledger.save_record(rec)
-                return f"{eid} failed, attempt {n}"
+                return
             if paused:
                 attempt.pop("ended")
                 jobs.pause_run(rec, paused)
                 ledger.save_record(rec)
-                return f"{eid} paused"
+                return
             rec["status"] = "evaluated"
             rec["kept"] = runner.keep_small(out, exp / "kept", cfg.keep, cfg.keep_max_kb)
             ledger.save_record(rec)  # the result is safe before anything else is written about it
@@ -273,17 +234,14 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
             except (ArlError, KeyError) as e:
                 facts = f"Written by arl. The table of results could not be written ({e}). The numbers are in metrics.json and record.json."
             write_text(exp / "analysis.md", render.fill(render.template(f"analysis_{kind}.md"), id=eid, facts=facts))
-            return f"{eid} result" + (f", {cfg.primary.name} {fmt(rec['metrics'][cfg.primary.name])}" if scored else "")
 
-        try:
-            with ledger.locked(wait=900):
-                common.finish(ledger, write_outcome())
-        except ArlError as e:
-            # The run is over and its outcome must not be lost because git or the home
-            # checkout is in the way: save the record, leave the commit for later.
-            if rec["status"] == "running":
-                write_outcome()
-            print(f"{eid}: the outcome is saved but could not be committed:\n  {e}\nFix that; the next arl command that writes the ledger commits it.", file=sys.stderr)
+        if failed:
+            message = f"{eid} failed, attempt {n}"
+        elif paused:
+            message = f"{eid} paused"
+        else:
+            message = f"{eid} result" + (f", {cfg.primary.name} {fmt(rec['metrics'][cfg.primary.name])}" if scored else "")
+        jobs.keep_outcome(ledger, eid, write_outcome, message)
 
     if failed:
         print(f"{eid} FAILED (attempt {n} of {cfg.max_attempts}): {failed}")
@@ -320,18 +278,16 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
             if split not in cfg.splits:
                 raise ArlError(f"arl.toml knows the splits {cfg.splits}, not '{split}'")
             fingerprint, data = common.data_files(ledger)  # a rerun reads the data too: a file that is gone stops it here
-            reasons = runner.busy(cfg)
-            if reasons:
-                raise ArlError("The machine is busy, not starting:\n  " + "\n  ".join(reasons), EXIT_BUSY)
+            jobs.require_free_machine(cfg)
             exp = ledger.exp_dir(eid)
             n = max([r["n"] for r in rec.get("reruns", [])], default=0) + 1  # failed reruns keep their number
             tree = ledger.worktree_root() / f"{cfg.name}-rerun-{eid}-{n}"
-            out, logs = exp / "artifacts" / f"rerun-{n}-{split}", exp / "logs"
+            out, log, eval_log = jobs.places(exp, "rerun", n, split)
             if out.exists():
                 shutil.rmtree(out)  # nothing recorded owns it: a rerun starts in an empty folder
             if tree.exists():
                 jobs.drop_tree(ledger, tree)
-            (logs / "pause.request").unlink(missing_ok=True)  # an old request is not meant for this rerun
+            (log.parent / "pause.request").unlink(missing_ok=True)  # an old request is not meant for this rerun
             env_now = runner.environment(ledger, probed)
             rec["rerun"] = {
                 "n": n,
@@ -348,10 +304,7 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
         # From here on the record belongs to whoever writes it next: a verdict may be given
         # while the rerun is going. 'rec' is read, never written back; see jobs.amend.
         out.mkdir(parents=True)
-        metrics_path = out / "metrics.json"
-        values = {"params": exp / "params.json", "out": out, "split": split, "home": ledger.home, "research": ledger.dir, "exp": exp, "worktree": tree, "metrics": metrics_path}
-        env = jobs.run_env(ledger, rec, values, resume=False)
-        limits = {"max_rss_gb": cfg.max_run_rss_gb, "min_free_ram_gb": cfg.stop_below_free_ram_gb, "pause_file": logs / "pause.request", "pause_grace": cfg.pause_grace, "heartbeat": logs / "heartbeat"}
+        values = {"params": exp / "params.json", "out": out, "split": split, "home": ledger.home, "research": ledger.dir, "exp": exp, "worktree": tree, "metrics": out / "metrics.json"}
         entry: dict[str, Any] = {"n": n, "at": now(), "split": split, "eval_digest": lock["eval_digest"], "data_digest": data, "env": env_now}
         same_data = rec["conditions"].get("data_digest") in (None, data)
         if not same_data:
@@ -361,12 +314,6 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
         differs = runner.env_differences(ledger, rec["conditions"].get("env"), env_now)
         if differs:
             entry["env_changed"] = {"count": len(differs), "first": differs[:20]}
-
-        def why(res: dict[str, Any]) -> str:
-            if res["paused"]:
-                return f"stopped: {res['paused']}. A rerun is not continued, run it again"
-            return res["stopped"] or f"exit {res['exit_code']}"
-        clock, failed, metrics = time.monotonic(), "", {}
 
         def started(pid: int) -> None:
             ref = runner.child_ref(pid)  # so a later arl can stop the job if this one is killed
@@ -383,35 +330,37 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
                 now_rec.setdefault("reruns", []).append(entry)
                 now_rec.pop("rerun")
 
+        wtree = Git(tree)
+        job = jobs.Job(
+            what="rerun",
+            command=rec.get("command") or cfg.run_command,
+            cwd=tree,
+            values=values,
+            env=jobs.run_env(ledger, rec, values, resume=False),
+            log=log,
+            eval_log=eval_log,
+            contract=lock["digest"],
+            data=data,
+            timeout=cfg.run_timeout,
+            on_start=started,
+            run_ended=lambda step: entry.update(run_seconds=step.seconds),
+            evaluation_ended=lambda step: entry.update(eval_seconds=step.seconds),
+            same_code=lambda: wtree.head() == rec["code_commit"] and not wtree.tracked_changes(),
+        )
+        clock, failed, metrics = time.monotonic(), "", {}
         try:
             tree.parent.mkdir(parents=True, exist_ok=True)
             ledger.git.prune_worktrees()
             ledger.git.add_detached(tree, rec["code_commit"])
-            command = rec.get("command") or cfg.run_command
-            res = runner.execute(runner.substitute(command, values), tree, env, cfg.run_timeout, logs / f"rerun-{n}.log", on_start=started, **limits)
-            entry["run_seconds"] = res["seconds"]
-            if res["stopped"] or res["paused"] or res["exit_code"] != 0:
-                failed = f"the rerun failed ({why(res)})"
-                entry["interrupted"] = bool(res["paused"])
-            elif not runner.manifest(out):
-                failed = "the rerun wrote nothing into its output folder"
-            else:
-                failed = jobs.moved(ledger, lock["digest"], data, "during the rerun")
-            if not failed:
-                ev = runner.execute(runner.substitute(cfg.eval_command, values), ledger.home, env, cfg.eval_timeout, logs / f"rerun-eval-{n}.log", on_start=started, **limits)
-                entry["eval_seconds"] = ev["seconds"]
-                if ev["stopped"] or ev["paused"] or ev["exit_code"] != 0:
-                    failed = f"the evaluator failed on the rerun ({why(ev)})"
-                    entry["interrupted"] = bool(ev["paused"])
-                elif moved := jobs.moved(ledger, lock["digest"], data, "during the rerun"):
-                    failed = moved
-                else:
-                    metrics = runner.read_metrics(metrics_path, cfg)
-                    reported = runner.read_train_metrics(out / "train_metrics.json")[0]
-                    if reported:
-                        entry["train_metrics"] = reported
+            got = jobs.measure(ledger, job)
+            failed, metrics = got.failed, got.metrics or {}
+            if got.paused:  # a rerun is not continued, so a stop is the end of it
+                failed = f"the rerun was stopped: {got.paused}. A rerun is not continued: run it again"
+                entry["interrupted"] = True
+            if got.train_metrics and not failed:
+                entry["train_metrics"] = got.train_metrics
         except ArlError as e:
-            failed = str(e).splitlines()[0]
+            failed = str(e)
         except BaseException:
             entry.setdefault("run_seconds", round(time.monotonic() - clock, 2))
             entry.update(failed="interrupted", interrupted=True)
@@ -425,12 +374,10 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
                 with contextlib.suppress(ArlError):
                     jobs.drop_tree(ledger, tree)
         entry.setdefault("run_seconds", round(time.monotonic() - clock, 2))
-        if not entry.get("interrupted"):
-            entry.pop("interrupted", None)
         primary = cfg.primary
         same_eval = rec["contract"]["eval_digest"] == lock["eval_digest"]
         if failed:
-            entry["failed"] = failed
+            entry["failed"] = failed = failed.splitlines()[0]
         else:
             entry["metrics"] = metrics
             if split == cfg.splits[0] and same_eval and same_data:
@@ -440,23 +387,14 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
             if primary.target is not None:
                 entry["meets_target"] = rules.meets_target(cfg, metrics)
 
-        try:
-            with ledger.locked(wait=900):
-                now_rec = ledger.record(eid)
-                close(now_rec)
-                ledger.save_record(now_rec)
-                common.finish(ledger, f"{eid} rerun on {split}" + (" failed" if failed else ""))
-        except ArlError as e:
-            # The result is kept even if it cannot be committed now, or the ledger cannot be read.
-            try:
-                jobs.amend(ledger, eid, close, wait=30)
-            except ArlError:
-                now_rec = ledger.record(eid)
-                close(now_rec)
-                ledger.save_record(now_rec)
-            print(f"{eid}: the rerun is saved but could not be committed:\n  {e}", file=sys.stderr)
+        def write() -> None:
+            now_rec = ledger.record(eid)
+            close(now_rec)
+            ledger.save_record(now_rec)
+
+        jobs.keep_outcome(ledger, eid, write, f"{eid} rerun on {split}" + (" failed" if failed else ""), what="rerun")
     if failed:
-        print(f"{eid} rerun on split '{split}' FAILED: {failed}. Log: {logs / f'rerun-{n}.log'}")
+        print(f"{eid} rerun on split '{split}' FAILED: {failed}. Log: {log}")
         return EXIT_CRASH
     print(f"{eid} rerun on split '{split}': {primary.name} = {fmt(metrics[primary.name])}")
     if differs:
