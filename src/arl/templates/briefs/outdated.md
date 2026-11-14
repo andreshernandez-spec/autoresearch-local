@@ -1,6 +1,5 @@
-{target} was drafted before the reference of track {track} stopped counting (the evaluator,
-the data or a package the contract names changed, or the track's branch was synced). It
-cannot run as it is.
+{target} was drafted before the reference of track {track} stopped counting (the evaluator
+or the data changed, or the track's branch was synced). It cannot run as it is.
 
 1. Drop the draft:   {arl} exp abandon {target} --reason "its reference no longer counts"
 2. Measure the track again:

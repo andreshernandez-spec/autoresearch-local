@@ -112,6 +112,17 @@ def _budget_line(ledger: Ledger) -> str:
     )
 
 
+def _target_line(ledger: Ledger, lock: dict[str, Any] | None, data: str | None) -> str:
+    """Where the target stands: who reached it, whether that was confirmed, and who did not hold."""
+    primary = ledger.cfg.primary
+    if primary.target is None or lock is None:
+        return ""
+    goal = f"{primary.name} {'>=' if primary.goal == 'max' else '<='} {fmt(float(primary.target))}"
+    hit = rules.target_claim(ledger, lock, data)
+    fell = [rules.claim_text(c) for c in rules.claims(ledger, lock) if c["state"] in ("missed", "given up")]
+    return f"{goal}: {rules.claim_text(hit) if hit else 'not reached'}." + (f" Not confirmed: {'; '.join(fell)}." if fell else "")
+
+
 # --- STATUS.md --------------------------------------------------------------------
 
 
@@ -132,7 +143,11 @@ def status(ledger: Ledger) -> str:
     last = f"{state['last']} decided '{state['last_decision']}'" if state["last"] else "none so far"
     due = "DUE: " + "; ".join(state["reasons"]) if state["due"] else f"{state['judged_since']} of {cfg.intro_every} experiments judged since"
     out.append(f"- Introspections: {last}. {due}.")
-    action = rules.next_action(ledger)
+    data = runner.data_now(ledger)
+    goal = _target_line(ledger, lock, data)
+    if goal:
+        out.append(f"- Target: {goal}")
+    action = rules.next_action(ledger, data)
     target = f" {action['target']}" if action.get("target") else ""
     out.append(f"- Next: {action['stage']}{target} ({action['why']}).")
 
@@ -169,7 +184,7 @@ def state(ledger: Ledger) -> dict[str, Any]:
         "paused": ledger.paused(),
         "budget": rules.budget(ledger),
         "introspection": rules.introspection_state(ledger),
-        "next": rules.next_action(ledger),
+        "next": rules.next_action(ledger, runner.data_now(ledger)),
         "tracks": ledger.tracks(),
         "experiments": [
             {k: e.get(k) for k in ("id", "title", "type", "track", "status", "hypotheses", "metrics", "comparison", "verdict")}
@@ -200,8 +215,7 @@ def _env_line(rec: dict[str, Any]) -> str:
     env = rec.get("conditions", {}).get("env") or {}
     if not env.get("python"):
         return ""
-    named = "".join(f", {k} {v}" for k, v in (env.get("versions") or {}).items())
-    return f" Environment: {env.get('prefix') or 'the python on the PATH'}, python {env['python']}{named}."
+    return f" Environment: {env.get('prefix') or 'the python on the PATH'}, python {env['python']}."
 
 
 def _reported(rec: dict[str, Any]) -> list[str]:
@@ -341,6 +355,9 @@ def introspection_facts(ledger: Ledger, trigger: str, state_: dict[str, Any], ac
     out.append(f"Window: {len(window)} experiments judged since {state_['last'] or 'the start'}.")
     out += ["", exp_table(ledger, window), "Tracks:", "", track_table(ledger, lock)]
     out.append(f"Budget: {_budget_line(ledger)}.")
+    goal = _target_line(ledger, lock, runner.data_now(ledger))
+    if goal:
+        out.append(f"Target: {goal}")
     hyps = [h for h in ledger.hypotheses() if h["status"] == "open"]
     out.append("Open hypotheses: " + ("; ".join(f"{h['id']} {h['title']}" for h in hyps) or "none") + ".")
     ideas = [i for i in ledger.ideas() if i["status"] == "open"]
@@ -437,5 +454,14 @@ def next_text(ledger: Ledger, action: dict[str, Any]) -> str:
             ctx["why"] = f"{ctx['why']}. Last failure: {rec['attempts'][-1].get('failed', 'not recorded')}"
         if stage == "judge" and (rec["type"] == "diagnose" or ctx["outcome"] == "repeat"):
             name = "judge_diagnose"
+    if stage == "confirm":
+        split, first = action.get("split", ""), ledger.cfg.splits[0]
+        again = split == first  # the contract has one split: the same run, made once more
+        ctx.update(
+            split=split,
+            first=first,
+            max_attempts=ledger.cfg.max_attempts,
+            where="when it is run once more" if again else f"on '{split}', where the loop never looked",
+        )
     head = f"NEXT: {stage}" + (f" {action['target']}" if action.get("target") else "")
     return f"{head}\nWhy: {action.get('why', '')}\n\n" + fill(template(f"briefs/{name}.md"), **ctx)

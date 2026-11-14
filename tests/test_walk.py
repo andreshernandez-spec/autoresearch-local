@@ -3,10 +3,11 @@
 Mostly it does what `arl next` says. Sometimes it types another command, and
 sometimes the ground is pulled away: a run is cut off, the loop is paused, a
 contract file is edited, a worktree folder disappears, the environment the
-contract names is moved away, a package in it changes version. A person steps
-in only where `next` says STOP. After every step the same things must hold: no
-traceback, `next` and `status` answer, the records agree with each other, and
-the step that `next` asks for is not refused for ever.
+contract names is moved away, a package in it changes version. In every second
+walk the contract has a target that a few results reach, on one split or on
+both. A person steps in only where `next` says STOP. After every step the same
+things must hold: no traceback, `next` and `status` answer, the records agree
+with each other, and the step that `next` asks for is not refused for ever.
 
 More seeds or longer walks: ARL_WALK_SEEDS=40 ARL_WALK_STEPS=150 python -m pytest tests/test_walk.py
 """
@@ -33,7 +34,7 @@ SEEDS = range(int(os.environ.get("ARL_WALK_SEEDS", "6")))
 STEPS = int(os.environ.get("ARL_WALK_STEPS", "70"))
 STAGES = {
     "track", "baseline", "hypothesize", "design", "outdated", "judge", "crashed", "interrupted", "resume",
-    "unfinished", "introspect", "reload", "wait", "stopped", "paused", "budget", "target", "contract", "environment",
+    "unfinished", "introspect", "reload", "wait", "stopped", "paused", "budget", "confirm", "target", "contract", "environment",
 }  # fmt: skip
 STATUSES = {"draft", "running", "paused", "evaluated", "judging", "judged", "crashed", "abandoned"}
 ACCEPTED = (0, 2, 3)  # done, the run failed, the run was paused: each one moved the loop on
@@ -263,6 +264,8 @@ class Walk:
                 self.call("exp", "abandon", target, "--reason", "it cannot run as drafted")
         elif stage == "outdated":
             self.call("exp", "abandon", target, "--reason", "its reference no longer counts")
+        elif stage == "confirm":
+            self.call("exp", "reproduce", target, "--split", action["split"])
         elif stage == "judge":
             self.judge(target)
         elif stage == "unfinished":
@@ -332,7 +335,7 @@ class Walk:
         elif kind == "upgrade":
             if self.env.exists():
                 install(self.env, "demo", f"{self.name('')}.0")
-                self.log.append("# a package the contract names changes version")
+                self.log.append("# a package in the environment changes version")
         elif kind == "folder":
             there = [t["name"] for t in tracks if p.ledger.worktree_path(t["name"]).exists()]
             clean = [name for name in there if not git(p.ledger.worktree_path(name), "status", "--porcelain")]
@@ -359,6 +362,7 @@ class Walk:
                         ("exp", "log", eid),
                         ("exp", "pause"),
                         ("exp", "reproduce", eid),
+                        ("exp", "reproduce", eid, "--split", "confirm"),
                         ("exp", "new", "--type", rng.choice(rules.TYPES), "--track", track, "--title", self.name("typed "), "--hyp", hid),
                         ("exp", "new", "--type", "baseline", "--track", track, "--title", self.name("typed ")),
                         ("track", "set", track, "--status", rng.choice(["active", "parked", "closed"]), "--note", "typed"),
@@ -435,7 +439,10 @@ def test_walk(project: Project, monkeypatch, seed: int):
     p = project
     env = make_env(p.base / "env")
     install(env, "demo", "1.0")
-    p.setup(every=5, stagnation=3, max_experiments=max(30, STEPS // 2), python="python", extra=env_table(env, "demo"))
+    # Every second walk has a target that some of its results reach: some hold on the other
+    # split and end the walk, some do not. The other walks go as deep as they can.
+    target = "target = 0.95" if seed % 2 else ""
+    p.setup(every=5, stagnation=3, max_experiments=max(30, STEPS // 2), python="python", extra=env_table(env), target=target)
     walk = Walk(p, seed, monkeypatch, env)
     walk.go(STEPS)
     walk.settle()

@@ -9,7 +9,7 @@ enforced. `PROTOCOL.md` is what an agent reads before using it.
 - Standard library only. A project runs `bin/arl` from whatever Python 3.11+ it
   has, with nothing installed. The same holds for `helpers/arl_job.py`, which
   projects copy.
-- `python -m pytest` runs everything (about four minutes). The tests drive a
+- `python -m pytest` runs everything (about six minutes). The tests drive a
   toy project in a temporary git repository through the real CLI.
 - Every gate has a test that hits it through the CLI and checks the message:
   `tests/test_flow.py` for the loop, `tests/test_introspection.py` for the
@@ -29,6 +29,14 @@ enforced. `PROTOCOL.md` is what an agent reads before using it.
 - Where a change takes several steps, the intent is written first and any later
   command can finish it (`_finish_judge`, `_settle`). Nothing may be left that
   only the command that started it can complete.
+- A command in the middle of a job does not write back the copy of a record
+  it started with: another command may have written to the record since (a
+  verdict given while a rerun is going). It changes the record as it is
+  now, under the ledger lock (`_amend`). The one exception is `exp run`,
+  because every other command refuses a record that says `running`.
+- What must still be as recorded when a job ends (the contract, the data
+  files) is asked in one place, `_moved`, by runs and reruns alike, after
+  the job and after its evaluation. A new condition goes there.
 - An interruption is not a failure. A part of a run that ends because arl or
   the job was stopped from outside leaves the run `paused`; only what the job
   itself did wrong uses up an attempt.
