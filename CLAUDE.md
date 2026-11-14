@@ -27,15 +27,15 @@ enforced. `PROTOCOL.md` is what an agent reads before using it.
 - A command checks everything before it changes anything. A refusal leaves the
   ledger, the worktrees and git as they were.
 - Where a change takes several steps, the intent is written first and any later
-  command can finish it (`_finish_judge`, `_settle`). Nothing may be left that
+  command can finish it (`common.finish_judge`, `jobs.settle`). Nothing may be left that
   only the command that started it can complete.
 - A command in the middle of a job does not write back the copy of a record
   it started with: another command may have written to the record since (a
   verdict given while a rerun is going). It changes the record as it is
-  now, under the ledger lock (`_amend`). The one exception is `exp run`,
+  now, under the ledger lock (`jobs.amend`). The one exception is `exp run`,
   because every other command refuses a record that says `running`.
 - What must still be as recorded when a job ends (the contract, the data
-  files) is asked in one place, `_moved`, by runs and reruns alike, after
+  files) is asked in one place, `jobs.moved`, by runs and reruns alike, after
   the job and after its evaluation. A new condition goes there.
 - An interruption is not a failure. A part of a run that ends because arl or
   the job was stopped from outside leaves the run `paused`; only what the job
@@ -71,7 +71,12 @@ enforced. `PROTOCOL.md` is what an agent reads before using it.
 
 | File | Holds |
 |---|---|
-| `src/arl/cli.py` | every command; the order of checks in `exp run` and `exp judge`; what a dead or interrupted process left (`_settle`) |
+| `src/arl/cli.py` | the parser, and what happens to what was typed |
+| `src/arl/commands/common.py` | what every command leans on: who is asking, the gates, the worktrees, the ledger lock that finishes a verdict left half applied |
+| `src/arl/commands/jobs.py` | a job arl started: what may not change under it (`moved`), writing to a record in the middle of one (`amend`), what a dead or interrupted process left (`settle`) |
+| `src/arl/commands/runs.py` | `exp run` and `exp reproduce`, and the order of their checks |
+| `src/arl/commands/experiments.py` | an experiment from its draft to its verdict (`exp judge` and the order of its checks), and looking one up |
+| `src/arl/commands/` the rest | `project.py` (init, freeze, status, next, verify), `session.py` (pause, resume, reload, notes, lessons), `tracks.py`, `hypotheses.py` (and ideas), `introspections.py` |
 | `src/arl/rules.py` | outcome of a result, allowed verdicts, when an introspection is due, the budget, what comes next |
 | `src/arl/contract.py` | `frozen.lock`: the two digests and who may freeze |
 | `src/arl/ledger.py` | where each record lives, ids, the ideas, lessons and activity files, the pause file, ledger commits |

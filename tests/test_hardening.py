@@ -16,7 +16,8 @@ import time
 
 import pytest
 
-from arl import cli, contract, gitops, render, runner
+from arl import contract, gitops, render, runner
+from arl.commands import common
 from conftest import DEAD_PID, EVAL_PY, NOTHING_NEW, Project, cut_off, git, job_pid, launch, pid_alive, wait_for
 
 
@@ -161,9 +162,9 @@ def test_refrozen_contract_with_work_pending(project: Project, monkeypatch):
     draft = p.draft("tune", hyps=(h,), params={"x": 0.5})
     evaluator = p.research / "eval" / "evaluate.py"
     evaluator.write_text(evaluator.read_text() + "\n# stricter\n")
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     p.arl("freeze", "--reason", "stricter", "--yes")
-    monkeypatch.setattr(cli, "interactive", lambda: False)
+    monkeypatch.setattr(common, "interactive", lambda: False)
     out = p.arl("next")
     assert "NEXT: outdated E0002" in out and "exp abandon E0002" in out
     assert "Abandon it" in p.arl("exp", "run", draft, code=1)
@@ -302,9 +303,9 @@ def test_parking_a_stalled_track_does_not_skip_the_introspection(project: Projec
     p.tune(-0.3, "discard", h, track="alpha")
     assert "An introspection comes first" in new_exp(p, "tune", h, code=1, track="beta")
     assert "comes out of an introspection" in p.arl("track", "set", "alpha", "--status", "parked", "--note", "stalled", code=1)
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     p.arl("track", "set", "alpha", "--status", "parked", "--note", "stalled")
-    monkeypatch.setattr(cli, "interactive", lambda: False)
+    monkeypatch.setattr(common, "interactive", lambda: False)
     assert "An introspection comes first" in new_exp(p, "tune", h, code=1, track="beta")
 
     assert p.introspect("adjust") == "N001"
@@ -347,7 +348,7 @@ def test_stop_budget_and_waiting_hold_for_existing_drafts(project: Project, monk
     draft = p.draft("tune", hyps=(h,), params={"x": 0.5})
     assert p.introspect("stop") == "N001"
     assert "waits for a person" in p.arl("exp", "run", draft, code=1)
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     p.arl("introspect", "resolve", "N001", "--decision", "stop", "--note", "enough")
     assert "NEXT: stopped N001" in p.arl("next")
     assert "Nothing runs until a person reopens it" in p.arl("exp", "run", draft, code=1)
@@ -605,7 +606,7 @@ def test_older_records_survive_a_new_metric(project: Project, monkeypatch):
     evaluator.write_text(evaluator.read_text().replace('"cost": abs(x)}', '"cost": abs(x), "extra": 1.0}'))
     toml = p.research / "arl.toml"
     toml.write_text(toml.read_text().replace("[budget]", '[[metric]]\nname = "extra"\nrole = "info"\n\n[budget]'))
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     p.arl("freeze", "--reason", "one more metric", "--yes")
     assert "score" in p.arl("exp", "show", "E0001")
     assert "verdict: keep" in p.judge(eid, "keep", "--hyp", f"{h}=supported")
@@ -729,7 +730,7 @@ def test_verdict_cut_off_in_the_middle_is_finished_later(project: Project, monke
     second = p.draft("tune", hyps=(h,), params={"x": 0.1})
     p.arl("exp", "run", second)
     p.fill(p.ledger.exp_dir(second) / "analysis.md")
-    monkeypatch.setattr(cli, "finish", lambda ledger, message: (_ for _ in ()).throw(KeyboardInterrupt))
+    monkeypatch.setattr(common, "finish", lambda ledger, message: (_ for _ in ()).throw(KeyboardInterrupt))
     p.arl("exp", "judge", second, "--verdict", "discard", "--reason", "worse", "--hyp", f"{h}=open", code=130)
     monkeypatch.undo()
     monkeypatch.chdir(p.root)
@@ -771,7 +772,7 @@ def test_freeze_that_cannot_be_committed_did_not_happen(project: Project, monkey
     p.baseline()
     evaluator = p.research / "eval" / "evaluate.py"
     evaluator.write_text(evaluator.read_text() + "\n# stricter\n")
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     index_lock.write_text("")
     assert "index.lock" in p.arl("freeze", "--reason", "stricter", "--yes", code=1)
     assert contract.load(p.ledger)["version"] == 1  # the old lock, so the change still shows as a change
@@ -791,7 +792,7 @@ def test_freeze_covers_only_what_was_shown(project: Project, monkeypatch):
         program.write_text(program.read_text() + "\nA rule that slipped in while the question was open.\n")
         return "y"
 
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     monkeypatch.setattr("builtins.input", answer)
     out = p.arl("freeze", "--reason", "one change", code=1)
     assert "changed: research/eval/evaluate.py" in out and "changed: research/PROGRAM.md" not in out

@@ -13,7 +13,8 @@ import os
 import shutil
 import sys
 
-from arl import __version__, cli, runner
+from arl import __version__, runner
+from arl.commands import common
 from conftest import Project, env_table, git, install, make_env, pause_record
 
 
@@ -211,10 +212,10 @@ def test_a_track_starts_from_an_old_experiment(project: Project, monkeypatch):
     p.judge(good, "discard", "--hyp", f"{h}=open")
     p.tune(0.3, "keep", h)  # the track went on another way
     assert "comes out of an introspection" in p.arl("track", "new", "back", "--from", good, code=1)
-    monkeypatch.setattr(cli, "interactive", lambda: True)  # the person decides to go back to it
+    monkeypatch.setattr(common, "interactive", lambda: True)  # the person decides to go back to it
     out = p.arl("track", "new", "back", "--from", good)
     assert f"It starts from {good}" in out
-    monkeypatch.setattr(cli, "interactive", lambda: False)
+    monkeypatch.setattr(common, "interactive", lambda: False)
     p.fill(p.research / "tracks" / "back.md")
     track = p.ledger.track("back")
     assert track["base_commit"] == p.record(good)["code_commit"] and track["from_ref"] == good
@@ -228,7 +229,7 @@ def test_a_track_starts_from_an_old_experiment(project: Project, monkeypatch):
 def test_a_track_does_not_start_from_what_has_no_method(project: Project, monkeypatch):
     p = project
     h = p.started()
-    monkeypatch.setattr(cli, "interactive", lambda: True)  # the person asks: what is refused is the source
+    monkeypatch.setattr(common, "interactive", lambda: True)  # the person asks: what is refused is the source
     draft = p.draft("tune", hyps=(h,), params={"x": 0.5})
     assert "never ran" in p.arl("track", "new", "a", "--from", draft, code=1)
     p.arl("exp", "abandon", draft, "--reason", "not needed")
@@ -246,9 +247,9 @@ def test_naming_another_environment_asks_for_a_new_baseline(project: Project, mo
     other = make_env(p.base / "other")
     arl_toml = p.research / "arl.toml"
     arl_toml.write_text(arl_toml.read_text().replace(str(env), str(other)))
-    monkeypatch.setattr(cli, "interactive", lambda: True)  # the person moves the program to another environment
+    monkeypatch.setattr(common, "interactive", lambda: True)  # the person moves the program to another environment
     assert "every track needs a new baseline" in p.arl("freeze", "--reason", "another environment", "--yes")
-    monkeypatch.setattr(cli, "interactive", lambda: False)
+    monkeypatch.setattr(common, "interactive", lambda: False)
     assert "NEXT: baseline main-line" in p.arl("next")
     again = p.baseline()
     assert p.record(again)["comparison"]["outcome"] == "reference"

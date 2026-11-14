@@ -26,6 +26,7 @@ import shutil
 import pytest
 
 from arl import cli, rules
+from arl.commands import common
 from arl.config import DECISIONS
 from arl.ledger import Ledger
 from conftest import NOTHING_NEW, Project, cut_off, env_table, git, install, make_env, pause_record
@@ -57,7 +58,7 @@ class Walk:
     # --- plumbing -----------------------------------------------------------------
 
     def person(self, there: bool) -> None:
-        self.mp.setattr(cli, "interactive", lambda: there)
+        self.mp.setattr(common, "interactive", lambda: there)
 
     def call(self, *argv) -> tuple[int, str]:
         out = io.StringIO()
@@ -143,7 +144,7 @@ class Walk:
         if self.rng.random() >= 0.2:
             return self.call(*args)[0]
         # The process is stopped somewhere in the middle of applying the verdict.
-        owner, step = self.rng.choice([(Ledger, "write_track_params"), (Ledger, "set_hypothesis"), (Ledger, "log_hypothesis"), (Ledger, "save_track"), (cli, "finish")])
+        owner, step = self.rng.choice([(Ledger, "write_track_params"), (Ledger, "set_hypothesis"), (Ledger, "log_hypothesis"), (Ledger, "save_track"), (common, "finish")])
         real = getattr(owner, step)
 
         def stopped_here(*args, **kwargs):

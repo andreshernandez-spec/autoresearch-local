@@ -123,6 +123,30 @@ def _target_line(ledger: Ledger, lock: dict[str, Any] | None, data: str | None) 
     return f"{goal}: {rules.claim_text(hit) if hit else 'not reached'}." + (f" Not confirmed: {'; '.join(fell)}." if fell else "")
 
 
+def summary(ledger: Ledger, rec: dict[str, Any]) -> str:
+    cfg = ledger.cfg
+    lines = [f"{rec['id']} {rec['title']} [{rec['type']} on {rec['track']}, {rec['status']}]"]
+    if "metrics" in rec:
+        comp = rec["comparison"]
+        for m in cfg.metrics:
+            if m.name in rec["metrics"]:  # a metric added to the contract later is not in older records
+                lines.append(f"  {m.name:28s} {fmt(rec['metrics'][m.name])}" + ("  (primary)" if m.role == "primary" else ""))
+        if comp.get("reference"):
+            lines.append(
+                f"  against {comp['reference']}: {comp['metric']} {fmt(comp['reference_value'])} -> {fmt(comp['value'])}, "
+                f"gain {comp['gain']:+.6g} (at least {fmt(comp['min_delta'])} counts)"
+            )
+        for g in comp["gate_failures"]:
+            lines.append(f"  constraint not met: {g}")
+        lines.append(f"  outcome: {comp['outcome']}")
+    if rec.get("train_metrics"):
+        lines.append("  reported by the run itself (not scored): " + ", ".join(f"{k} {fmt(v)}" for k, v in list(rec["train_metrics"].items())[:12]))
+    if rec["status"] in ("judged", "judging", "abandoned"):
+        v = rec["verdict"]
+        lines.append(f"  verdict: {v['decision']}. {v['reason']}")
+    return "\n".join(lines)
+
+
 # --- STATUS.md --------------------------------------------------------------------
 
 

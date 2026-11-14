@@ -8,7 +8,8 @@ import time
 
 import pytest
 
-from arl import cli, runner
+from arl import runner
+from arl.commands import common
 from conftest import Project, git
 
 
@@ -162,7 +163,7 @@ def test_contract_is_frozen(project: Project, monkeypatch):
     p.arl("idea", "add", "--title", "noted", "--body", "text")
     assert git(p.root, "status", "--porcelain", "--", "research") == "M research/eval/evaluate.py"
 
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     assert "needs a new baseline" in p.arl("freeze", "--reason", "kinder", "--yes")
     assert "NEXT: baseline main-line" in p.arl("next")
     assert "no reference under contract v2" in new_exp(p, "tune", h, code=1)
@@ -279,16 +280,16 @@ def test_some_decisions_wait_for_a_person(project: Project, monkeypatch):
     assert "waits for a person" in new_exp(p, "tune", h, code=1)
     assert "in a terminal" in p.arl("introspect", "resolve", "N001", "--decision", "continue", "--note", "go on", code=1)
 
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     p.arl("introspect", "resolve", "N001", "--decision", "stop", "--note", "enough")
     assert "NEXT: stopped N001" in p.arl("next")
     assert "decided to stop" in new_exp(p, "tune", h, code=1)
     # after a stop the agent can write an introspection, but reopening is the person's decision
-    monkeypatch.setattr(cli, "interactive", lambda: False)
+    monkeypatch.setattr(common, "interactive", lambda: False)
     p.introspect("continue")
     assert p.ledger.introspection("N002")[0]["status"] == "waiting"
     assert "NEXT: wait N002" in p.arl("next")
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     p.arl("introspect", "resolve", "N002", "--decision", "continue", "--note", "go on")
     assert "NEXT: reload N002" in p.arl("next")
     p.arl("reload")
