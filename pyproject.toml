@@ -15,3 +15,4 @@ line-length = 140
 
 [tool.pyright]
 extraPaths = ["src", "tests"]
+pythonVersion = "3.11"  # the floor: what a newer Python added is an error here

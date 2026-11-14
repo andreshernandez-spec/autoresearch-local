@@ -1,0 +1,101 @@
+# What a pull request has to pass, and what main is held to.
+#
+# arl is standard library only and runs from its checkout, so nothing is installed
+# here except the tools that check it: pytest, and pyright in one job. The suite
+# drives a toy project in a temporary git repository through the real command
+# line, with real jobs in processes of their own. It needs Linux (/proc, sessions,
+# signals), git and bash, all of which the runner has.
+#
+# Three things are checked:
+#   - the suite on every Python from the floor in pyproject.toml to the newest,
+#     because a floor nobody runs is a guess;
+#   - the types. Records are classes, so a field misspelt in a line no test runs
+#     is found here. pyright is pinned: a new release of the checker must not
+#     fail a change that did not touch it. The pin moves in a change of its own;
+#   - the loop walked at random, wide: 40 walks of 150 steps, shared out over
+#     four runners. The suite itself walks 6 times 70 steps, which has missed a
+#     dead end before.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to a pull request makes the older run worthless, so cancel it. Not
+# on main: there the group is the commit, so no run waits behind another one.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  tests:
+    name: pytest (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: arl starts with nothing installed
+        run: python bin/arl --help > /dev/null
+      - name: install pytest
+        run: python -m pip install pytest
+      - name: what is under test
+        run: |
+          python -VV
+          python -m pytest --version
+          git --version
+          git log --oneline -1
+      - name: pytest
+        run: python -m pytest --durations=15
+
+  types:
+    name: pyright
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: install pyright
+        run: python -m pip install pyright==1.1.414
+      # pyproject.toml tells pyright to read the code as Python 3.11 does
+      - name: pyright
+        run: pyright src
+
+  walk:
+    # no slash in the name: `gh run view --log` returns nothing for a job that has one
+    name: wide walk (${{ matrix.part }} of 4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: install pytest
+        run: python -m pip install pytest
+      - name: 40 walks of 150 steps, every fourth one on this runner
+        env:
+          ARL_WALK_SEEDS: 40
+          ARL_WALK_STEPS: 150
+          ARL_WALK_SHARD: ${{ matrix.part }}/4
+        run: ARL_WALK_REPORT="$RUNNER_TEMP/walks.jsonl" python -m pytest tests/test_walk.py
+      - name: which stages the walks reached
+        if: always()
+        run: cat "$RUNNER_TEMP/walks.jsonl" 2> /dev/null || echo "no walk came to its end"
