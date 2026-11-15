@@ -88,13 +88,10 @@ agent_may = ["continue", "adjust", "branch", "pivot"]
 # or relative to the project). arl puts its bin first on the PATH of each job, whoever
 # started the command, and refuses to start when it is not there.
 # prefix = "~/anaconda3/envs/project"
-# Packages whose versions must be the same for two results to be compared. When one of
-# them (or python) changes, the next scored experiment waits for a new baseline.
-# packages = ["numpy", "jax"]
-# arl stores with every run the list of packages that python sees (name and version,
-# the commit of an editable install, the builds conda installed), once per distinct
-# content, and says where two runs differ. The output of one more command can be
-# stored the same way:
+# Nothing else is set here. arl stores with every run the list of packages that python
+# sees (name and version, the commit of an editable install, the builds conda
+# installed), once per distinct content, and says where two runs differ. The output of
+# one more command can be stored the same way:
 # command = "python -m pip freeze"
 
 [data]

@@ -8,7 +8,8 @@ from typing import Any
 from . import contract
 from .config import Config
 from .ledger import Ledger
-from .runner import alive, env_changes
+from .runner import alive
+from .record import Comparison, Record, Track, need
 from .util import now, parse_time
 
 SCORED = ("baseline", "tune", "feature")
@@ -41,7 +42,7 @@ def gate_failures(cfg: Config, metrics: dict[str, float], reference: dict[str, f
     return fails
 
 
-def compare(cfg: Config, metrics: dict[str, float], reference: dict[str, Any] | None, repeat: bool = False) -> dict[str, Any]:
+def compare(cfg: Config, metrics: dict[str, float], reference: Record | None, repeat: bool = False) -> Comparison:
     """Outcome of a scored run against the track's reference experiment.
 
     No reference: this run is the reference. A baseline on a track that has one
@@ -50,51 +51,48 @@ def compare(cfg: Config, metrics: dict[str, float], reference: dict[str, Any] | 
     """
     primary = cfg.primary
     value = metrics[primary.name]
-    ref_metrics = reference["metrics"] if reference else None
+    ref_metrics = reference.metrics if reference else None
     fails = gate_failures(cfg, metrics, ref_metrics)
-    out: dict[str, Any] = {
-        "metric": primary.name,
-        "value": value,
-        "gate_failures": fails,
-        "target_met": bool(primary.target is not None and not fails and primary.meets(value, primary.target)),
-    }
+    met = bool(primary.target is not None and not fails and primary.meets(value, primary.target))
     if reference is None:
-        out["outcome"] = "reference"
-        return out
+        return Comparison(metric=primary.name, value=value, gate_failures=fails, target_met=met, outcome="reference")
     assert ref_metrics is not None
     gain = primary.gain(value, ref_metrics[primary.name])
-    out.update(
-        reference=reference["id"],
+    ref_failed = bool(reference.comparison and reference.comparison.gate_failures)
+    if repeat:
+        outcome, met = "repeat", False
+    elif fails:
+        outcome = "gate_fail"
+    elif ref_failed:
+        outcome = "improve"  # inside the constraints beats outside them
+    elif gain > 0 and gain >= primary.min_delta:
+        outcome = "improve"
+    elif gain < 0 and -gain >= primary.min_delta:
+        outcome = "worse"
+    else:
+        outcome = "neutral"
+    return Comparison(
+        metric=primary.name,
+        value=value,
+        gate_failures=fails,
+        target_met=met,
+        reference=reference.id,
         reference_value=ref_metrics[primary.name],
         gain=gain,
         min_delta=primary.min_delta,
+        outcome=outcome,
     )
-    ref_failed = bool(reference.get("comparison", {}).get("gate_failures"))
-    if repeat:
-        out["outcome"] = "repeat"
-        out["target_met"] = False
-    elif fails:
-        out["outcome"] = "gate_fail"
-    elif ref_failed:
-        out["outcome"] = "improve"  # inside the constraints beats outside them
-    elif gain > 0 and gain >= primary.min_delta:
-        out["outcome"] = "improve"
-    elif gain < 0 and -gain >= primary.min_delta:
-        out["outcome"] = "worse"
-    else:
-        out["outcome"] = "neutral"
-    return out
 
 
-def allowed_verdicts(rec: dict[str, Any]) -> list[str]:
+def allowed_verdicts(rec: Record) -> list[str]:
     """What the agent may decide. The first entry is the default."""
-    if rec["status"] in ("crashed", "paused"):
+    if rec.status in ("crashed", "paused"):
         return ["crash"]
-    if rec["status"] != "evaluated":
+    if rec.status != "evaluated":
         return []
-    if rec["type"] == "diagnose":
+    if rec.type == "diagnose":
         return ["finding"]
-    outcome = rec.get("comparison", {}).get("outcome")
+    outcome = rec.outcome
     if outcome == "repeat":
         return ["finding"]  # a measurement of the noise, not a new reference
     if outcome == "reference":
@@ -109,57 +107,35 @@ def allowed_verdicts(rec: dict[str, Any]) -> list[str]:
 # --- tracks -----------------------------------------------------------------------
 
 
-def reference_for(ledger: Ledger, track: dict[str, Any], eval_digest: str, data: str | None = None, env: str | None = None) -> dict[str, Any] | None:
-    """The experiment that measured the track head under the current evaluator, on the
-    current data and with the current versions of the packages the contract names.
-
-    data, env: the digests as they are now. None leaves that condition unchecked
-    (the caller does not have it at hand, or the contract names no packages).
-    """
-    eid = track.get("head_experiment")
+def reference_for(ledger: Ledger, track: Track, eval_digest: str, data: str | None = None) -> Record | None:
+    """The experiment that measured the track head under the current evaluator, on the current data."""
+    eid = track.head_experiment
     if not eid:
         return None
     rec = ledger.record(eid)
-    if rec.get("contract", {}).get("eval_digest") != eval_digest:
+    if rec.eval_digest != eval_digest:
         return None
-    measured_on = rec.get("conditions", {}).get("data_digest")
+    measured_on = rec.data_digest
     if data is not None and measured_on is not None and measured_on != data:
-        return None
-    if env is not None and rec.get("conditions", {}).get("env_digest") != env:
         return None
     return rec
 
 
-def why_no_reference(ledger: Ledger, track: dict[str, Any], lock: dict[str, Any], data: str | None, env: dict[str, Any] | None) -> str:
-    """Why a track has nothing a new result could be compared with."""
-    name, eid = track["name"], track.get("head_experiment")
-    general = f"track {name} has no reference under contract v{lock['version']} and the data as it is"
-    if not eid or not env or not env.get("digest"):
-        return general
-    if reference_for(ledger, track, lock["eval_digest"], data) is None:
-        return general  # the evaluator or the data: the packages are not the reason
-    measured = ledger.record(eid).get("conditions", {})
-    if "env_digest" not in measured:
-        return f"track {name} was measured by {eid} before the contract named packages ([env] packages): measure it again"
-    changes = env_changes(measured.get("env"), env)
-    return f"track {name} was measured by {eid} with other packages ({'; '.join(changes) or 'see its record'}): measure it again"
-
-
-def in_flight(ledger: Ledger, track: str | None = None) -> list[dict[str, Any]]:
+def in_flight(ledger: Ledger, track: str | None = None) -> list[Record]:
     return [
         e
         for e in ledger.experiments()
-        if e["status"] in IN_FLIGHT and (track is None or e["track"] == track)
+        if e.status in IN_FLIGHT and (track is None or e.track == track)
     ]
 
 
-def kept(rec: dict[str, Any]) -> bool:
-    return rec["status"] == "judged" and rec["verdict"]["decision"] == "keep"
+def kept(rec: Record) -> bool:
+    return rec.status == "judged" and rec.decision == "keep"
 
 
-def stale(rec: dict[str, Any]) -> bool:
+def stale(rec: Record) -> bool:
     """Marked as running, but the arl that ran it is gone."""
-    return rec["status"] == "running" and not alive(rec.get("pid"), rec.get("pid_start"))
+    return rec.status == "running" and not alive(rec.pid, rec.pid_start)
 
 
 # --- budget -----------------------------------------------------------------------
@@ -169,9 +145,9 @@ def budget(ledger: Ledger) -> dict[str, Any]:
     """Experiments that ran, and the hours of every run: failed ones, interrupted ones, reruns."""
     cfg = ledger.cfg
     exps = ledger.experiments()
-    ran = [e for e in exps if e.get("attempts")]
-    runs = [a for e in exps for a in (*e.get("attempts", []), *e.get("reruns", []))]
-    hours = sum(a.get("run_seconds", 0) + a.get("eval_seconds", 0) for a in runs) / 3600
+    ran = [e for e in exps if e.attempts]
+    runs = [a for e in exps for a in (*e.attempts, *e.reruns)]
+    hours = sum((a.run_seconds or 0) + (a.eval_seconds or 0) for a in runs) / 3600
     count_spent = cfg.max_experiments is not None and len(ran) >= cfg.max_experiments
     hours_spent = cfg.max_run_hours is not None and hours >= cfg.max_run_hours
     reasons = []
@@ -190,15 +166,105 @@ def budget(ledger: Ledger) -> dict[str, Any]:
     }
 
 
-def target_met(ledger: Ledger) -> dict[str, Any] | None:
-    lock = contract.load(ledger)
-    if lock is None or ledger.cfg.primary.target is None:
+# --- the target -------------------------------------------------------------------
+# Reaching the target ends the program, so one result on the split the loop tunes on
+# is not enough. It is a claim, and the claim has to hold where the loop never looked.
+
+
+def meets_target(cfg: Config, metrics: dict[str, float]) -> bool:
+    """A result on its own against the target: the primary metric reaches it and every
+    absolute limit holds. Limits relative to a reference say nothing on another split."""
+    primary = cfg.primary
+    try:
+        return primary.target is not None and not gate_failures(cfg, metrics, None) and primary.meets(metrics[primary.name], primary.target)
+    except KeyError:
+        return False  # a metric the contract asks for is not in this result
+
+
+def confirming_splits(cfg: Config) -> list[str]:
+    """Where a result that met the target has to hold as well: every split the loop does
+    not score on, or the first one again when the contract has no other."""
+    return cfg.splits[1:] or cfg.splits[:1]
+
+
+def claim(ledger: Ledger, rec: Record, lock: dict[str, Any]) -> dict[str, Any] | None:
+    """Where a kept result that met the target on the first split stands, or None when
+    the experiment makes no such claim under the evaluator as it is.
+
+    state "open": a run on "split" is still to do ('arl exp reproduce --split').
+    "confirmed": a run on every confirming split met the target as well.
+    "missed": a run on "split" did not. That settles it: a later run that does
+    better there does not turn the answer round, or the split would be tuned on.
+    "given up": the run on "split" failed as often as a run may, so nothing is
+    known. A run that succeeds later still decides.
+    Only reruns under the same evaluator and on the data the experiment read count.
+    """
+    cfg = ledger.cfg
+    if cfg.primary.target is None or not kept(rec) or not (rec.comparison and rec.comparison.target_met):
         return None
-    for e in ledger.experiments():
-        same = e.get("contract", {}).get("eval_digest") == lock["eval_digest"]
-        if kept(e) and same and e.get("comparison", {}).get("target_met"):
-            return e
-    return None
+    if rec.eval_digest != lock["eval_digest"]:
+        return None
+    data = rec.data_digest
+    out: dict[str, Any] = {"id": rec.id, "first": cfg.splits[0], "splits": confirming_splits(cfg), "state": "confirmed"}
+    todo, given_up = [], []
+    for split in out["splits"]:
+        mine = [
+            r
+            for r in rec.reruns
+            if r.split == split and r.eval_digest == lock["eval_digest"] and (data is None or r.data_digest == data)
+        ]
+        scored = [r for r in mine if r.metrics is not None and not r.failed]
+        missed = next((r for r in scored if not meets_target(cfg, r.metrics or {})), None)
+        if missed:
+            return {**out, "state": "missed", "split": split, "rerun": missed.n, "value": (missed.metrics or {}).get(cfg.primary.name)}
+        if not scored:
+            failures = sum(1 for r in mine if r.failed and not r.interrupted)
+            (given_up if failures >= cfg.max_attempts else todo).append((split, failures))
+    if todo:
+        return {**out, "state": "open", "split": todo[0][0]}
+    if given_up:
+        return {**out, "state": "given up", "split": given_up[0][0], "failures": given_up[0][1]}
+    return out
+
+
+def claim_text(c: dict[str, Any]) -> str:
+    """A claim in one line, for a reason, a brief or a table."""
+    again = c.get("split") == c["first"]  # one split only: the same run, made once more
+    where = "when it was run again" if again else f"on {c.get('split')}"
+    if c["state"] == "missed":
+        value = f" ({c['value']:.6g})" if isinstance(c.get("value"), (int, float)) else ""
+        return f"{c['id']} reached the target on {c['first']} and not {where}{value}"
+    if c["state"] == "given up":
+        return f"{c['id']} reached the target on {c['first']} and could not be confirmed {where} (the run there failed {c['failures']} times)"
+    if c["state"] == "open":
+        return f"{c['id']} reached the target on {c['first']} and is not confirmed yet"
+    done = "running it again" if c["splits"] == [c["first"]] else f"the run{'s' if len(c['splits']) > 1 else ''} on {' and '.join(c['splits'])}"
+    return f"{c['id']} reached the target on {c['first']}, and {done} confirmed it"
+
+
+def claims(ledger: Ledger, lock: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Every claim on the target under the evaluator as it is, oldest first."""
+    if lock is None or ledger.cfg.primary.target is None:
+        return []
+    return [c for c in (claim(ledger, e, lock) for e in ledger.experiments()) if c]
+
+
+def target_claim(ledger: Ledger, lock: dict[str, Any] | None, data: str | None = None) -> dict[str, Any] | None:
+    """The claim that counts now: reached under the evaluator as it is and on the data as
+    it is, and confirmed or still to be confirmed. A confirmed one comes first.
+
+    data: the digest of the data files, when the caller has it at hand. A result
+    reached on other data says nothing about the data as they are.
+    """
+    by_id = {e.id: e for e in ledger.experiments()} if lock else {}
+    standing = []
+    for c in claims(ledger, lock):
+        measured_on = by_id[c["id"]].data_digest
+        if data is not None and measured_on is not None and measured_on != data:
+            continue
+        if c["state"] in ("confirmed", "open"):
+            standing.append(c)
+    return next((c for c in standing if c["state"] == "confirmed"), standing[0] if standing else None)
 
 
 # --- introspections ---------------------------------------------------------------
@@ -214,51 +280,57 @@ def introspection_state(ledger: Ledger) -> dict[str, Any]:
     """
     cfg = ledger.cfg
     all_ = ledger.introspections()
-    waiting = next((n for n in all_ if n["status"] == "waiting"), None)
-    opened = next((n for n in all_ if n["status"] == "open"), None)
-    closed = [n for n in all_ if n["status"] == "closed"]
+    waiting = next((n for n in all_ if n.status == "waiting"), None)
+    opened = next((n for n in all_ if n.status == "open"), None)
+    closed = [n for n in all_ if n.status == "closed"]
     last = closed[-1] if closed else None
-    covered = {eid for n in closed for eid in n.get("window", [])}
+    covered = {eid for n in closed for eid in n.window}
 
     exps = ledger.experiments()
-    recent = [e for e in exps if e["status"] == "judged" and e["id"] not in covered]
-    recent.sort(key=lambda e: (e["verdict"]["at"], e["id"]))
+    recent = [e for e in exps if e.status == "judged" and e.id not in covered]
+    recent.sort(key=lambda e: (need(e.verdict).at, e.id))
+    # A result that met the target where the loop tunes and not where it never looked is
+    # the clearest sign that the loop fits its first split: how to go on is decided here.
+    seen = {eid for n in closed for eid in n.unconfirmed}
+    unconfirmed = [c for c in claims(ledger, contract.load(ledger)) if c["state"] in ("missed", "given up") and c["id"] not in seen]
 
     reasons = []
     if waiting:
-        reasons.append(f"{waiting['id']} waits for a person to decide")
+        reasons.append(f"{waiting.id} waits for a person to decide")
     if opened:
-        reasons.append(f"{opened['id']} is open")
+        reasons.append(f"{opened.id} is open")
+    reasons += [claim_text(c) for c in unconfirmed]
     if len(recent) >= cfg.intro_every:
-        start = last["id"] if last else "the start"
+        start = last.id if last else "the start"
         reasons.append(f"{len(recent)} experiments judged since {start}, an introspection is due every {cfg.intro_every}")
     stagnant = {}
     for track in ledger.tracks():  # parked ones too: parking a stalled track does not skip the introspection
         run = 0
         for e in recent:
-            if e["track"] != track["name"] or e["type"] not in ("tune", "feature"):
+            if e.track != track.name or e.type not in ("tune", "feature"):
                 continue
-            run = 0 if e["verdict"]["decision"] == "keep" else run + 1
-        stagnant[track["name"]] = run
+            run = 0 if e.decision == "keep" else run + 1
+        stagnant[track.name] = run
         if run >= cfg.intro_stagnation:
-            reasons.append(f"track {track['name']}: {run} scored experiments in a row without a keep")
+            reasons.append(f"track {track.name}: {run} scored experiments in a row without a keep")
     if cfg.intro_max_days is not None and recent:
-        anchor = parse_time(last["closed"]) if last else parse_time(min(e["created"] for e in exps))
+        anchor = parse_time(last.closed) if last and last.closed else parse_time(min(e.created for e in exps))
         days = (parse_time(now()) - anchor).total_seconds() / 86400
         if days > cfg.intro_max_days:
-            since = f"{last['id']}" if last else "the first experiment"
+            since = f"{last.id}" if last else "the first experiment"
             reasons.append(f"{days:.1f} days since {since}, the limit is {cfg.intro_max_days}")
     return {
         "due": bool(reasons),
         "reasons": reasons,
-        "open": opened["id"] if opened else None,
-        "waiting": waiting["id"] if waiting else None,
-        "last": last["id"] if last else None,
-        "last_decision": last.get("decision") if last else None,
-        "reload": last["id"] if last and not last.get("reloaded") else None,
+        "open": opened.id if opened else None,
+        "waiting": waiting.id if waiting else None,
+        "last": last.id if last else None,
+        "last_decision": last.decision if last else None,
+        "reload": last.id if last and not last.reloaded else None,
         "judged_since": len(recent),
-        "window": [e["id"] for e in recent],
+        "window": [e.id for e in recent],
         "stagnant": stagnant,
+        "unconfirmed": [c["id"] for c in unconfirmed],
     }
 
 
@@ -271,8 +343,8 @@ def next_action(ledger: Ledger, data: str | None = None, env: dict[str, Any] | N
     A person's word first (the contract, a pause, a decision that waits for
     them), then work that is unfinished, then the gates, then new work.
     data: the digest of the data files, when the caller has it at hand.
-    env: what the python a job would get answered (its "digest"), or the
-    "problem" with it, when the caller has asked.
+    env: what the python a job would get answered, or the "problem" with it,
+    when the caller has asked.
     """
     if not ledger.exists():
         return {"stage": "setup", "why": f"no {ledger.name}/arl.toml in {ledger.home}"}
@@ -294,37 +366,37 @@ def next_action(ledger: Ledger, data: str | None = None, env: dict[str, Any] | N
     if state["waiting"]:
         return {"stage": "wait", "target": state["waiting"], "why": state["reasons"][0], "stop": True}
 
-    tracks = {t["name"]: t for t in ledger.tracks()}
-    env_digest, env_problem = (env or {}).get("digest"), (env or {}).get("problem")
+    tracks = {t.name: t for t in ledger.tracks()}
+    env_problem = (env or {}).get("problem")
 
-    def no_reference(e: dict[str, Any]) -> bool:
-        if e["type"] not in ("tune", "feature") or e["track"] not in tracks:
+    def no_reference(e: Record) -> bool:
+        if e.type not in ("tune", "feature") or e.track not in tracks:
             return False
-        return reference_for(ledger, tracks[e["track"]], lock["eval_digest"], data, env_digest) is None
+        return reference_for(ledger, tracks[e.track], lock["eval_digest"], data) is None
 
     for e in exps:
-        if e["status"] == "judging":
-            return {"stage": "unfinished", "target": e["id"], "why": f"the verdict of {e['id']} was cut off before it was complete"}
+        if e.status == "judging":
+            return {"stage": "unfinished", "target": e.id, "why": f"the verdict of {e.id} was cut off before it was complete"}
     for e in exps:
-        if e["status"] == "running":
+        if e.status == "running":
             if not stale(e):
-                return {"stage": "running", "target": e["id"], "why": f"{e['id']} is running (pid {e.get('pid')})"}
+                return {"stage": "running", "target": e.id, "why": f"{e.id} is running (pid {e.pid})"}
             if not env_problem:  # with no environment nothing can be continued: that is said below
-                return {"stage": "interrupted", "target": e["id"], "why": f"the run of {e['id']} ended without a result"}
+                return {"stage": "interrupted", "target": e.id, "why": f"the run of {e.id} ended without a result"}
     for e in exps:
-        if e["status"] == "evaluated":
-            return {"stage": "judge", "target": e["id"], "why": f"{e['id']} has a result and no verdict"}
+        if e.status == "evaluated":
+            return {"stage": "judge", "target": e.id, "why": f"{e.id} has a result and no verdict"}
     if env_problem:
         return {"stage": "environment", "why": env_problem, "stop": True}
     for e in exps:
-        if e["status"] == "crashed":
-            tries = len(e.get("attempts", []))
-            why = f"{e['id']} failed {tries} time(s)"
+        if e.status == "crashed":
+            tries = len(e.attempts)
+            why = f"{e.id} failed {tries} time(s)"
             if tries >= cfg.max_attempts:
                 why += ", the limit: judge it as a crash"
             elif no_reference(e):
-                why += f" and track {e['track']} has no reference any more: judge it as a crash"
-            return {"stage": "crashed", "target": e["id"], "why": why}
+                why += f" and track {e.track} has no reference any more: judge it as a crash"
+            return {"stage": "crashed", "target": e.id, "why": why}
     if state["open"]:
         return {"stage": "introspect", "target": state["open"], "why": f"{state['open']} is open"}
     if state["last_decision"] == "stop":
@@ -334,31 +406,37 @@ def next_action(ledger: Ledger, data: str | None = None, env: dict[str, Any] | N
     changed = ledger.changed_since_reload()
     if changed:
         return {"stage": "reload", "why": f"{', '.join(changed)} changed since the last reload"}
-    hit = target_met(ledger)
-    if hit:
-        return {"stage": "target", "target": hit["id"], "why": f"{hit['id']} reached the target", "stop": True}
+    hit = target_claim(ledger, lock, data)
+    if hit and hit["state"] == "confirmed":
+        return {"stage": "target", "target": hit["id"], "why": claim_text(hit), "stop": True}
     spent = budget(ledger)
+    if hit and not spent["hours_spent"]:  # the run that confirms it takes hours like any other
+        return {"stage": "confirm", "target": hit["id"], "split": hit["split"], "why": claim_text(hit)}
     for e in exps:
-        if e["status"] == "paused":
+        if e.status == "paused":
             if spent["hours_spent"]:
                 break
-            how = (e.get("attempts") or [{}])[-1].get("paused", "it was interrupted")
-            return {"stage": "resume", "target": e["id"], "why": how}
+            how = (e.attempts[-1].paused if e.attempts else None) or "it was interrupted"
+            return {"stage": "resume", "target": e.id, "why": how}
     if spent["spent"]:
-        return {"stage": "budget", "why": "; ".join(spent["spent"]), "stop": True}
+        return {"stage": "budget", "why": "; ".join(spent["spent"] + ([claim_text(hit)] if hit else [])), "stop": True}
     for e in exps:
-        if e["status"] == "draft":
+        if e.status == "draft":
             if no_reference(e):
-                why = f"{e['id']} was drafted against a reference that no longer counts"
-                return {"stage": "outdated", "target": e["id"], "why": why}
-            return {"stage": "design", "target": e["id"], "why": f"{e['id']} is drafted and has not run"}
+                why = f"{e.id} was drafted against a reference that no longer counts"
+                return {"stage": "outdated", "target": e.id, "why": why}
+            return {"stage": "design", "target": e.id, "why": f"{e.id} is drafted and has not run"}
     if state["due"]:
         return {"stage": "introspect", "why": "; ".join(state["reasons"])}
 
-    active = [t for t in tracks.values() if t["status"] == "active"]
+    active = [t for t in tracks.values() if t.status == "active"]
     if not active:
         return {"stage": "track", "why": "no active track"}
     for t in active:
-        if reference_for(ledger, t, lock["eval_digest"], data, env_digest) is None:
-            return {"stage": "baseline", "target": t["name"], "why": why_no_reference(ledger, t, lock, data, env)}
+        if reference_for(ledger, t, lock["eval_digest"], data) is None:
+            return {
+                "stage": "baseline",
+                "target": t.name,
+                "why": f"track {t.name} has no reference under contract v{lock['version']} and the data as it is",
+            }
     return {"stage": "hypothesize", "why": "nothing in flight, no gate closed"}

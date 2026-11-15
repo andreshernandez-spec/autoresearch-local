@@ -7,6 +7,7 @@ how close that is to a target it keeps to itself. Enough to exercise every gate.
 from __future__ import annotations
 
 import contextlib
+import datetime
 import io
 import json
 import re
@@ -39,6 +40,8 @@ a = p.parse_args()
 params = json.load(open(a.params))
 if params.get("crash"):
     sys.exit(3)
+if params.get("silent") in (True, a.split):
+    sys.exit(0)  # ends well and leaves nothing behind: always, or on one split
 if params.get("hog_mb"):
     hog = b"x" * (params["hog_mb"] << 20)
 if params.get("deaf"):
@@ -104,13 +107,14 @@ keep = ["*.json", "*.csv"]
 command = "{python} research/eval/evaluate.py --out {{out}} --metrics {{metrics}} --split {{split}}"
 timeout_s = 60
 frozen = ["research/eval"]
-splits = ["dev", "confirm"]
+splits = [{splits}]
 
 [[metric]]
 name = "score"
 goal = "max"
 role = "primary"
 min_delta = 0.01
+{target}
 
 [[metric]]
 name = "cost"
@@ -158,7 +162,7 @@ class Project:
         path.write_text(_FILL.sub("Written for the test.", path.read_text()))
 
     def contract(self, **over) -> None:
-        cfg = dict(worktrees=str(self.base / "wt"), python=sys.executable, timeout=60, max_experiments=40, every=6, stagnation=4, extra="", grace=5, budget="")
+        cfg = dict(worktrees=str(self.base / "wt"), python=sys.executable, timeout=60, max_experiments=40, every=6, stagnation=4, extra="", grace=5, budget="", splits='"dev", "confirm"', target="")
         cfg.update(over)
         (self.research / "arl.toml").write_text(ARL_TOML.format(**cfg))
 
@@ -181,12 +185,12 @@ class Project:
         return hid
 
     def draft(self, typ: str, track: str = "main-line", title: str = "", hyps: tuple[str, ...] = (), params: dict | None = None, offset: float | None = None, extra: tuple[str, ...] = ()) -> str:
-        before = {r["id"] for r in self.ledger.experiments()}
+        before = {r.id for r in self.ledger.experiments()}
         args = ["exp", "new", "--type", typ, "--track", track, "--title", title or f"{typ} run"]
         for h in hyps:
             args += ["--hyp", h]
         self.arl(*args, *extra)
-        eid = next(r["id"] for r in self.ledger.experiments() if r["id"] not in before)
+        eid = next(r.id for r in self.ledger.experiments() if r.id not in before)
         exp = self.ledger.exp_dir(eid)
         self.fill(exp / "design.md")
         if params is not None:
@@ -219,17 +223,25 @@ class Project:
         return eid
 
     def record(self, eid: str) -> dict:
-        return self.ledger.record(eid)
+        """What record.json holds. Tests look at the file, which is what a person or another program reads."""
+        return json.loads((self.ledger.exp_dir(eid) / "record.json").read_text())
+
+    def records(self) -> list[dict]:
+        return [json.loads(path.read_text()) for path in sorted(self.research.glob("experiments/E*/record.json"))]
+
+    def save_record(self, rec: dict) -> None:
+        """Put a record back as a test changed it by hand."""
+        (self.ledger.exp_dir(rec["id"]) / "record.json").write_text(json.dumps(rec, indent=2) + "\n")
 
     def introspect(self, decision: str = "continue", *extra: str, reload: bool = True) -> str:
         """Open an introspection, write it, close it with nothing new to record, reload."""
-        before = {n["id"] for n in self.ledger.introspections()}
+        before = {n.id for n in self.ledger.introspections()}
         self.arl("introspect", "new", "--trigger", "asked")
-        nid = next(n["id"] for n in self.ledger.introspections() if n["id"] not in before)
+        nid = next(n.id for n in self.ledger.introspections() if n.id not in before)
         self.fill(self.research / "introspections" / f"{nid}.md")
         flags = extra or NOTHING_NEW
         self.arl("introspect", "close", nid, "--decision", decision, *flags)
-        if reload and self.ledger.introspection(nid)[0]["status"] == "closed":
+        if reload and self.ledger.introspection(nid)[0].status == "closed":
             self.arl("reload")
         return nid
 
@@ -248,20 +260,15 @@ def cut_off(p: "Project", eid: str, child: dict | None = None) -> None:
     rec = p.record(eid)
     wt = p.ledger.worktree_path(rec["track"])
     code = git(wt, "rev-parse", "HEAD")
-    rec["attempts"].append({"n": len(rec["attempts"]) + 1, "started": LONG_AGO, "code_commit": code, "segments": [{"started": LONG_AGO}]})
+    # A job that is still going is charged until it is stopped: it started a moment ago, not last winter.
+    began = datetime.datetime.now().astimezone().isoformat(timespec="seconds") if child else LONG_AGO
+    rec["attempts"].append({"n": len(rec["attempts"]) + 1, "started": began, "code_commit": code, "segments": [{"started": began}]})
     rec.update(status="running", pid=DEAD_PID, pid_start=1, code_commit=code)
     rec.setdefault("contract", {k: lock[k] for k in ("version", "digest", "eval_digest")})
     rec.setdefault("conditions", {"command": p.ledger.cfg.run_command, "split": "dev", "worktree": str(wt), "data": [], "data_digest": runner.data_digest([])})
-    try:
-        probed = runner.probe_env(p.ledger)
-    except cli.ArlError:
-        probed = None
-    if probed and probed.get("digest"):  # the packages it started with, as a real run records them
-        rec["conditions"].setdefault("env_digest", probed["digest"])
-        rec["conditions"].setdefault("env", {k: probed[k] for k in ("prefix", "python", "versions") if k in probed})
     if child:
         rec["child"] = child
-    p.ledger.save_record(rec)
+    p.save_record(rec)
 
 
 def pause_record(p: "Project", eid: str, seconds: float = 1.0) -> None:
@@ -274,7 +281,7 @@ def pause_record(p: "Project", eid: str, seconds: float = 1.0) -> None:
     rec["status"] = "paused"
     for key in ("pid", "pid_start"):
         rec.pop(key)
-    p.ledger.save_record(rec)
+    p.save_record(rec)
 
 
 def make_env(path: Path) -> Path:
@@ -296,10 +303,9 @@ def install(env: Path, name: str, version: str, editable: Path | None = None) ->
         (info / "direct_url.json").write_text(json.dumps({"url": f"file://{editable}", "dir_info": {"editable": True}}))
 
 
-def env_table(env: Path, *packages: str) -> str:
-    """The [env] table of a contract that names this environment and these packages."""
-    named = f"packages = {json.dumps(list(packages))}\n" if packages else ""
-    return f'[env]\nprefix = "{env}"\n{named}'
+def env_table(env: Path) -> str:
+    """The [env] table of a contract that names this environment."""
+    return f'[env]\nprefix = "{env}"\n'
 
 
 LAUNCHER = Path(__file__).resolve().parent.parent / "bin" / "arl"

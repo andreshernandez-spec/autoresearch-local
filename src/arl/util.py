@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import hashlib
 import json
@@ -50,9 +51,18 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def as_text(value: Any) -> str:
+    """What JSON cannot write by itself (a path, a time), as text. A record is not one of
+    those: it is written through record.dump, and one that got here unconverted would be
+    stored as a line of text that nothing can read back."""
+    if dataclasses.is_dataclass(value):
+        raise TypeError(f"a {type(value).__name__} is written with record.dump, not as it is")
+    return str(value)
+
+
 def canonical(obj: Any) -> str:
     """JSON with a fixed key order, for hashing."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=as_text)
 
 
 def slugify(text: str, max_len: int = 36) -> str:
@@ -81,7 +91,7 @@ def read_json(path: Path) -> Any:
 
 
 def write_json(path: Path, obj: Any) -> None:
-    write_text(path, json.dumps(obj, indent=2, default=str) + "\n")
+    write_text(path, json.dumps(obj, indent=2, default=as_text) + "\n")
 
 
 # --- what a person or an agent types ---------------------------------------------

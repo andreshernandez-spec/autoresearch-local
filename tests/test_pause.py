@@ -16,7 +16,8 @@ from pathlib import Path
 
 import pytest
 
-from arl import cli, runner
+from arl import runner
+from arl.commands import common
 from conftest import Project, cut_off, git, job_pid, launch, pause_record, pid_alive, prediction, saved_step, wait_for
 
 SLOW = {"x": 0.5, "steps": 60, "step_s": 0.1}  # six seconds of work, saved after every step
@@ -145,9 +146,9 @@ def test_paused_run_continues_only_what_it_started(project: Project, monkeypatch
     (wt / "run.py").write_text((wt / "run.py").read_text().replace("OFFSET = 0.1", "OFFSET = 0.6"))
     evaluator = p.research / "eval" / "evaluate.py"
     evaluator.write_text(evaluator.read_text() + "\n# stricter\n")
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     p.arl("freeze", "--reason", "stricter", "--yes")
-    monkeypatch.setattr(cli, "interactive", lambda: False)
+    monkeypatch.setattr(common, "interactive", lambda: False)
     out = p.arl("exp", "run", eid, code=1)
     assert "the contract was frozen anew since" in out and "--verdict crash" in out
     p.judge(eid, "crash")
@@ -274,14 +275,14 @@ def test_loop_is_paused_with_a_note_and_resumed(project: Project):
 def test_pause_set_at_a_terminal_is_lifted_at_a_terminal(project: Project, monkeypatch):
     p = project
     p.started()
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     p.arl("pause", "--reason", "away until Monday")
     assert p.ledger.paused()["by"] == "a person at a terminal"
-    monkeypatch.setattr(cli, "interactive", lambda: False)
+    monkeypatch.setattr(common, "interactive", lambda: False)
     out = p.arl("resume", code=1)  # the agent does not decide that Monday has come
     assert "paused by a person at a terminal" in out and p.ledger.paused() is not None
     assert "by a person at a terminal: away until Monday" in p.arl("next")
-    monkeypatch.setattr(cli, "interactive", lambda: True)
+    monkeypatch.setattr(common, "interactive", lambda: True)
     assert "NEXT: hypothesize" in p.arl("resume")
 
 
