@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import collections
 import re
+import tomllib
 from pathlib import Path
 from typing import Any
 
 from . import contract, rules, runner
 from .ledger import Ledger
 from .record import Record, Rerun, dump, need
-from .util import ArlError, fmt, now, read_text
+from .util import ArlError, fmt, now, read_front, read_text
 
 ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = ROOT / "bin" / "arl"
@@ -343,6 +344,43 @@ def _section(body: str, heading: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+def _quoted(body: str | None, heading: str) -> list[str]:
+    """A section of a ledger file as it is written, indented, or a few words on why there is none."""
+    if body is None:
+        return ["  (the file cannot be read)"]
+    if not re.search(rf"^## {re.escape(heading)}", body, re.M):
+        return [f"  (the file has no '## {heading}' section)"]
+    text = _section(body, heading)
+    if not text:
+        return ["  (empty)"]
+    if not re.sub(r"^\s*>?\s*FILL:.*$", "", text, flags=re.M).strip():
+        return ["  (not written: still the FILL line of the template)"]
+    return [f"  {line}".rstrip() for line in text.splitlines()]
+
+
+def _respect(ledger: Ledger, rec: Record) -> str:
+    """Below the design steps: the track's "Stop if" and the tripwires the latest closed
+    introspection set, as they are written. A design that goes past either has to say why."""
+    track = ledger.track_path(rec.track)
+    try:
+        body: str | None = read_front(track)[1]
+    except (ArlError, OSError, tomllib.TOMLDecodeError):
+        body = None
+    out = ["", "What the design must respect:", "", f'"Stop if" of track {rec.track} ({ledger.rel(track)}):', *_quoted(body, "Stop if"), ""]
+    last = rules.introspection_state(ledger)["last"]
+    if last:
+        path = ledger.intro_path(last)
+        try:
+            body = read_front(path)[1]
+        except (ArlError, OSError, tomllib.TOMLDecodeError):
+            body = None
+        out += [f"Tripwires set by {last}, the latest closed introspection ({ledger.rel(path)}):", *_quoted(body, "6. Tripwires")]
+    else:
+        out.append("Tripwires: none, no introspection has been closed yet.")
+    out += ["", "If one of these has fired, this design is its action, or the design says why not."]
+    return "\n".join(out) + "\n"
+
+
 def _activity_facts(ledger: Ledger, events: list[dict[str, Any]], window: list[Record], reruns: list[tuple[str, Rerun]]) -> list[str]:
     """Part 2 and part 3 start from this: what was refused, what failed, what was noted.
 
@@ -520,4 +558,7 @@ def next_text(ledger: Ledger, action: dict[str, Any]) -> str:
             where="when it is run once more" if again else f"on '{split}', where the loop never looked",
         )
     head = f"NEXT: {stage}" + (f" {action['target']}" if action.get("target") else "")
-    return f"{head}\nWhy: {action.get('why', '')}\n\n" + fill(template(f"briefs/{name}.md"), **ctx)
+    text = fill(template(f"briefs/{name}.md"), **ctx)
+    if stage == "design":
+        text += _respect(ledger, ledger.record(action["target"]))
+    return f"{head}\nWhy: {action.get('why', '')}\n\n" + text

@@ -190,7 +190,10 @@ it, what should be seen if it is true, and what would refute it. No code, no
 plan. Look at the open hypotheses, at `KNOWLEDGE.md` and at `IDEAS.md` before
 writing a new one.
 
-**Design** (`arl exp new`). Pick the kind:
+**Design** (`arl exp new`). The brief ends with the "Stop if" of the track
+and the tripwires the latest closed introspection set, as they are written.
+If one of them has fired, the design is what it calls for, or the design
+says why not. Pick the kind:
 
 | Kind | Use it when | Changes | Scored | Merged |
 |---|---|---|---|---|
