@@ -10,7 +10,7 @@ from typing import Any
 
 from . import contract, rules, runner
 from .ledger import Ledger
-from .record import Record, dump, need
+from .record import Record, Rerun, dump, need
 from .util import ArlError, fmt, now, read_text
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -328,8 +328,11 @@ def _section(body: str, heading: str) -> str:
     return match.group(1).strip() if match else ""
 
 
-def _activity_facts(ledger: Ledger, events: list[dict[str, Any]], window: list[Record]) -> list[str]:
-    """Part 2 and part 3 start from this: what was refused, what failed, what was noted."""
+def _activity_facts(ledger: Ledger, events: list[dict[str, Any]], window: list[Record], reruns: list[tuple[str, Rerun]]) -> list[str]:
+    """Part 2 and part 3 start from this: what was refused, what failed, what was noted.
+
+    reruns: the failed or cut-short reruns no introspection has listed yet.
+    """
     out = ["How the work went in this window (for part 2):", ""]
     refused = collections.Counter()
     example: dict[str, str] = {}
@@ -352,6 +355,8 @@ def _activity_facts(ledger: Ledger, events: list[dict[str, Any]], window: list[R
             for seg in a.segments:
                 if seg.ended_by not in (None, "finished", "failed"):
                     failures.append(f"- {e.id} attempt {a.n}: a part of the run ended early ({seg.ended_by})")
+    for eid, r in reruns:
+        failures.append(f"- {eid} rerun {r.n} on {r.split}{' (cut short)' if r.interrupted else ''}: {str(r.failed).splitlines()[0][:200]}")
     out += ["", "Runs that failed or were cut short:" if failures else "Runs that failed or were cut short: none."] + failures
     for about, label in (("work", "Notes about the way of working"), ("problem", "Notes about the problem (for part 3)")):
         notes = [ev for ev in events if ev.get("kind") == "note" and ev.get("about") == about]
@@ -380,7 +385,7 @@ def _env_window_facts(ledger: Ledger, window: list[Record]) -> list[str]:
     return ["The environment changed between runs (a possible reason for a changed score; `arl exp env <id> <other>` lists everything):", ""] + out
 
 
-def introspection_facts(ledger: Ledger, trigger: str, state_: dict[str, Any], activity_from: int) -> str:
+def introspection_facts(ledger: Ledger, trigger: str, state_: dict[str, Any], activity_from: int, reruns: list[tuple[str, Rerun]]) -> str:
     lock = contract.load(ledger)
     by_id = {e.id: e for e in ledger.experiments()}
     window = [by_id[i] for i in state_["window"]]
@@ -403,7 +408,7 @@ def introspection_facts(ledger: Ledger, trigger: str, state_: dict[str, Any], ac
     if state_["last"]:
         tripwires = _section(ledger.introspection(state_["last"])[1], "6. Tripwires")
         out += ["", f"Tripwires set by {state_['last']}:", "", tripwires or "none written"]
-    out += [""] + _activity_facts(ledger, ledger.activity()[activity_from:], window)
+    out += [""] + _activity_facts(ledger, ledger.activity()[activity_from:], window, reruns)
     return "\n".join(out)
 
 

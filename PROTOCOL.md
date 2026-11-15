@@ -249,8 +249,8 @@ yourself with `--trigger`. It has four parts, in this order:
    change, or is a completely different approach due? Argue against the current
    path as well as you can, and go through every open idea.
 2. **How the work went.** Not about the problem: about the way of working. The
-   introspection file lists the commands arl refused, the runs that failed or
-   were cut short, and your notes. Whatever deserves a standing instruction is
+   introspection file lists the commands arl refused, the runs and reruns that
+   failed or were cut short, and your notes. Whatever deserves a standing instruction is
    recorded with `arl lesson add`: `--scope general` when it would hold in any
    project (a wrong git action, a habit that wasted a run), `--scope project`
    when it is about this project's tools and data.

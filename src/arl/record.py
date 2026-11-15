@@ -272,6 +272,7 @@ class Introspection:
     window: list[str] = field(default_factory=list)  # the experiments judged since the one before
     unconfirmed: list[str] = field(default_factory=list)  # results that met the target and did not hold
     activity_upto: int | None = None  # how far into activity.jsonl its facts go
+    reruns: list[str] | None = None  # the failed or cut-short reruns its facts listed, as E0007/2; None from an older arl
     knowledge_sha256: str | None = None  # KNOWLEDGE.md when it was opened
     lessons_general: int | None = None  # lessons on file when it was opened
     lessons_project: int | None = None

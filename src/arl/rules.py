@@ -10,7 +10,7 @@ from . import contract
 from .config import Config
 from .ledger import Ledger
 from .runner import alive
-from .record import Comparison, Record, Track, need
+from .record import Comparison, Record, Rerun, Track, need
 from .util import now, parse_time
 
 SCORED = ("baseline", "tune", "feature")
@@ -344,6 +344,34 @@ def introspection_state(ledger: Ledger) -> dict[str, Any]:
         "stagnant": stagnant,
         "unconfirmed": [c["id"] for c in unconfirmed],
     }
+
+
+def unlisted_reruns(ledger: Ledger) -> list[tuple[str, Rerun]]:
+    """Reruns that failed or were cut short and that no introspection has listed yet.
+
+    A rerun belongs to no window: it can come long after its experiment was judged.
+    So each introspection keeps the ones its facts named. One written by an older arl
+    kept nothing: the reruns that started before it opened (in that second too) are left
+    to it, so the first introspection after an upgrade does not list the whole history.
+    """
+    earlier = ledger.introspections()
+    listed = {key for n in earlier for key in n.reruns or []}
+    try:
+        cutoff = max((parse_time(n.opened) for n in earlier if n.reruns is None and n.opened), default=None)
+    except ValueError:
+        cutoff = None
+    out = []
+    for e in ledger.experiments():
+        for r in e.reruns:
+            if not r.failed or f"{e.id}/{r.n}" in listed:
+                continue
+            try:
+                if cutoff is not None and parse_time(r.at) <= cutoff:
+                    continue
+            except ValueError:
+                pass  # a time that cannot be read: say it rather than lose it
+            out.append((e.id, r))
+    return out
 
 
 # --- what comes next --------------------------------------------------------------

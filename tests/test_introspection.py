@@ -15,7 +15,7 @@ import pytest
 
 from arl import cli, runner
 from arl import ledger as ledger_module
-from conftest import NOTHING_NEW, Project, git
+from conftest import DEAD_PID, NOTHING_NEW, Project, git
 
 
 def lesson(p: Project, scope: str, title: str, body: str = "What happened. What to do instead.", *extra: str) -> str:
@@ -131,6 +131,48 @@ def test_recent_activity_is_laid_out_for_parts_two_and_three(project: Project):
     assert "Commands arl refused: 1." in facts and "no experiment <id>" in facts
     assert "ran the evaluator in the foreground" not in facts
     assert "Notes about the way of working: none." in facts and "Runs that failed or were cut short: none." in facts
+
+
+def test_a_rerun_that_failed_is_among_the_runs_that_failed(project: Project):
+    """A rerun can come long after its experiment's window: its time decides which introspection lists it."""
+    p = project
+    h = p.started()
+    eid = p.draft("tune", hyps=(h,), params={"x": 0.5, "silent": "confirm"})  # leaves nothing behind on 'confirm'
+    p.arl("exp", "run", eid)
+    p.judge(eid, "keep", "--hyp", f"{h}=supported")
+    p.arl("exp", "reproduce", eid, "--split", "confirm", code=2)
+    p.arl("introspect", "new", "--trigger", "asked")
+    facts = (p.research / "introspections" / "N001.md").read_text()
+    assert "Runs that failed or were cut short: none." not in facts
+    assert f"- {eid} rerun 1 on confirm: the rerun wrote nothing into its output folder" in facts
+    p.fill(p.research / "introspections" / "N001.md")
+    p.arl("introspect", "close", "N001", "--decision", "continue", *NOTHING_NEW)
+    p.arl("reload")
+
+    rec = p.record(eid)  # the arl that ran a rerun was killed and left it behind
+    rec["rerun"] = {"n": 2, "split": "dev", "started": rec["reruns"][0]["at"], "pid": DEAD_PID, "pid_start": 1}
+    p.save_record(rec)
+    assert "reproduced: True" in p.arl("exp", "reproduce", eid)  # finds it, books it, runs its own
+    p.arl("introspect", "new", "--trigger", "asked")
+    facts = (p.research / "introspections" / "N002.md").read_text()
+    assert f"- {eid} rerun 2 on dev (cut short): interrupted: the arl that ran it was gone" in facts
+    assert "rerun 1 on confirm" not in facts and "rerun 3" not in facts  # listed before, and the one that worked
+    assert p.ledger.introspection("N001")[0].reruns == [f"{eid}/1"] and p.ledger.introspection("N002")[0].reruns == [f"{eid}/2"]
+
+
+def test_an_introspection_from_an_older_arl_saw_the_reruns_before_it(project: Project):
+    p = project
+    h = p.started()
+    eid = p.draft("tune", hyps=(h,), params={"x": 0.5, "silent": "confirm"})
+    p.arl("exp", "run", eid)
+    p.judge(eid, "keep", "--hyp", f"{h}=supported")
+    p.arl("exp", "reproduce", eid, "--split", "confirm", code=2)
+    p.introspect()
+    path = p.research / "introspections" / "N001.md"
+    path.write_text(path.read_text().replace(f'reruns = ["{eid}/1"]\n', ""))  # what an older arl wrote
+    assert p.ledger.introspection("N001")[0].reruns is None
+    p.arl("introspect", "new", "--trigger", "asked")
+    assert "Runs that failed or were cut short: none." in (p.research / "introspections" / "N002.md").read_text()
 
 
 def test_files_changed_by_someone_else_are_read_again(project: Project):

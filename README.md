@@ -42,8 +42,8 @@ also the path the skill file names. Cloned anywhere else it works the same:
 `arl introspect new` writes a file with the facts filled in: the experiments
 judged since the last one, the state of every track, the budget, the open
 hypotheses and ideas, the tripwires the last introspection set, and what the
-activity log holds (commands arl refused, runs that failed or were cut short,
-notes written in passing). The agent writes the rest, in four parts:
+activity log holds (commands arl refused, runs and reruns that failed or were
+cut short, notes written in passing). The agent writes the rest, in four parts:
 
 | Part | Question | What it leaves behind |
 |---|---|---|

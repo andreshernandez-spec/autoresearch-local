@@ -44,6 +44,7 @@ def cmd_introspect_new(args: argparse.Namespace) -> int:
         events = ledger.activity()
         earlier = [n for n in ledger.introspections() if n.activity_upto is not None]
         activity_from = (earlier[-1].activity_upto or 0) if earlier else 0
+        reruns = rules.unlisted_reruns(ledger)
         meta = Introspection(
             id=nid,
             status="open",
@@ -52,11 +53,12 @@ def cmd_introspect_new(args: argparse.Namespace) -> int:
             window=state["window"],
             unconfirmed=state["unconfirmed"],
             activity_upto=len(events),
+            reruns=[f"{eid}/{r.n}" for eid, r in reruns],
             knowledge_sha256=ledger.knowledge_hash(),
             lessons_general=len(ledger.lessons("general")),
             lessons_project=len(ledger.lessons("project")),
         )
-        facts = render.introspection_facts(ledger, trigger, state, activity_from)
+        facts = render.introspection_facts(ledger, trigger, state, activity_from, reruns)
         save_front(ledger.intro_root / f"{nid}.md", meta, render.fill(render.template("introspection.md"), id=nid, facts=facts))
         write_text(ledger.status_path, render.status(ledger))
     print(f"{nid} opened: {ledger.intro_root / f'{nid}.md'}")
