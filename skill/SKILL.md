@@ -149,7 +149,8 @@ equal and which are free, before building a gate around it.
 
 ## Answering "what happened"
 
-`arl status` for the overview, `arl exp list`, `arl exp show <id>` for one
+`arl status` for the overview, `arl exp list`, `arl plot [metric]` for the
+course of a metric over the experiments, `arl exp show <id>` for one
 experiment's conditions and result (it also prints how to run it again and how
 to start a track from it), `arl exp env <id> [<other>]` for what differs
 between its environment and today's or another experiment's, the `analysis.md` files for the reasoning,

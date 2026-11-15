@@ -396,6 +396,7 @@ class Walk:
                         ("guard", "--", "true"),
                         ("guard", "--no-lock", "--timeout", "30", "--", "false"),
                         ("status", "--json"),
+                        ("plot",),
                         ("freeze", "--reason", "typed without looking"),
                     ]
                 )

@@ -187,12 +187,18 @@ metric nobody was watching, or it was discarded and now looks right.
 
 ```sh
 arl exp list                        # every experiment: result, outcome, verdict
+arl plot                            # the primary metric against the experiment number, drawn in the terminal
+arl plot loss --goal min            # any other metric, also one the runs report about themselves
 arl exp show E0007                  # what it was, what it ran with, what came of it
 arl exp reproduce E0007             # run it again as it was, compare with the record
 arl exp reproduce E0007 --split confirm
 arl track new again --from E0007    # a new line of work that starts there
 ```
 
+- **See the course.** `plot` draws one point per experiment that has the
+  metric: `*` kept, `o` not kept, `.` scored under an earlier evaluator (not
+  comparable with the rest), and a line for the best kept so far. `--track`
+  takes one track, `--svg FILE` writes the same chart as an image.
 - **Look.** `exp show` prints the scores, the verdict and its reason, the
   commit, the params, the environment, the contract version with the commit
   that froze it, the arl version, and the git command that shows its code
