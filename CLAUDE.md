@@ -98,7 +98,7 @@ enforced. `PROTOCOL.md` is what an agent reads before using it.
 | `src/arl/commands/jobs.py` | a job arl started: the one path a run and a rerun take (`measure`), what may not change under it (`moved`), writing to a record in the middle of one (`amend`), keeping its outcome (`keep_outcome`), what a dead or interrupted process left (`settle`) |
 | `src/arl/commands/runs.py` | `exp run` and `exp reproduce`: the checks before a job starts, and where each writes what came of it |
 | `src/arl/commands/experiments.py` | an experiment from its draft to its verdict (`exp judge` and the order of its checks), and looking one up |
-| `src/arl/commands/` the rest | `project.py` (init, freeze, status, next, verify), `session.py` (pause, resume, reload, notes, lessons), `tracks.py`, `hypotheses.py` (and ideas), `introspections.py` |
+| `src/arl/commands/` the rest | `project.py` (init, freeze, status, next, verify, plot), `session.py` (pause, resume, reload, notes, lessons), `tracks.py`, `hypotheses.py` (and ideas), `introspections.py` |
 | `src/arl/rules.py` | outcome of a result, allowed verdicts, when an introspection is due, the budget, what comes next |
 | `src/arl/contract.py` | `frozen.lock`: the two digests and who may freeze |
 | `src/arl/record.py` | what an experiment's record, a track, a hypothesis and an introspection hold, as types; reading and writing them; what a status promises |
@@ -106,5 +106,6 @@ enforced. `PROTOCOL.md` is what an agent reads before using it.
 | `src/arl/runner.py` | running a job in its own session with limits, stopping it, machine gates, the environment a job gets, conditions written into a record |
 | `src/arl/config.py` | `arl.toml`, every value checked when it is read |
 | `src/arl/render.py` | `STATUS.md`, the facts in introspections and analyses, what a reload prints, the briefs |
+| `src/arl/plot.py` | the chart of `arl plot`: text for a terminal and an SVG, from points the command hands in |
 | `src/arl/templates/` | what `arl init` and the record commands write |
 | `helpers/arl_job.py` | what a job copies to save its state and stop when asked |
