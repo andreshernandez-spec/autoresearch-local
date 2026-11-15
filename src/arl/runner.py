@@ -31,6 +31,7 @@ from . import __version__
 from .config import Config
 from .gitops import Git
 from .ledger import Ledger
+from .record import Cpu
 from .util import EXIT_BUSY, ArlError, canonical, read_json, read_text, sha256_file, sha256_text, write_json
 
 _PLACEHOLDER = re.compile(r"\{(params|out|metrics|split|home|research|exp|worktree)\}")
@@ -101,8 +102,10 @@ def _gpu_free_mb() -> float | None:
 
 
 @contextlib.contextmanager
-def run_lock(ledger: Ledger) -> Generator[None, None, None]:
-    """One run at a time, across every project that names the same lock file."""
+def run_lock(ledger: Ledger, holder: str = "") -> Generator[None, None, None]:
+    """One run at a time, across every project that names the same lock file.
+
+    holder: what holds it, when that is not a run, for whoever finds it taken."""
     cfg = ledger.cfg
     path = Path(os.path.expanduser(cfg.lock)) if cfg.lock else ledger.dir / ".run.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -114,7 +117,7 @@ def run_lock(ledger: Ledger) -> Generator[None, None, None]:
             raise ArlError(f"another run holds {path} ({f.read().strip() or 'unknown'})", EXIT_BUSY) from e
         f.seek(0)
         f.truncate()
-        f.write(f"pid {os.getpid()} {ledger.cfg.name}")
+        f.write(f"pid {os.getpid()} {ledger.cfg.name}" + (f", {holder}" if holder else ""))
         f.flush()
         try:
             yield
@@ -253,13 +256,14 @@ def execute(
     cwd: Path,
     env: dict[str, str],
     timeout: float,
-    log: Path,
+    log: Path | None,
     max_rss_gb: float | None = None,
     min_free_ram_gb: float | None = None,
     on_start: Callable[[int], None] | None = None,
     pause_file: Path | None = None,
     pause_grace: float = QUICK_GRACE,
     heartbeat: Path | None = None,
+    peak: bool = False,
 ) -> dict[str, Any]:
     """Run through bash in a session of its own, output to a file.
 
@@ -269,22 +273,28 @@ def execute(
     low on memory, or arl itself being interrupted). A paused job can be
     continued later; a stopped one failed.
 
+    log: None sends the output where arl's own goes, for a command that is read as it runs.
     heartbeat: a file marked every second while the job is watched. If arl
     dies without a word, its time says how long the job had run by then,
     whether or not the job ever wrote a line.
+    peak: measure the memory of the job's processes every second, and return the
+    highest as peak_gb. Otherwise it is measured only to hold the job to max_rss_gb.
     """
-    log.parent.mkdir(parents=True, exist_ok=True)
+    if log is not None:
+        log.parent.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
     stopped = paused = ""
-    with open(log, "ab") as f:
-        f.write(f"$ cd {cwd} && {command}\n".encode())
-        f.flush()
+    top = 0.0
+    with open(log, "ab") if log is not None else contextlib.nullcontext() as f:
+        if f is not None:
+            f.write(f"$ cd {cwd} && {command}\n".encode())
+            f.flush()
         proc = subprocess.Popen(
             ["bash", "-c", command],
             cwd=cwd,
             env=env,
             stdout=f,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.STDOUT if f is not None else None,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
@@ -301,11 +311,13 @@ def execute(
                     pass
                 ticks += 1
                 mark(heartbeat)
+                held = _session_memory_gb(proc.pid) if peak or (max_rss_gb is not None and ticks % 2 == 0) else None
+                top = max(top, held or 0.0)
                 if time.monotonic() - start > timeout:
                     stopped = f"it passed its limit of {timeout:.0f} s"
                 elif pause_file is not None and pause_file.exists():
                     paused = "a pause was asked for"
-                elif ticks % 2 == 0 and max_rss_gb is not None and (held := _session_memory_gb(proc.pid)) > max_rss_gb:
+                elif max_rss_gb is not None and held is not None and held > max_rss_gb:
                     stopped = f"its processes held {held:.1f} GB of RAM, the limit is {max_rss_gb}"
                 elif min_free_ram_gb is not None and (free := _mem_available_gb()) is not None and free < min_free_ram_gb:
                     paused = f"the machine was down to {free:.1f} GB of free RAM, the floor is {min_free_ram_gb}"
@@ -323,7 +335,8 @@ def execute(
                 pause_file.unlink(missing_ok=True)
         if not (stopped or paused) and session_pids(proc.pid):
             stop_session(proc.pid)  # the job ended and left something running: nothing outlives a run
-    return {"exit_code": proc.returncode, "seconds": round(time.monotonic() - start, 2), "stopped": stopped, "paused": paused}
+    out = {"exit_code": proc.returncode, "seconds": round(time.monotonic() - start, 2), "stopped": stopped, "paused": paused}
+    return out | ({"peak_gb": round(top, 3)} if peak else {})
 
 
 def mark(path: Path | None) -> None:
@@ -633,11 +646,19 @@ def listing_changes(old: str, new: str) -> list[str]:
     return out
 
 
-def env_differences(ledger: Ledger, old: dict[str, Any] | None, new: dict[str, Any] | None, new_texts: dict[str, str] | None = None) -> list[str]:
+def env_differences(
+    ledger: Ledger,
+    old: dict[str, Any] | None,
+    new: dict[str, Any] | None,
+    new_texts: dict[str, str] | None = None,
+    cpus: tuple[Cpu | None, Cpu | None] = (None, None),
+) -> list[str]:
     """Everything two recorded environments differ in that could change a result:
-    the machine, the system, the GPU and its driver, python, and the package lists.
+    the machine, the system, the GPU and its driver, the CPUs and the variables
+    that say how to use them, python, and the package lists.
 
     new_texts: the lists of the newer one, when they are at hand and not stored.
+    cpus: the CPUs of the older and the newer one.
     Never raises: a record from an older arl, or a list that is gone, says less.
     """
     old, new, out = old or {}, new or {}, []
@@ -646,6 +667,7 @@ def env_differences(ledger: Ledger, old: dict[str, Any] | None, new: dict[str, A
             out.append(f"{label} {old[key]} -> {new[key]}")
     if old.get("gpu") and new.get("gpu") and old["gpu"] != new["gpu"]:
         out.append(f"GPU and driver {'; '.join(map(str, old['gpu']))} -> {'; '.join(map(str, new['gpu']))}")
+    out += cpu_differences(*cpus)
     both = [key for key in LISTS if old.get(key) and new.get(key)]
     if both:
         key = both[0]  # arl's own list when both runs have it: one format, every package with its version
@@ -660,6 +682,43 @@ def env_differences(ledger: Ledger, old: dict[str, Any] | None, new: dict[str, A
     elif any(old.get(key) for key in LISTS) and any(new.get(key) for key in LISTS):
         out.append("the package lists of the two are of different kinds and cannot be compared (one is arl's own, the other the output of [env] command)")
     return out
+
+
+# Set in a job's environment, these change how numerical libraries split their work, or
+# where it runs, and with that the bits of a result.
+NUMERIC_VARS = ("XLA_FLAGS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "JAX_PLATFORMS", "CUDA_VISIBLE_DEVICES")
+
+
+def cpu_conditions(env: dict[str, str]) -> Cpu:
+    """The CPUs a job started now can use: it inherits arl's affinity, and env is the
+    environment it is given."""
+    try:
+        affinity: int | None = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        affinity = None  # a system that does not say
+    return Cpu(affinity=affinity, count=os.cpu_count(), variables={k: env[k] for k in NUMERIC_VARS if k in env})
+
+
+def cpu_differences(old: Cpu | None, new: Cpu | None) -> list[str]:
+    """What two records say differently about the CPUs. A record from before they were kept says nothing."""
+    if old is None or new is None:
+        return []
+    out = []
+    for label, before, after in (("CPUs the job could use", old.affinity, new.affinity), ("CPUs of the machine", old.count, new.count)):
+        if before is not None and after is not None and before != after:
+            out.append(f"{label} {before} -> {after}")
+    for name in sorted({*old.variables, *new.variables}):
+        before, after = old.variables.get(name), new.variables.get(name)
+        if before != after:
+            out.append(f"{name} {'unset' if before is None else repr(before)} -> {'unset' if after is None else repr(after)}")
+    return out
+
+
+def cpu_text(cpu: Cpu) -> str:
+    """The CPUs of a record in one line."""
+    could = f"{cpu.affinity} of the {cpu.count} of the machine" if cpu.affinity is not None else f"the machine's {cpu.count}"
+    said = ", ".join(f"{k}={v!r}" for k, v in sorted(cpu.variables.items())) or f"none of {', '.join(NUMERIC_VARS)}"
+    return f"the job could use {could}; set: {said}"
 
 
 def differences(n: int) -> str:

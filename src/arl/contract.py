@@ -8,7 +8,8 @@ every run checks the hashes first. The lock carries two digests:
   tables and the environment the contract names ([env] prefix). Scores are
   compared only within one eval_digest, so raising the budget does not ask for
   a new baseline, and touching the evaluator or moving to another environment
-  does.
+  does. [eval] split_size is left out: it says how large a split is, not how
+  it is scored.
 
 The first freeze can be done by anyone. Once an experiment exists, a new freeze
 needs a person at a terminal.
@@ -70,7 +71,10 @@ def current(ledger: Ledger) -> dict[str, Any]:
     files = {ledger.rel(ledger.dir / f): sha256_file(ledger.dir / f) for f in CONTRACT_FILES}
     files.update(evals)
     raw = cfg.raw
-    scoring = {"files": evals, "run": raw.get("run"), "eval": raw.get("eval"), "metric": raw.get("metric")}
+    scored_by = raw.get("eval")
+    if isinstance(scored_by, dict) and "split_size" in scored_by:  # only then: every digest from before stays what it was
+        scored_by = {k: v for k, v in scored_by.items() if k != "split_size"}
+    scoring = {"files": evals, "run": raw.get("run"), "eval": scored_by, "metric": raw.get("metric")}
     if cfg.env_prefix:
         scoring["env"] = cfg.env_prefix  # a score belongs to the environment it was computed in
     return {

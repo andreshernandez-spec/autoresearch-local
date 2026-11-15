@@ -14,7 +14,7 @@ from typing import Any
 from .. import contract, render, rules, runner
 from ..gitops import Git
 from ..ledger import Ledger
-from ..record import HeadMove, Record, Verdict, dump, need
+from ..record import Cpu, HeadMove, Record, Verdict, dump, need
 from ..util import ArlError, check_id, fmt, now, one_line, require_filled, slugify, write_json, write_text
 from . import common, jobs
 from .common import ARL
@@ -361,6 +361,8 @@ def cmd_exp_show(args: argparse.Namespace) -> int:
         digest = env.get("listing") or env.get("packages")
         listing = f"; every package: {ledger.name}/envs/{digest}.txt" if digest else ""
         print(f"  environment: {', '.join(what)}{listing}")
+        if rec.cpu:
+            print(f"  CPUs: {runner.cpu_text(rec.cpu)}")
         print(f"  ran under: {_contract_at(ledger, need(rec.contract).version)}, arl {env.get('arl', '(version not recorded)')}, on {env.get('host', 'an unnamed machine')}")
     print(f"  files: {exp}")
     code, base = rec.code_commit, rec.base_commit
@@ -383,11 +385,12 @@ def _contract_at(ledger: Ledger, version: int) -> str:
     return f"contract v{version}" + (f" (frozen in {found}: git show {found}:{ledger.name}/arl.toml)" if found else "")
 
 
-def _env_lines(ledger: Ledger, env: dict[str, Any]) -> list[str]:
+def _env_lines(ledger: Ledger, env: dict[str, Any], cpu: Cpu | None) -> list[str]:
     lines = [f"  environment: {env.get('prefix') or 'not named by the contract'}" + (f", python {env['python']}" if env.get("python") else "")]
     lines.append(f"  machine: {env.get('host', 'not recorded')}, {env.get('platform', 'system not recorded')}")
     if env.get("gpu"):
         lines.append(f"  GPU and driver: {'; '.join(map(str, env['gpu']))}")
+    lines.append(f"  CPUs: {runner.cpu_text(cpu) if cpu else 'not recorded (an older arl ran it)'}")
     lines.append(f"  arl: {env.get('arl', 'version not recorded')}")
     for key, label in (("listing", "every package python saw"), ("packages", "the output of [env] command")):
         if env.get(key):
@@ -405,20 +408,21 @@ def cmd_exp_env(args: argparse.Namespace) -> int:
     if not env:
         raise ArlError(f"{rec.id} has not run: there is no environment to show")
     print(f"{rec.id} ran in:")
-    print("\n".join(_env_lines(ledger, env)))
+    print("\n".join(_env_lines(ledger, env, rec.cpu)))
     if args.other:
         other = ledger.record(check_id("E", args.other))
         there = other.env
         if not there:
             raise ArlError(f"{other.id} has not run: there is no environment to compare with")
-        differs, against = runner.env_differences(ledger, env, there), f"the one {other.id} ran in"
+        differs, against = runner.env_differences(ledger, env, there, cpus=(rec.cpu, other.cpu)), f"the one {other.id} ran in"
     else:
         probed = common.env_or_problem(ledger)
         if probed and probed.get("problem"):
             print(f"The environment cannot be asked now: {probed['problem'].splitlines()[0]}")
             return 1
         now_env, texts = runner.snapshot(ledger, probed, store=False)
-        differs, against = runner.env_differences(ledger, env, now_env, texts), "the environment as it is now"
+        now_cpu = runner.cpu_conditions(runner.job_env(ledger))
+        differs, against = runner.env_differences(ledger, env, now_env, texts, cpus=(rec.cpu, now_cpu)), "the environment as it is now"
     if differs:
         print(f"Compared with {against}, {runner.differences(len(differs))}:")
         print("\n".join(f"  {line}" for line in differs))

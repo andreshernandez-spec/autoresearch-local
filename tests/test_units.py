@@ -85,6 +85,11 @@ def test_min_goal(tmp_path):
         ("run = 1\n" + TOML.replace("[run]", "[other]"), "must be a table"),
         (TOML + '[env]\npackages = ["numpy"]\n', "packages is not an option"),
         (TOML + "[env]\nprefix = 3\n", "prefix must be text"),
+        (TOML.replace('frozen = ["research/eval"]', 'frozen = ["research/eval"]\nsplit_size = 400'), "split_size must be a table"),
+        (TOML.replace('frozen = ["research/eval"]', 'frozen = ["research/eval"]\nsplit_size = { dev = 400, test = 9 }'), "names test, which"),
+        (TOML.replace('frozen = ["research/eval"]', 'frozen = ["research/eval"]\nsplits = ["dev", "test"]\nsplit_size = { dev = 400 }'), "test has none"),
+        (TOML.replace('frozen = ["research/eval"]', 'frozen = ["research/eval"]\nsplit_size = { dev = 0 }'), "split_size.dev must be at least 1"),
+        (TOML.replace('frozen = ["research/eval"]', 'frozen = ["research/eval"]\nsplit_size = { dev = 2.5 }'), "split_size.dev must be a whole number"),
     ],
 )
 def test_bad_config(tmp_path, broken, message):
@@ -103,6 +108,13 @@ def test_old_and_new_name_of_the_introspection_table(tmp_path):
     path.write_text(TOML)
     cfg = config.load(path)
     assert (cfg.intro_every, cfg.checkpoint_every, cfg.pause_grace) == (8, 600.0, 60.0)
+
+
+def test_split_sizes(tmp_path, cfg):
+    assert cfg.split_size is None
+    path = tmp_path / "arl.toml"
+    path.write_text(TOML.replace('frozen = ["research/eval"]', 'frozen = ["research/eval"]\nsplits = ["dev", "test"]\nsplit_size = { test = 2000, dev = 400 }'))
+    assert config.load(path).split_size == {"dev": 400, "test": 2000}
 
 
 def test_the_environment_table(tmp_path, cfg):

@@ -2,6 +2,8 @@
 
 {type} on track {track}. Tests {hyps}.
 Written before the run. arl locks this file and params.json when the run starts.
+The design brief (`arl next`) shows the track's "Stop if" and the tripwires of the last introspection.
+If one of these has fired, this design is its action, or the design says why not.
 
 ## Change
 

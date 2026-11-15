@@ -425,3 +425,52 @@ def test_a_run_continued_in_a_changed_environment_says_so(project: Project):
     assert "The environment changed between the parts of this run (1 difference): extra 1.0 -> 2.0." in analysis
     parts = p.record(eid)["attempts"][-1]["segments"]
     assert parts[0]["env"]["listing"] != parts[1]["env"]["listing"]
+
+
+# --- the CPUs, which bits can depend on --------------------------------------------------
+
+
+def test_a_run_records_the_cpus_it_could_use_and_a_change_is_said(project: Project, monkeypatch):
+    p = project
+    for name in runner.NUMERIC_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("OMP_NUM_THREADS", "4")
+    h = p.started()
+    cores = sorted(os.sched_getaffinity(0))
+    cpu = p.record("E0001")["conditions"]["cpu"]
+    assert cpu == {"affinity": len(cores), "count": os.cpu_count(), "variables": {"OMP_NUM_THREADS": "4"}}
+    assert p.record("E0001")["attempts"][0]["segments"][0]["cpu"] == cpu
+    # The job sees what was recorded: it inherits the affinity and gets the variable.
+    seen = observe(p, "python -c 'import os; print(len(os.sched_getaffinity(0)), os.environ.get(\"OMP_NUM_THREADS\"))'", "cpus.txt")
+    assert seen.split() == [str(len(cores)), "4"]
+
+    monkeypatch.setenv("OMP_NUM_THREADS", "16")
+    monkeypatch.setenv("XLA_FLAGS", "--xla_cpu_multi_thread_eigen=false")
+    fewer = len(cores) > 1
+    if fewer:
+        os.sched_setaffinity(0, cores[:1])  # arl itself on one core: so is every job it starts
+    try:
+        eid = p.tune(0.5, "keep", h)
+    finally:
+        os.sched_setaffinity(0, cores)
+    said = (["CPUs the job could use " + f"{len(cores)} -> 1"] if fewer else []) + ["OMP_NUM_THREADS '4' -> '16'", "XLA_FLAGS unset -> '--xla_cpu_multi_thread_eigen=false'"]
+    analysis = (p.ledger.exp_dir(eid) / "analysis.md").read_text()
+    assert f"The environment is not the one the reference E0001 ran in ({runner.differences(len(said))}): {'; '.join(said)}." in analysis
+    out = p.arl("exp", "env", "E0001", eid)
+    assert "  CPUs: the job could use" in out and "set: OMP_NUM_THREADS='4'" in out
+    assert all(f"  {line}" in out for line in said)
+    assert f"CPUs: the job could use {'1' if fewer else len(cores)} of the {os.cpu_count()} of the machine" in p.arl("exp", "show", eid)
+    monkeypatch.setenv("OMP_NUM_THREADS", "4")
+    assert "OMP_NUM_THREADS '16' -> '4'" in p.arl("exp", "env", eid)  # against now
+    out = p.arl("exp", "reproduce", "E0001")  # as it first ran, but for XLA_FLAGS
+    assert "the environment is not the one it first ran in (1 difference): XLA_FLAGS unset -> '--xla_cpu_multi_thread_eigen=false'" in out
+    assert p.record("E0001")["reruns"][0]["cpu"]["variables"] == {"OMP_NUM_THREADS": "4", "XLA_FLAGS": "--xla_cpu_multi_thread_eigen=false"}
+
+    rec = p.record("E0001")  # what an arl from before wrote
+    del rec["conditions"]["cpu"]
+    for segment in rec["attempts"][0]["segments"]:
+        segment.pop("cpu", None)
+    p.save_record(rec)
+    out = p.arl("exp", "env", "E0001", eid)
+    assert "CPUs: not recorded" in out and "OMP_NUM_THREADS '4'" not in out
+

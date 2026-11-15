@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import collections
 import re
+import tomllib
 from pathlib import Path
 from typing import Any
 
 from . import contract, rules, runner
 from .ledger import Ledger
-from .record import Record, dump, need
-from .util import ArlError, fmt, now, read_text
+from .record import Record, Rerun, dump, need
+from .util import ArlError, fmt, now, read_front, read_text
 
 ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = ROOT / "bin" / "arl"
@@ -124,7 +125,7 @@ def _target_line(ledger: Ledger, lock: dict[str, Any] | None, data: str | None) 
         return ""
     goal = f"{primary.name} {'>=' if primary.goal == 'max' else '<='} {fmt(float(primary.target))}"
     hit = rules.target_claim(ledger, lock, data)
-    fell = [rules.claim_text(c) for c in rules.claims(ledger, lock) if c["state"] in ("missed", "given up")]
+    fell = [rules.claim_text(c) for c in rules.claims(ledger, lock) if c["state"] in rules.NOT_CONFIRMED]
     return f"{goal}: {rules.claim_text(hit) if hit else 'not reached'}." + (f" Not confirmed: {'; '.join(fell)}." if fell else "")
 
 
@@ -263,7 +264,7 @@ def _env_facts(ledger: Ledger, rec: Record, ref: Record | None) -> list[str]:
     primary = ledger.cfg.primary.name
     try:
         if ref is not None and ref.id != rec.id:
-            differs = runner.env_differences(ledger, ref.env, env)
+            differs = runner.env_differences(ledger, ref.env, env, cpus=(ref.cpu, rec.cpu))
             if differs:
                 out.append(
                     f"The environment is not the one the reference {ref.id} ran in ({runner.differences(len(differs))}): {runner.short(differs)}. "
@@ -273,7 +274,7 @@ def _env_facts(ledger: Ledger, rec: Record, ref: Record | None) -> list[str]:
             last = ledger.track(rec.track).head_experiment
             if last and last != rec.id:
                 before = ledger.record(last)
-                differs = runner.env_differences(ledger, before.env, env)
+                differs = runner.env_differences(ledger, before.env, env, cpus=(before.cpu, rec.cpu))
                 value = f" ({primary} {fmt(before.metrics[primary])})" if before.metrics and primary in before.metrics else ""
                 out.append(
                     f"The track was last measured by {last}{value}, which no longer counts as its reference. "
@@ -281,7 +282,7 @@ def _env_facts(ledger: Ledger, rec: Record, ref: Record | None) -> list[str]:
                 )
         parts = rec.attempts[-1].segments
         if len(parts) > 1:
-            between = runner.env_differences(ledger, parts[0].env, parts[-1].env)
+            between = runner.env_differences(ledger, parts[0].env, parts[-1].env, cpus=(parts[0].cpu, parts[-1].cpu))
             if between:
                 out.append(f"The environment changed between the parts of this run ({runner.differences(len(between))}): {runner.short(between)}.")
     except (ArlError, KeyError, OSError, TypeError, ValueError) as e:
@@ -318,9 +319,24 @@ def analysis_facts(ledger: Ledger, rec: Record) -> str:
         lines.append(f"A change of at least {fmt(comp.min_delta)} on {comp.metric} counts as better or worse.")
     if comp.gate_failures:
         lines.append("Constraints not met: " + "; ".join(comp.gate_failures) + ".")
-    lines += _reported(rec) + _env_facts(ledger, rec, ref)
+    lines += _reported(rec) + _env_facts(ledger, rec, ref) + _rerun_estimates(ledger, rec)
     lines.append(f"{took}. {where}")
     return "\n".join(lines)
+
+
+def _rerun_estimates(ledger: Ledger, rec: Record) -> list[str]:
+    """With [eval] split_size: how long a rerun on each split that confirms a result would take,
+    so that a result that could never be confirmed is known before it is kept."""
+    out = []
+    for split in rules.confirming_splits(ledger.cfg):
+        est = rules.rerun_estimate(ledger.cfg, rec, split)
+        if est is None:
+            continue
+        text = f"A rerun on {split} would take about {est['seconds']:.0f} s, limit {est['limit']:.0f} s (this run's {est['ran']:.0f} s, scaled by [eval] split_size)"
+        if not est["fits"]:
+            text += ". It would not fit: a result that reaches the target here cannot be confirmed there, until the method is faster or a person raises [run] timeout_s"
+        out.append(text + ".")
+    return out
 
 
 def _section(body: str, heading: str) -> str:
@@ -328,8 +344,48 @@ def _section(body: str, heading: str) -> str:
     return match.group(1).strip() if match else ""
 
 
-def _activity_facts(ledger: Ledger, events: list[dict[str, Any]], window: list[Record]) -> list[str]:
-    """Part 2 and part 3 start from this: what was refused, what failed, what was noted."""
+def _quoted(body: str | None, heading: str) -> list[str]:
+    """A section of a ledger file as it is written, indented, or a few words on why there is none."""
+    if body is None:
+        return ["  (the file cannot be read)"]
+    if not re.search(rf"^## {re.escape(heading)}", body, re.M):
+        return [f"  (the file has no '## {heading}' section)"]
+    text = _section(body, heading)
+    if not text:
+        return ["  (empty)"]
+    if not re.sub(r"^\s*>?\s*FILL:.*$", "", text, flags=re.M).strip():
+        return ["  (not written: still the FILL line of the template)"]
+    return [f"  {line}".rstrip() for line in text.splitlines()]
+
+
+def _respect(ledger: Ledger, rec: Record) -> str:
+    """Below the design steps: the track's "Stop if" and the tripwires the latest closed
+    introspection set, as they are written. A design that goes past either has to say why."""
+    track = ledger.track_path(rec.track)
+    try:
+        body: str | None = read_front(track)[1]
+    except (ArlError, OSError, tomllib.TOMLDecodeError):
+        body = None
+    out = ["", "What the design must respect:", "", f'"Stop if" of track {rec.track} ({ledger.rel(track)}):', *_quoted(body, "Stop if"), ""]
+    last = rules.introspection_state(ledger)["last"]
+    if last:
+        path = ledger.intro_path(last)
+        try:
+            body = read_front(path)[1]
+        except (ArlError, OSError, tomllib.TOMLDecodeError):
+            body = None
+        out += [f"Tripwires set by {last}, the latest closed introspection ({ledger.rel(path)}):", *_quoted(body, "6. Tripwires")]
+    else:
+        out.append("Tripwires: none, no introspection has been closed yet.")
+    out += ["", "If one of these has fired, this design is its action, or the design says why not."]
+    return "\n".join(out) + "\n"
+
+
+def _activity_facts(ledger: Ledger, events: list[dict[str, Any]], window: list[Record], reruns: list[tuple[str, Rerun]]) -> list[str]:
+    """Part 2 and part 3 start from this: what was refused, what failed, what was noted.
+
+    reruns: the failed or cut-short reruns no introspection has listed yet.
+    """
     out = ["How the work went in this window (for part 2):", ""]
     refused = collections.Counter()
     example: dict[str, str] = {}
@@ -352,6 +408,8 @@ def _activity_facts(ledger: Ledger, events: list[dict[str, Any]], window: list[R
             for seg in a.segments:
                 if seg.ended_by not in (None, "finished", "failed"):
                     failures.append(f"- {e.id} attempt {a.n}: a part of the run ended early ({seg.ended_by})")
+    for eid, r in reruns:
+        failures.append(f"- {eid} rerun {r.n} on {r.split}{' (cut short)' if r.interrupted else ''}: {str(r.failed).splitlines()[0][:200]}")
     out += ["", "Runs that failed or were cut short:" if failures else "Runs that failed or were cut short: none."] + failures
     for about, label in (("work", "Notes about the way of working"), ("problem", "Notes about the problem (for part 3)")):
         notes = [ev for ev in events if ev.get("kind") == "note" and ev.get("about") == about]
@@ -370,7 +428,7 @@ def _env_window_facts(ledger: Ledger, window: list[Record]) -> list[str]:
         inside, out = {e.id for e in window}, []
         for before, after in zip(ran, ran[1:]):
             if after.id in inside:
-                differs = runner.env_differences(ledger, before.env, after.env)
+                differs = runner.env_differences(ledger, before.env, after.env, cpus=(before.cpu, after.cpu))
                 if differs:
                     out.append(f"- between {before.id} and {after.id} ({runner.differences(len(differs))}): {runner.short(differs, 5)}")
     except (ArlError, KeyError, OSError, TypeError, ValueError) as e:
@@ -380,7 +438,7 @@ def _env_window_facts(ledger: Ledger, window: list[Record]) -> list[str]:
     return ["The environment changed between runs (a possible reason for a changed score; `arl exp env <id> <other>` lists everything):", ""] + out
 
 
-def introspection_facts(ledger: Ledger, trigger: str, state_: dict[str, Any], activity_from: int) -> str:
+def introspection_facts(ledger: Ledger, trigger: str, state_: dict[str, Any], activity_from: int, reruns: list[tuple[str, Rerun]]) -> str:
     lock = contract.load(ledger)
     by_id = {e.id: e for e in ledger.experiments()}
     window = [by_id[i] for i in state_["window"]]
@@ -403,7 +461,7 @@ def introspection_facts(ledger: Ledger, trigger: str, state_: dict[str, Any], ac
     if state_["last"]:
         tripwires = _section(ledger.introspection(state_["last"])[1], "6. Tripwires")
         out += ["", f"Tripwires set by {state_['last']}:", "", tripwires or "none written"]
-    out += [""] + _activity_facts(ledger, ledger.activity()[activity_from:], window)
+    out += [""] + _activity_facts(ledger, ledger.activity()[activity_from:], window, reruns)
     return "\n".join(out)
 
 
@@ -433,6 +491,9 @@ def reload_text(ledger: Ledger, handoff: dict[str, Any] | None = None, env: list
     tracks = ", ".join(f"{ledger.name}/tracks/{t.name}.md" for t in ledger.tracks() if t.status == "active") or "none yet"
     out += env or []
     out += [
+        f"==> A check of your own that takes more than a few seconds: {LAUNCHER} guard -- <command>. It runs in the",
+        "    environment runs use, under the machine's memory limits and the run lock, and records and scores nothing.",
+        "",
         "==> Also part of your instructions. Read them again if this session has not, or has been cut short since:",
         f"  {ROOT / 'PROTOCOL.md'}",
         f"  {ledger.program_path}",
@@ -497,4 +558,7 @@ def next_text(ledger: Ledger, action: dict[str, Any]) -> str:
             where="when it is run once more" if again else f"on '{split}', where the loop never looked",
         )
     head = f"NEXT: {stage}" + (f" {action['target']}" if action.get("target") else "")
-    return f"{head}\nWhy: {action.get('why', '')}\n\n" + fill(template(f"briefs/{name}.md"), **ctx)
+    text = fill(template(f"briefs/{name}.md"), **ctx)
+    if stage == "design":
+        text += _respect(ledger, ledger.record(action["target"]))
+    return f"{head}\nWhy: {action.get('why', '')}\n\n" + text

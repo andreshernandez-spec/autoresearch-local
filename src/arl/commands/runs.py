@@ -1,4 +1,5 @@
-"""Running an experiment, and running a recorded one again."""
+"""Running an experiment, running a recorded one again, and running a check of the
+agent's own under the same limits."""
 
 from __future__ import annotations
 
@@ -7,8 +8,13 @@ import contextlib
 import copy
 import datetime as dt
 import os
+import resource
+import shlex
 import shutil
+import signal
+import sys
 import time
+from pathlib import Path
 
 from .. import contract, render, rules, runner
 from ..gitops import Git
@@ -136,9 +142,12 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
                 if rec.design is None:
                     rec.design = Design(design_sha256=design_hash, params_sha256=params_hash, locked_at=now())
                 part.env = runner.environment(ledger, probed)
+                part.cpu = runner.cpu_conditions(runner.job_env(ledger))
                 given = need(rec.conditions)
                 if given.env is None:
                     given.env = part.env
+                if given.cpu is None and len(attempt.segments) == 1:
+                    given.cpu = part.cpu
                 ledger.save_record(rec)
                 parts = len(attempt.segments)
                 common.finish(ledger, f"{eid} continued, part {parts}" if parts > 1 else (f"{eid} design, {typ} on {rec.track}" if n == 1 else f"{eid} attempt {n}"))
@@ -281,6 +290,17 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
             split = args.split or cfg.splits[0]
             if split not in cfg.splits:
                 raise ArlError(f"arl.toml knows the splits {cfg.splits}, not '{split}'")
+            estimate = rules.rerun_estimate(cfg, rec, split)
+            if estimate is not None and not estimate["fits"]:
+                sizes = need(cfg.split_size)
+                raise ArlError(
+                    f"A rerun of {eid} on '{split}' would take about {estimate['seconds']:.0f} s, and the run limit is {estimate['limit']:.0f} s "
+                    "([run] timeout_s). It is not started: it would fail at the limit.\n"
+                    f"The estimate is its run of {estimate['ran']:.0f} s on '{estimate['split']}' ({sizes[estimate['split']]} items), "
+                    f"scaled to the {sizes[split]} items of '{split}' ([eval] split_size).\n"
+                    "Two ways on: a faster method, tried in an experiment of its own, or a person raising [run] timeout_s\n"
+                    "and freezing the contract again (the tracks are then measured again)."
+                )
             fingerprint, data = common.data_files(ledger)  # a rerun reads the data too: a file that is gone stops it here
             jobs.require_free_machine(cfg)
             exp = ledger.exp_dir(eid)
@@ -293,6 +313,7 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
                 jobs.drop_tree(ledger, tree)
             (log.parent / "pause.request").unlink(missing_ok=True)  # an old request is not meant for this rerun
             env_now = runner.environment(ledger, probed)
+            cpu_now = runner.cpu_conditions(runner.job_env(ledger))
             rec.rerun = Going(
                 n=n,
                 split=split,
@@ -309,13 +330,13 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
         # while the rerun is going. 'rec' is read, never written back; see jobs.amend.
         out.mkdir(parents=True)
         values = {"params": exp / "params.json", "out": out, "split": split, "home": ledger.home, "research": ledger.dir, "exp": exp, "worktree": tree, "metrics": out / "metrics.json"}
-        entry = Rerun(n=n, at=now(), split=split, eval_digest=lock["eval_digest"], data_digest=data, env=env_now)
+        entry = Rerun(n=n, at=now(), split=split, eval_digest=lock["eval_digest"], data_digest=data, env=env_now, cpu=cpu_now)
         same_data = rec.data_digest in (None, data)
         if not same_data:
             entry.data = fingerprint  # what it read instead
         # A rerun does not put the old environment back. It says what is different now,
         # since that can explain a different result. Both package lists are in the ledger.
-        differs = runner.env_differences(ledger, rec.env, env_now)
+        differs = runner.env_differences(ledger, rec.env, env_now, cpus=(rec.cpu, cpu_now))
         if differs:
             entry.env_changed = EnvChange(count=len(differs), first=differs[:20])
 
@@ -440,3 +461,49 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
         print()
         print(render.next_text(ledger, common.next_action(ledger)), end="")
     return 0
+
+
+# --- a check of the agent's own -----------------------------------------------------
+
+
+def _size(gb: float) -> str:
+    return f"{gb:.1f} GB" if gb >= 1 else f"{gb * 1024:.0f} MB"
+
+
+def cmd_guard(args: argparse.Namespace) -> int:
+    """One command of the agent's own (a quick check, a conversion, a test) in the
+    contract's environment and under the machine's limits. Not a run: nothing is
+    recorded and nothing is scored, so it waits for no gate of the loop."""
+    if not args.command:
+        raise ArlError(f"say what to run:  {ARL} guard -- <command> [<argument> ...]")
+    if args.timeout is not None and not args.timeout > 0:
+        raise ArlError("--timeout is in seconds, and more than 0")
+    ledger = Ledger.locate()
+    cfg = ledger.cfg
+    # One word is a command line for bash (pipes, &&); more are a command and its arguments.
+    command = args.command[0] if len(args.command) == 1 else shlex.join(args.command)
+    timeout = args.timeout or cfg.run_timeout
+    prefix = runner.env_prefix(ledger)
+    with runner.run_lock(ledger, "arl guard") if not args.no_lock else contextlib.nullcontext():
+        jobs.require_free_machine(cfg)
+        limits = [f"{timeout:.0f} s"]
+        if cfg.max_run_rss_gb is not None:
+            limits.append(f"{cfg.max_run_rss_gb:g} GB for its processes")
+        if cfg.stop_below_free_ram_gb is not None:
+            limits.append(f"stopped below {cfg.stop_below_free_ram_gb:g} GB of free RAM")
+        print(f"arl guard: limits {', '.join(limits)}; {'without' if args.no_lock else 'holding'} the run lock.", file=sys.stderr)
+        if prefix is not None and not (prefix / "bin" / "python").exists():
+            print(f"arl guard: the environment the contract names is not on this machine ({cfg.env_prefix}): python is whatever the PATH has.", file=sys.stderr)
+        res = runner.execute(command, Path.cwd(), runner.job_env(ledger), timeout, None, max_rss_gb=cfg.max_run_rss_gb, min_free_ram_gb=cfg.stop_below_free_ram_gb, peak=True)
+    # The largest single process as the kernel kept it, which a sample a second can miss.
+    # In arl's own process it includes git's, which are small.
+    largest = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024**2
+    stopped = res["stopped"] or res["paused"]  # out of RAM is a stop here: a check is not continued
+    code = res["exit_code"]
+    code = 128 - code if code < 0 else code  # what a shell says for a process a signal ended
+    if stopped:
+        print(f"arl guard: STOPPED, {stopped}. The command and everything it started were ended.", file=sys.stderr)
+        code = code or 128 + signal.SIGTERM
+    print(f"arl guard: exit {code}, {res['seconds']:.1f} s, peak memory {_size(max(res['peak_gb'], largest))}", file=sys.stderr)
+    return code
+

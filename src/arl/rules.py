@@ -10,7 +10,7 @@ from . import contract
 from .config import Config
 from .ledger import Ledger
 from .runner import alive
-from .record import Comparison, Record, Track, need
+from .record import Comparison, Record, Rerun, Track, need
 from .util import now, parse_time
 
 SCORED = ("baseline", "tune", "feature")
@@ -193,6 +193,24 @@ def meets_target(cfg: Config, metrics: dict[str, float]) -> bool:
         return False  # a metric the contract asks for is not in this result
 
 
+def rerun_estimate(cfg: Config, rec: Record, split: str) -> dict[str, Any] | None:
+    """How long a rerun of an experiment on a split would take, from [eval] split_size: the
+    recorded time of the run that gave its result (every part of it, not the evaluation),
+    scaled by the number of items. None without sizes, or without a recorded time.
+
+    seconds, limit ([run] timeout_s) and fits; ran and split: what it was scaled from.
+    """
+    sizes, given = cfg.split_size, rec.conditions
+    if not sizes or not rec.attempts or given is None or given.split not in sizes or split not in sizes:
+        return None
+    attempt = rec.attempts[-1]
+    ran = attempt.run_seconds if attempt.run_seconds is not None else attempt.ran()
+    if not ran:
+        return None
+    seconds = ran * sizes[split] / sizes[given.split]
+    return {"seconds": seconds, "limit": cfg.run_timeout, "fits": seconds <= cfg.run_timeout, "ran": ran, "split": given.split}
+
+
 def confirming_splits(cfg: Config) -> list[str]:
     """Where a result that met the target has to hold as well: every split the loop does
     not score on, or the first one again when the contract has no other."""
@@ -209,6 +227,8 @@ def claim(ledger: Ledger, rec: Record, lock: dict[str, Any]) -> dict[str, Any] |
     better there does not turn the answer round, or the split would be tuned on.
     "given up": the run on "split" failed as often as a run may, so nothing is
     known. A run that succeeds later still decides.
+    "too long": a run on "split" would pass the run limit by [eval] split_size, so
+    it is not started, and the claim is set aside as it is for "given up".
     Only reruns under the same evaluator and on the data the experiment read count.
     """
     cfg = ledger.cfg
@@ -218,7 +238,7 @@ def claim(ledger: Ledger, rec: Record, lock: dict[str, Any]) -> dict[str, Any] |
         return None
     data = rec.data_digest
     out: dict[str, Any] = {"id": rec.id, "first": cfg.splits[0], "splits": confirming_splits(cfg), "state": "confirmed"}
-    todo, given_up = [], []
+    todo, given_up, too_long = [], [], []
     for split in out["splits"]:
         mine = [
             r
@@ -231,12 +251,22 @@ def claim(ledger: Ledger, rec: Record, lock: dict[str, Any]) -> dict[str, Any] |
             return {**out, "state": "missed", "split": split, "rerun": missed.n, "value": (missed.metrics or {}).get(cfg.primary.name)}
         if not scored:
             failures = sum(1 for r in mine if r.failed and not r.interrupted)
-            (given_up if failures >= cfg.max_attempts else todo).append((split, failures))
+            estimate = rerun_estimate(cfg, rec, split)
+            if estimate is not None and not estimate["fits"]:
+                too_long.append((split, estimate))  # first: running the other splits would not change the answer
+            else:
+                (given_up if failures >= cfg.max_attempts else todo).append((split, failures))
+    if too_long:
+        split, estimate = too_long[0]
+        return {**out, "state": "too long", "split": split, "seconds": estimate["seconds"], "limit": estimate["limit"]}
     if todo:
         return {**out, "state": "open", "split": todo[0][0]}
     if given_up:
         return {**out, "state": "given up", "split": given_up[0][0], "failures": given_up[0][1]}
     return out
+
+
+NOT_CONFIRMED = ("missed", "given up", "too long")  # a claim set aside: the target counts as not reached by it
 
 
 def claim_text(c: dict[str, Any]) -> str:
@@ -248,6 +278,9 @@ def claim_text(c: dict[str, Any]) -> str:
         return f"{c['id']} reached the target on {c['first']} and not {where}{value}"
     if c["state"] == "given up":
         return f"{c['id']} reached the target on {c['first']} and could not be confirmed {where} (the run there failed {c['failures']} times)"
+    if c["state"] == "too long":
+        how = "by running it again" if again else f"on {c.get('split')}"
+        return f"{c['id']} reached the target on {c['first']} and cannot be confirmed {how}: that run would take about {c['seconds']:.0f} s, the limit is {c['limit']:.0f} s"
     if c["state"] == "open":
         return f"{c['id']} reached the target on {c['first']} and is not confirmed yet"
     done = "running it again" if c["splits"] == [c["first"]] else f"the run{'s' if len(c['splits']) > 1 else ''} on {' and '.join(c['splits'])}"
@@ -304,7 +337,7 @@ def introspection_state(ledger: Ledger) -> dict[str, Any]:
     # A result that met the target where the loop tunes and not where it never looked is
     # the clearest sign that the loop fits its first split: how to go on is decided here.
     seen = {eid for n in closed for eid in n.unconfirmed}
-    unconfirmed = [c for c in claims(ledger, contract.load(ledger)) if c["state"] in ("missed", "given up") and c["id"] not in seen]
+    unconfirmed = [c for c in claims(ledger, contract.load(ledger)) if c["state"] in NOT_CONFIRMED and c["id"] not in seen]
 
     reasons = []
     if waiting:
@@ -344,6 +377,34 @@ def introspection_state(ledger: Ledger) -> dict[str, Any]:
         "stagnant": stagnant,
         "unconfirmed": [c["id"] for c in unconfirmed],
     }
+
+
+def unlisted_reruns(ledger: Ledger) -> list[tuple[str, Rerun]]:
+    """Reruns that failed or were cut short and that no introspection has listed yet.
+
+    A rerun belongs to no window: it can come long after its experiment was judged.
+    So each introspection keeps the ones its facts named. One written by an older arl
+    kept nothing: the reruns that started before it opened (in that second too) are left
+    to it, so the first introspection after an upgrade does not list the whole history.
+    """
+    earlier = ledger.introspections()
+    listed = {key for n in earlier for key in n.reruns or []}
+    try:
+        cutoff = max((parse_time(n.opened) for n in earlier if n.reruns is None and n.opened), default=None)
+    except ValueError:
+        cutoff = None
+    out = []
+    for e in ledger.experiments():
+        for r in e.reruns:
+            if not r.failed or f"{e.id}/{r.n}" in listed:
+                continue
+            try:
+                if cutoff is not None and parse_time(r.at) <= cutoff:
+                    continue
+            except ValueError:
+                pass  # a time that cannot be read: say it rather than lose it
+            out.append((e.id, r))
+    return out
 
 
 # --- what comes next --------------------------------------------------------------

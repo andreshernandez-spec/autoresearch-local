@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 
@@ -10,7 +11,7 @@ import pytest
 
 from arl import runner
 from arl.commands import common
-from conftest import Project, git
+from conftest import NOTHING_NEW, Project, git
 
 
 def new_exp(p: Project, typ: str, h: str | None = None, code: int = 0) -> str:
@@ -149,6 +150,45 @@ def test_diagnose_is_not_scored_and_never_merged(project: Project):
     assert p.record(custom)["kept"] == ["seen.json"]
     p.judge(custom, "finding")
     assert "--command is for diagnose" in p.arl("exp", "new", "--type", "baseline", "--track", "main-line", "--title", "t", "--command", "true", code=1)
+
+
+def write_section(path, heading: str, text: str) -> None:
+    """Put text under a heading of a ledger file, the way the agent writes it."""
+    body = path.read_text()
+    path.write_text(re.sub(rf"(^## {re.escape(heading)}\n).*?(?=^## )", lambda m: m.group(1) + "\n" + text + "\n\n", body, count=1, flags=re.M | re.S))
+
+
+def test_the_design_brief_shows_what_the_design_must_respect(project: Project):
+    p = project
+    h = p.started()
+    track = p.research / "tracks" / "main-line.md"
+    write_section(track, "Stop if", "- three tunes of x in a row without a keep\n- a run on the full data cannot fit the time limit")
+    out = new_exp(p, "tune", h)
+    assert "What the design must respect:" in out and '"Stop if" of track main-line (research/tracks/main-line.md):' in out
+    assert "  - three tunes of x in a row without a keep\n  - a run on the full data cannot fit the time limit" in out
+    assert "Tripwires: none, no introspection has been closed yet." in out
+    assert "If one of these has fired, this design is its action, or the design says why not." in out
+    design = (p.ledger.exp_dir("E0002") / "design.md").read_text()
+    assert "If one of these has fired, this design is its action, or the design says why not." in design
+    p.arl("exp", "abandon", "E0002", "--reason", "the introspection comes first")
+
+    p.arl("introspect", "new", "--trigger", "asked")
+    intro = p.research / "introspections" / "N001.md"
+    p.fill(intro)
+    write_section(intro, "6. Tripwires", "A timing check comes before more work on the scored split.")
+    p.arl("introspect", "close", "N001", "--decision", "continue", *NOTHING_NEW)
+    p.arl("reload")
+    out = new_exp(p, "tune", h)
+    assert "Tripwires set by N001, the latest closed introspection (research/introspections/N001.md):\n  A timing check comes before more work" in out
+    assert "  - three tunes of x in a row without a keep" in out
+    assert out.count("What the design must respect:") == 1 and out.index("To drop the draft instead") < out.index("What the design must respect")
+    assert "A timing check comes before more work" in p.arl("next")  # the same brief, from next
+
+    # What is missing or still a placeholder is said, and stops nothing.
+    track.write_text(track.read_text().replace("## Stop if\n", "## When to stop\n"))
+    assert "(the file has no '## Stop if' section)" in p.arl("next")
+    track.write_text(track.read_text().replace("## When to stop\n\n- three", "## Stop if\n\n> FILL: the results that would end this track\n\n- three").replace("- three tunes of x in a row without a keep\n- a run on the full data cannot fit the time limit", ""))
+    assert "(not written: still the FILL line of the template)" in p.arl("next")
 
 
 def test_contract_is_frozen(project: Project, monkeypatch):
@@ -386,6 +426,48 @@ def test_reproduce_and_confirmation_split(project: Project):
     assert not list((p.base / "wt").glob("toy-rerun-*"))
     assert "knows the splits" in p.arl("exp", "reproduce", eid, "--split", "test", code=1)
     assert p.record(eid)["verdict"]["decision"] == "keep"
+    assert "A rerun on confirm would take" not in (p.ledger.exp_dir(eid) / "analysis.md").read_text()  # no split sizes, no estimate
+
+
+def sizes(confirm: int) -> str:
+    """[eval] split_size, in the table the test contract leaves room for at its end."""
+    return f"[eval.split_size]\ndev = 1\nconfirm = {confirm}\n"
+
+
+def test_a_rerun_that_cannot_fit_the_run_limit_is_not_started(project: Project, monkeypatch):
+    p = project
+    h = p.started(extra=sizes(10**6))  # whatever a toy run takes, a million times that is past 60 s
+    eid = p.tune(0.5, "keep", h)
+    ran = p.record(eid)["attempts"][-1]["run_seconds"]
+    analysis = (p.ledger.exp_dir(eid) / "analysis.md").read_text()
+    assert f"A rerun on confirm would take about {ran * 10**6:.0f} s, limit 60 s (this run's {ran:.0f} s, scaled by [eval] split_size). It would not fit" in analysis
+    before, head = p.record(eid), git(p.root, "rev-parse", "HEAD")
+    out = p.arl("exp", "reproduce", eid, "--split", "confirm", code=1)
+    assert f"A rerun of {eid} on 'confirm' would take about {ran * 10**6:.0f} s, and the run limit is 60 s" in out
+    assert "on 'dev' (1 items), scaled to the 1000000 items of 'confirm'" in out
+    assert "a faster method" in out and "a person raising [run] timeout_s" in out
+    assert p.record(eid) == before and git(p.root, "rev-parse", "HEAD") == head and not (p.ledger.exp_dir(eid) / "artifacts" / "rerun-1-confirm").exists()
+    assert "reproduced: True" in p.arl("exp", "reproduce", eid)  # the split it ran on: the same size, it fits
+
+    # The person makes the split smaller in the contract. Sizes do not change a score: the references still count.
+    monkeypatch.setattr(common, "interactive", lambda: True)
+    (p.research / "arl.toml").write_text((p.research / "arl.toml").read_text().replace("confirm = 1000000", "confirm = 2"))
+    p.arl("freeze", "--reason", "the confirming split is smaller", "--yes")
+    assert "score = 0.78" in p.arl("exp", "reproduce", eid, "--split", "confirm")
+    assert "NEXT: hypothesize" in p.arl("next")
+
+
+def test_a_target_that_cannot_be_confirmed_in_time_is_set_aside(project: Project):
+    """Not a dead end at 'confirm': the claim is not confirmed, and the loop goes on from an introspection."""
+    p = project
+    h = p.started(target="target = 0.95", extra=sizes(10**6))
+    eid = p.tune(0.7, "keep", h)  # 1.0 on dev
+    out = p.arl("next")
+    assert "NEXT: introspect" in out and f"{eid} reached the target on dev and cannot be confirmed on confirm: that run would take about" in out
+    assert "Not confirmed:" in (p.research / "STATUS.md").read_text()
+    assert "That has to be confirmed first" not in new_exp(p, "tune", h, code=1)  # the introspection comes first, nothing else
+    p.introspect()
+    assert "NEXT: hypothesize" in p.arl("next")
 
 
 def test_ideas_document(project: Project):

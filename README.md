@@ -42,8 +42,8 @@ also the path the skill file names. Cloned anywhere else it works the same:
 `arl introspect new` writes a file with the facts filled in: the experiments
 judged since the last one, the state of every track, the budget, the open
 hypotheses and ideas, the tripwires the last introspection set, and what the
-activity log holds (commands arl refused, runs that failed or were cut short,
-notes written in passing). The agent writes the rest, in four parts:
+activity log holds (commands arl refused, runs and reruns that failed or were
+cut short, notes written in passing). The agent writes the rest, in four parts:
 
 | Part | Question | What it leaves behind |
 |---|---|---|
@@ -132,7 +132,12 @@ project's git:
 - for a conda environment what conda installed, with the build: also the
   libraries python does not list, such as the BLAS a numpy is linked against.
 
-The machine, the system, the GPU and its driver are in the record beside it.
+The machine, the system, the GPU and its driver are in the record beside it,
+and so are the CPUs the job could use (its affinity as arl passes it on, and
+the number the machine has) and, where they are set for the job, `XLA_FLAGS`,
+`OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `JAX_PLATFORMS`
+and `CUDA_VISIBLE_DEVICES`: with another number of threads a sum can be added
+in another order, and give other bits.
 `[env] command` adds the output of one more command, stored the same way.
 These lists name folders and the machine: something to know before a
 project's ledger is published.
@@ -156,6 +161,8 @@ say what is different, because that can explain a different result:
 What an agent types itself (a quick check in python, a test run) uses its own
 shell. `arl reload`, the first command of a session, says where runs happen
 and, when the shell's `python` is another one, which interpreter to call.
+`arl guard -- <command>` runs such a check in the environment runs use and
+under the limits of `[machine]` (below), and records nothing.
 
 ## What an experiment records
 
@@ -166,7 +173,7 @@ and, when the shell's `python` is another one, which interpreter to call.
 | Code | the commit in `record.json`, on a branch arl never deletes | yes |
 | Configuration | the contract version in `record.json`; `exp show` names the commit that froze it | yes |
 | Inputs | name, size and sha256 of every file under `[data] files`, taken before the run and compared after it and after the evaluation; a rerun records what it read; the evaluator's own files are part of the contract | the hashes |
-| Environment | prefix, python, machine, system, GPU and driver, arl version, and the list of every package | yes |
+| Environment | prefix, python, machine, system, GPU and driver, the CPUs the job could use and the thread variables it was given, arl version, and the list of every package | yes |
 | Outputs | name, size and sha256 of every file the run wrote; small ones copied into `kept/` | hashes and small files |
 | Test metrics | `metrics.json`, written by the frozen evaluator; reruns beside it, each with its split, the data it read and whether it meets the target | yes |
 | Training metrics | what the run reports about itself in `{out}/train_metrics.json` | yes |
@@ -345,6 +352,15 @@ experiment and the others are reached only through
 on. Those results are stored and never used for a verdict. They decide one
 thing, whether a target counts as reached.
 
+`[eval] split_size = { dev = 400, confirm = 2000 }` says how many items each
+split has. With it a rerun is estimated before it starts: the recorded run
+time of the experiment (every part of its run, not the evaluation), scaled by
+the sizes. A rerun that would pass `[run] timeout_s` is refused, with the two
+ways on (a faster method, or a person raising the limit), and the analysis of
+every scored run says what a rerun on each confirming split would take.
+Without it nothing is estimated. The sizes are not part of what a score
+depends on: adding them asks for no new baseline.
+
 A `target` on the primary metric ends the program, so reaching it once is
 not enough. A kept result that reaches it on the first split is a claim, and
 `arl next` says `confirm <id>`: the experiment is run once more on every
@@ -357,6 +373,8 @@ other split, or on the first one again when the contract has no other.
   change the answer: a split that is tried until it agrees has been tuned on.
 - A confirming run that itself fails `max_attempts` times sets the claim
   aside as not confirmed. A run that succeeds later still decides.
+- A confirming run that would pass the run limit by `[eval] split_size` is
+  not started, and the claim is set aside as not confirmed in the same way.
 - A claim counts only under the evaluator as it is and on the data files as
   they are. After either changes, the tracks are measured again, and a result
   that reaches the target is confirmed again.
@@ -368,6 +386,15 @@ A run in progress is stopped, with every process it started, when it passes
 its time limit or when its processes hold more RAM than `max_run_rss_gb`
 (a failure), and paused when the machine falls below `stop_below_free_ram_gb`
 (not a failure: it continues when there is room again).
+
+`arl guard [--no-lock] [--timeout SECONDS] -- <command>` holds a command of
+the agent's own (a check, a conversion, a test) to the same: the machine
+gates first, the run lock (so it waits for a run, and a run for it), and the
+memory watch, which here stops the command and everything it started and says
+which limit it passed. It runs in the current folder with the environment a
+job gets, passes the output and the exit code through, and ends with the wall
+time and the peak memory. It works while the loop is paused or waits for a
+person, and records nothing: it is a runner, not a scorer.
 
 The budget counts experiments that ran and the hours of every run: failed
 ones, interrupted parts and reruns included. Without `max_run_hours` nothing
@@ -428,7 +455,7 @@ words that fit any project.
 
 ```
 arl init | freeze | status | next | verify
-arl reload | pause | resume | note
+arl reload | pause | resume | note | guard
 arl track      new | set | sync | worktree | list
 arl hyp        new | set | list
 arl idea       add | set | list
@@ -439,7 +466,8 @@ arl introspect due | new | close | resolve
 
 `arl <command> --help` for each. Exit codes of `exp run`: 0 a result, 2 the run
 or the evaluator failed, 3 the run was paused and can be continued, 75 the
-machine is busy, 1 a gate refused.
+machine is busy, 1 a gate refused. `guard` returns the command's own code, 128
+plus the signal when one ended it, and 75 when the machine is busy.
 
 ## What it does not do
 
@@ -471,8 +499,8 @@ machine is busy, 1 a gate refused.
   rationalization, not someone who edits `frozen.lock` by hand. Git shows that.
   "A person at a terminal" is a check that the command runs in a terminal; a
   program can fake one. The protocol forbids it, nothing prevents it.
-- No way to stop a `diagnose` command from calling the evaluator itself. That
-  is rule 2 of the protocol, not a gate.
+- No way to stop a `diagnose` command, or one run through `arl guard`, from
+  calling the evaluator itself. That is rule 2 of the protocol, not a gate.
 
 ## For agents
 

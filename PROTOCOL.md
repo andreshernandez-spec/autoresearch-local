@@ -143,7 +143,11 @@ what you had only in your head. So write things down when they happen:
     route a run around it (another interpreter in the command, a venv of your
     own). A package that is missing or broken is not a result and not yours to
     repair: stop and tell the person. For what you run yourself outside arl (a
-    quick check, a test), use the interpreter `arl reload` names.
+    quick check, a test), use the interpreter `arl reload` names, and run
+    anything heavier than a few seconds through `arl guard -- <command>`: the
+    same environment, the machine's memory limits and the run lock, and
+    nothing recorded. It runs whatever it is given and scores nothing, so
+    rule 2 holds for it too: never the evaluator.
 14. **A run is decided by what is on record.** Whatever decides the result is
     in `params.json` or in the committed code: the random seed, the number of
     steps, every setting. Nothing comes from the clock, an environment
@@ -162,6 +166,7 @@ what you had only in your head. So write things down when they happen:
 | "The evaluator misses what my change improves." | It may. Write it in IDEAS.md (kind: evaluator) and raise it at the next introspection. The score stands. |
 | "The gain is just under the threshold but it looks real." | Neutral is neutral. Repeat it with `--allow-duplicate` to see the noise, or discard. |
 | "A quick score outside arl first, to see if it is worth designing." | That is the experiment. Draft it. |
+| "It is only a quick check, it can run on the side." | If it takes more than a few seconds, `arl guard -- <command>`. A check that grows past the memory limit is stopped before it takes the machine down, and it waits while a run holds the lock. |
 | "This is only a small tune, the design can be one word." | The prediction is what makes the result worth anything. Write it. |
 | "The result is odd, I will adjust the design text to match what I meant." | The design is locked. Say in the analysis what you meant and what happened. |
 | "An introspection is due, but one more experiment first." | The gate is closed for a reason. Introspect. |
@@ -185,7 +190,10 @@ it, what should be seen if it is true, and what would refute it. No code, no
 plan. Look at the open hypotheses, at `KNOWLEDGE.md` and at `IDEAS.md` before
 writing a new one.
 
-**Design** (`arl exp new`). Pick the kind:
+**Design** (`arl exp new`). The brief ends with the "Stop if" of the track
+and the tripwires the latest closed introspection set, as they are written.
+If one of them has fired, the design is what it calls for, or the design
+says why not. Pick the kind:
 
 | Kind | Use it when | Changes | Scored | Merged |
 |---|---|---|---|---|
@@ -222,9 +230,10 @@ everything it had done.
 **Judge** (`arl exp judge`). Work from `design.md` and `arl exp show`, not from
 what you hoped. Write what happened against the prediction, the most likely
 reason, and what you did not check. If the facts say the environment is not
-the one the reference ran in, a changed package is a candidate reason for the
-difference, before the change you made: `arl exp env <reference> <id>` lists
-what differs, and a baseline in the environment as it is now settles it. Before believing a good number, check that
+the one the reference ran in, a changed package, number of CPUs or thread
+setting is a candidate reason for the difference, before the change you made:
+`arl exp env <reference> <id>` lists what differs, and a baseline in the
+environment as it is now settles it. Before believing a good number, check that
 the work was done: the run time is plausible, the instances were all scored,
 nothing was skipped. Results that flatter the method deserve the hardest look.
 
@@ -238,7 +247,10 @@ stays the reference of its track, and an introspection is due. Its part 1
 asks why one split said yes and the other no: a gain smaller than the noise,
 or a method fitted to the split it was tuned on. A result reached under
 another evaluator or on other data files makes no claim: after either
-changes, the tracks are measured again.
+changes, the tracks are measured again. With `[eval] split_size`, a run
+that would pass the run limit there is not started: the claim is set aside
+as not confirmed, and the analysis of a run already says what a rerun would
+take, so a result that could never be confirmed is known before it is kept.
 
 **Introspection** (`arl introspect new`, `arl introspect close`, `arl reload`).
 Due after a set number of judged experiments, after a run of experiments
@@ -249,11 +261,11 @@ yourself with `--trigger`. It has four parts, in this order:
    change, or is a completely different approach due? Argue against the current
    path as well as you can, and go through every open idea.
 2. **How the work went.** Not about the problem: about the way of working. The
-   introspection file lists the commands arl refused, the runs that failed or
-   were cut short, and your notes. Whatever deserves a standing instruction is
-   recorded with `arl lesson add`: `--scope general` when it would hold in any
-   project (a wrong git action, a habit that wasted a run), `--scope project`
-   when it is about this project's tools and data.
+   introspection file lists the commands arl refused, the runs and reruns that
+   failed or were cut short, and your notes. Whatever deserves a standing
+   instruction is recorded with `arl lesson add`: `--scope general` when it
+   would hold in any project (a wrong git action, a habit that wasted a run),
+   `--scope project` when it is about this project's tools and data.
 3. **What we know.** About the problem itself. Bring `research/KNOWLEDGE.md`
    up to date with what the window established, made likely or ruled out. It is
    a distillation of everything the work has revealed so far: revise and merge,
