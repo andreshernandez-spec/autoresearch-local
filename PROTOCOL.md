@@ -231,8 +231,9 @@ everything it had done.
 what you hoped. Write what happened against the prediction, the most likely
 reason, and what you did not check. If the facts say the environment is not
 the one the reference ran in, a changed package, number of CPUs or thread
-setting is a candidate reason for the difference, before the change you made: `arl exp env <reference> <id>` lists
-what differs, and a baseline in the environment as it is now settles it. Before believing a good number, check that
+setting is a candidate reason for the difference, before the change you made:
+`arl exp env <reference> <id>` lists what differs, and a baseline in the
+environment as it is now settles it. Before believing a good number, check that
 the work was done: the run time is plausible, the instances were all scored,
 nothing was skipped. Results that flatter the method deserve the hardest look.
 
@@ -261,10 +262,10 @@ yourself with `--trigger`. It has four parts, in this order:
    path as well as you can, and go through every open idea.
 2. **How the work went.** Not about the problem: about the way of working. The
    introspection file lists the commands arl refused, the runs and reruns that
-   failed or were cut short, and your notes. Whatever deserves a standing instruction is
-   recorded with `arl lesson add`: `--scope general` when it would hold in any
-   project (a wrong git action, a habit that wasted a run), `--scope project`
-   when it is about this project's tools and data.
+   failed or were cut short, and your notes. Whatever deserves a standing
+   instruction is recorded with `arl lesson add`: `--scope general` when it
+   would hold in any project (a wrong git action, a habit that wasted a run),
+   `--scope project` when it is about this project's tools and data.
 3. **What we know.** About the problem itself. Bring `research/KNOWLEDGE.md`
    up to date with what the window established, made likely or ruled out. It is
    a distillation of everything the work has revealed so far: revise and merge,

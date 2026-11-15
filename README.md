@@ -461,7 +461,7 @@ arl introspect due | new | close | resolve
 `arl <command> --help` for each. Exit codes of `exp run`: 0 a result, 2 the run
 or the evaluator failed, 3 the run was paused and can be continued, 75 the
 machine is busy, 1 a gate refused. `guard` returns the command's own code, 128
-and the signal when it was stopped, and 75 when the machine is busy.
+plus the signal when one ended it, and 75 when the machine is busy.
 
 ## What it does not do
 
