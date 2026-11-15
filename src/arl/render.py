@@ -264,7 +264,7 @@ def _env_facts(ledger: Ledger, rec: Record, ref: Record | None) -> list[str]:
     primary = ledger.cfg.primary.name
     try:
         if ref is not None and ref.id != rec.id:
-            differs = runner.env_differences(ledger, ref.env, env)
+            differs = runner.env_differences(ledger, ref.env, env, cpus=(ref.cpu, rec.cpu))
             if differs:
                 out.append(
                     f"The environment is not the one the reference {ref.id} ran in ({runner.differences(len(differs))}): {runner.short(differs)}. "
@@ -274,7 +274,7 @@ def _env_facts(ledger: Ledger, rec: Record, ref: Record | None) -> list[str]:
             last = ledger.track(rec.track).head_experiment
             if last and last != rec.id:
                 before = ledger.record(last)
-                differs = runner.env_differences(ledger, before.env, env)
+                differs = runner.env_differences(ledger, before.env, env, cpus=(before.cpu, rec.cpu))
                 value = f" ({primary} {fmt(before.metrics[primary])})" if before.metrics and primary in before.metrics else ""
                 out.append(
                     f"The track was last measured by {last}{value}, which no longer counts as its reference. "
@@ -282,7 +282,7 @@ def _env_facts(ledger: Ledger, rec: Record, ref: Record | None) -> list[str]:
                 )
         parts = rec.attempts[-1].segments
         if len(parts) > 1:
-            between = runner.env_differences(ledger, parts[0].env, parts[-1].env)
+            between = runner.env_differences(ledger, parts[0].env, parts[-1].env, cpus=(parts[0].cpu, parts[-1].cpu))
             if between:
                 out.append(f"The environment changed between the parts of this run ({runner.differences(len(between))}): {runner.short(between)}.")
     except (ArlError, KeyError, OSError, TypeError, ValueError) as e:
@@ -428,7 +428,7 @@ def _env_window_facts(ledger: Ledger, window: list[Record]) -> list[str]:
         inside, out = {e.id for e in window}, []
         for before, after in zip(ran, ran[1:]):
             if after.id in inside:
-                differs = runner.env_differences(ledger, before.env, after.env)
+                differs = runner.env_differences(ledger, before.env, after.env, cpus=(before.cpu, after.cpu))
                 if differs:
                     out.append(f"- between {before.id} and {after.id} ({runner.differences(len(differs))}): {runner.short(differs, 5)}")
     except (ArlError, KeyError, OSError, TypeError, ValueError) as e:

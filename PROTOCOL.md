@@ -230,8 +230,8 @@ everything it had done.
 **Judge** (`arl exp judge`). Work from `design.md` and `arl exp show`, not from
 what you hoped. Write what happened against the prediction, the most likely
 reason, and what you did not check. If the facts say the environment is not
-the one the reference ran in, a changed package is a candidate reason for the
-difference, before the change you made: `arl exp env <reference> <id>` lists
+the one the reference ran in, a changed package, number of CPUs or thread
+setting is a candidate reason for the difference, before the change you made: `arl exp env <reference> <id>` lists
 what differs, and a baseline in the environment as it is now settles it. Before believing a good number, check that
 the work was done: the run time is plausible, the instances were all scored,
 nothing was skipped. Results that flatter the method deserve the hardest look.

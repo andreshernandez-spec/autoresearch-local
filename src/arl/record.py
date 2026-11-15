@@ -26,11 +26,23 @@ R = TypeVar("R")
 
 
 @dataclass(slots=True, kw_only=True)
+class Cpu:
+    """The CPUs a job could use, and the variables that tell numerical libraries how to use
+    them. Bits can depend on them: a sum split over 16 threads is added in another order
+    than over 4."""
+
+    affinity: int | None = None  # CPUs the job may run on, as arl passes them on (len(os.sched_getaffinity(0))); None where the system does not say
+    count: int | None = None  # CPUs the machine has (os.cpu_count())
+    variables: dict[str, str] = field(default_factory=dict, metadata={"omit_empty": True})  # those of runner.NUMERIC_VARS set in the job's environment
+
+
+@dataclass(slots=True, kw_only=True)
 class Part:
     """One stretch of a run: from a start to its end, a pause or an interruption."""
 
     started: str
     env: dict[str, Any] | None = None  # the environment this part ran in
+    cpu: Cpu | None = None  # the CPUs it could use; not in records from before 0.7
     ended: str | None = None
     ended_by: str | None = None  # finished, failed, paused, interrupted
     seconds: float | None = None  # how long the job ran in this part
@@ -83,6 +95,7 @@ class Conditions:
     data: list[dict[str, Any]] = field(default_factory=list)  # each data file: path, bytes, sha256
     data_digest: str | None = None  # None in a record from before the data files were written down
     env: dict[str, Any] | None = None  # the environment of its first part
+    cpu: Cpu | None = None  # the CPUs of its first part; not in records from before 0.7
 
 
 @dataclass(slots=True, kw_only=True)
@@ -146,6 +159,7 @@ class Rerun:
     eval_digest: str | None = None  # the evaluator it was scored under
     data_digest: str | None = None  # the data files it read
     env: dict[str, Any] | None = None
+    cpu: Cpu | None = None  # the CPUs it could use; not in records from before 0.7
     data: list[dict[str, Any]] | None = None  # the data files, when they are not the ones the experiment read
     env_changed: EnvChange | None = None
     run_seconds: float | None = None
@@ -230,6 +244,10 @@ class Record:
     @property
     def env(self) -> dict[str, Any] | None:
         return self.conditions.env if self.conditions else None
+
+    @property
+    def cpu(self) -> Cpu | None:
+        return self.conditions.cpu if self.conditions else None
 
     def forget_job(self) -> None:
         """No process is running for it any more."""

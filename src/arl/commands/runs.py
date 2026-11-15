@@ -142,9 +142,12 @@ def cmd_exp_run(args: argparse.Namespace) -> int:
                 if rec.design is None:
                     rec.design = Design(design_sha256=design_hash, params_sha256=params_hash, locked_at=now())
                 part.env = runner.environment(ledger, probed)
+                part.cpu = runner.cpu_conditions(runner.job_env(ledger))
                 given = need(rec.conditions)
                 if given.env is None:
                     given.env = part.env
+                if given.cpu is None and len(attempt.segments) == 1:
+                    given.cpu = part.cpu
                 ledger.save_record(rec)
                 parts = len(attempt.segments)
                 common.finish(ledger, f"{eid} continued, part {parts}" if parts > 1 else (f"{eid} design, {typ} on {rec.track}" if n == 1 else f"{eid} attempt {n}"))
@@ -310,6 +313,7 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
                 jobs.drop_tree(ledger, tree)
             (log.parent / "pause.request").unlink(missing_ok=True)  # an old request is not meant for this rerun
             env_now = runner.environment(ledger, probed)
+            cpu_now = runner.cpu_conditions(runner.job_env(ledger))
             rec.rerun = Going(
                 n=n,
                 split=split,
@@ -326,13 +330,13 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
         # while the rerun is going. 'rec' is read, never written back; see jobs.amend.
         out.mkdir(parents=True)
         values = {"params": exp / "params.json", "out": out, "split": split, "home": ledger.home, "research": ledger.dir, "exp": exp, "worktree": tree, "metrics": out / "metrics.json"}
-        entry = Rerun(n=n, at=now(), split=split, eval_digest=lock["eval_digest"], data_digest=data, env=env_now)
+        entry = Rerun(n=n, at=now(), split=split, eval_digest=lock["eval_digest"], data_digest=data, env=env_now, cpu=cpu_now)
         same_data = rec.data_digest in (None, data)
         if not same_data:
             entry.data = fingerprint  # what it read instead
         # A rerun does not put the old environment back. It says what is different now,
         # since that can explain a different result. Both package lists are in the ledger.
-        differs = runner.env_differences(ledger, rec.env, env_now)
+        differs = runner.env_differences(ledger, rec.env, env_now, cpus=(rec.cpu, cpu_now))
         if differs:
             entry.env_changed = EnvChange(count=len(differs), first=differs[:20])
 

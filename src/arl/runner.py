@@ -31,6 +31,7 @@ from . import __version__
 from .config import Config
 from .gitops import Git
 from .ledger import Ledger
+from .record import Cpu
 from .util import EXIT_BUSY, ArlError, canonical, read_json, read_text, sha256_file, sha256_text, write_json
 
 _PLACEHOLDER = re.compile(r"\{(params|out|metrics|split|home|research|exp|worktree)\}")
@@ -645,11 +646,19 @@ def listing_changes(old: str, new: str) -> list[str]:
     return out
 
 
-def env_differences(ledger: Ledger, old: dict[str, Any] | None, new: dict[str, Any] | None, new_texts: dict[str, str] | None = None) -> list[str]:
+def env_differences(
+    ledger: Ledger,
+    old: dict[str, Any] | None,
+    new: dict[str, Any] | None,
+    new_texts: dict[str, str] | None = None,
+    cpus: tuple[Cpu | None, Cpu | None] = (None, None),
+) -> list[str]:
     """Everything two recorded environments differ in that could change a result:
-    the machine, the system, the GPU and its driver, python, and the package lists.
+    the machine, the system, the GPU and its driver, the CPUs and the variables
+    that say how to use them, python, and the package lists.
 
     new_texts: the lists of the newer one, when they are at hand and not stored.
+    cpus: the CPUs of the older and the newer one.
     Never raises: a record from an older arl, or a list that is gone, says less.
     """
     old, new, out = old or {}, new or {}, []
@@ -658,6 +667,7 @@ def env_differences(ledger: Ledger, old: dict[str, Any] | None, new: dict[str, A
             out.append(f"{label} {old[key]} -> {new[key]}")
     if old.get("gpu") and new.get("gpu") and old["gpu"] != new["gpu"]:
         out.append(f"GPU and driver {'; '.join(map(str, old['gpu']))} -> {'; '.join(map(str, new['gpu']))}")
+    out += cpu_differences(*cpus)
     both = [key for key in LISTS if old.get(key) and new.get(key)]
     if both:
         key = both[0]  # arl's own list when both runs have it: one format, every package with its version
@@ -672,6 +682,43 @@ def env_differences(ledger: Ledger, old: dict[str, Any] | None, new: dict[str, A
     elif any(old.get(key) for key in LISTS) and any(new.get(key) for key in LISTS):
         out.append("the package lists of the two are of different kinds and cannot be compared (one is arl's own, the other the output of [env] command)")
     return out
+
+
+# Set in a job's environment, these change how numerical libraries split their work, or
+# where it runs, and with that the bits of a result.
+NUMERIC_VARS = ("XLA_FLAGS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "JAX_PLATFORMS", "CUDA_VISIBLE_DEVICES")
+
+
+def cpu_conditions(env: dict[str, str]) -> Cpu:
+    """The CPUs a job started now can use: it inherits arl's affinity, and env is the
+    environment it is given."""
+    try:
+        affinity: int | None = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        affinity = None  # a system that does not say
+    return Cpu(affinity=affinity, count=os.cpu_count(), variables={k: env[k] for k in NUMERIC_VARS if k in env})
+
+
+def cpu_differences(old: Cpu | None, new: Cpu | None) -> list[str]:
+    """What two records say differently about the CPUs. A record from before they were kept says nothing."""
+    if old is None or new is None:
+        return []
+    out = []
+    for label, before, after in (("CPUs the job could use", old.affinity, new.affinity), ("CPUs of the machine", old.count, new.count)):
+        if before is not None and after is not None and before != after:
+            out.append(f"{label} {before} -> {after}")
+    for name in sorted({*old.variables, *new.variables}):
+        before, after = old.variables.get(name), new.variables.get(name)
+        if before != after:
+            out.append(f"{name} {'unset' if before is None else repr(before)} -> {'unset' if after is None else repr(after)}")
+    return out
+
+
+def cpu_text(cpu: Cpu) -> str:
+    """The CPUs of a record in one line."""
+    could = f"{cpu.affinity} of the {cpu.count} of the machine" if cpu.affinity is not None else f"the machine's {cpu.count}"
+    said = ", ".join(f"{k}={v!r}" for k, v in sorted(cpu.variables.items())) or f"none of {', '.join(NUMERIC_VARS)}"
+    return f"the job could use {could}; set: {said}"
 
 
 def differences(n: int) -> str:

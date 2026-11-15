@@ -132,7 +132,12 @@ project's git:
 - for a conda environment what conda installed, with the build: also the
   libraries python does not list, such as the BLAS a numpy is linked against.
 
-The machine, the system, the GPU and its driver are in the record beside it.
+The machine, the system, the GPU and its driver are in the record beside it,
+and so are the CPUs the job could use (its affinity as arl passes it on, and
+the number the machine has) and, where they are set for the job, `XLA_FLAGS`,
+`OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `JAX_PLATFORMS`
+and `CUDA_VISIBLE_DEVICES`: with another number of threads a sum can be added
+in another order, and give other bits.
 `[env] command` adds the output of one more command, stored the same way.
 These lists name folders and the machine: something to know before a
 project's ledger is published.
@@ -168,7 +173,7 @@ under the limits of `[machine]` (below), and records nothing.
 | Code | the commit in `record.json`, on a branch arl never deletes | yes |
 | Configuration | the contract version in `record.json`; `exp show` names the commit that froze it | yes |
 | Inputs | name, size and sha256 of every file under `[data] files`, taken before the run and compared after it and after the evaluation; a rerun records what it read; the evaluator's own files are part of the contract | the hashes |
-| Environment | prefix, python, machine, system, GPU and driver, arl version, and the list of every package | yes |
+| Environment | prefix, python, machine, system, GPU and driver, the CPUs the job could use and the thread variables it was given, arl version, and the list of every package | yes |
 | Outputs | name, size and sha256 of every file the run wrote; small ones copied into `kept/` | hashes and small files |
 | Test metrics | `metrics.json`, written by the frozen evaluator; reruns beside it, each with its split, the data it read and whether it meets the target | yes |
 | Training metrics | what the run reports about itself in `{out}/train_metrics.json` | yes |
