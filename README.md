@@ -324,7 +324,12 @@ part of a verdict: the score comes from the evaluator.
 
 The evaluator must not import code that experiments can change, and the run
 must not compute its own score. One metric is `primary` (with `min_delta`, the
-smallest change that counts). `constraint` metrics have a `limit` or a
+smallest change that counts). Optional `secondary` metrics break exact ties,
+in the order their `[[metric]]` tables appear. A later metric never compensates
+for a worse earlier metric: a nonzero change below that metric's `min_delta`
+is neutral and stops the comparison, rather than passing it to a tie-breaker.
+Comparisons name the metric that decided them, and reruns check every ranking
+metric before reporting reproduction. `constraint` metrics have a `limit` or a
 `max_regression` and must hold for a result to be kept. `info` metrics are
 recorded.
 

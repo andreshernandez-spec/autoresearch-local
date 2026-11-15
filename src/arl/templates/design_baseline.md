@@ -9,4 +9,4 @@ Written before the run. arl locks this file and params.json when the run starts.
 
 ## Expected
 
-> FILL: the value you expect on {primary} and where that expectation comes from
+> FILL: the values you expect on the ranking metrics ({ranking}) and where those expectations come from

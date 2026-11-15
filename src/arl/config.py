@@ -21,7 +21,7 @@ DECISIONS = ["continue", "adjust", "branch", "pivot", "stop", "escalate"]
 class Metric:
     name: str
     goal: str  # "max" or "min"
-    role: str  # "primary", "constraint" or "info"
+    role: str  # "primary", "secondary", "constraint" or "info"
     min_delta: float = 0.0
     target: float | None = None
     limit: float | None = None
@@ -74,6 +74,11 @@ class Config:
     @property
     def primary(self) -> Metric:
         return next(m for m in self.metrics if m.role == "primary")
+
+    @property
+    def ranking(self) -> list[Metric]:
+        """Primary first, then secondary metrics in their declaration order."""
+        return [self.primary, *(m for m in self.metrics if m.role == "secondary")]
 
     def metric(self, name: str) -> Metric | None:
         return next((m for m in self.metrics if m.name == name), None)
@@ -142,8 +147,8 @@ def load(path: Path) -> Config:
         goal, role = m.get("goal", "max"), m.get("role", "info")
         if goal not in ("max", "min"):
             raise ArlError(f"arl.toml: {where}: goal must be 'max' or 'min'")
-        if role not in ("primary", "constraint", "info"):
-            raise ArlError(f"arl.toml: {where}: role must be primary, constraint or info")
+        if role not in ("primary", "secondary", "constraint", "info"):
+            raise ArlError(f"arl.toml: {where}: role must be primary, secondary, constraint or info")
         limit, regression = _number(m, where, "limit"), _number(m, where, "max_regression", least=0)
         if role == "constraint" and limit is None and regression is None:
             raise ArlError(f"arl.toml: constraint {name} needs 'limit' or 'max_regression'")

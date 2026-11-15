@@ -30,7 +30,7 @@ from arl import cli, rules
 from arl.commands import common
 from arl.config import DECISIONS
 from arl.ledger import Ledger
-from conftest import NOTHING_NEW, Project, cut_off, env_table, git, install, make_env, pause_record
+from conftest import EVAL_PY, NOTHING_NEW, Project, cut_off, env_table, git, install, make_env, pause_record
 
 SEEDS = range(int(os.environ.get("ARL_WALK_SEEDS", "6")))
 if os.environ.get("ARL_WALK_SHARD"):  # "2/4": the second of four machines that share the walks out
@@ -448,7 +448,11 @@ def test_walk(project: Project, monkeypatch, seed: int):
     # Every second walk has a target that some of its results reach: some hold on the other
     # split and end the walk, some do not. The other walks go as deep as they can.
     target = "target = 0.95" if seed % 2 else ""
-    p.setup(every=5, stagnation=3, max_experiments=max(30, STEPS // 2), python="python", extra=env_table(env), target=target)
+    extra, evaluator = env_table(env), EVAL_PY
+    if seed % 4 >= 2:  # half the walks have plateaus in the primary, broken by a secondary
+        extra += '\n[[metric]]\nname = "quality"\ngoal = "max"\nrole = "secondary"\n'
+        evaluator = evaluator.replace('"score": 1 - abs(x - target)', '"score": round(1 - abs(x - target), 1), "quality": x')
+    p.setup(evaluator=evaluator, every=5, stagnation=3, max_experiments=max(30, STEPS // 2), python="python", extra=extra, target=target)
     walk = Walk(p, seed, monkeypatch, env)
     walk.go(STEPS)
     walk.settle()

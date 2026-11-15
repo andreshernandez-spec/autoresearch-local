@@ -4,7 +4,7 @@
 
 ## What happened
 
-> FILL: the result in plain words, set against the prediction in design.md
+> FILL: each ranking metric against the prediction in design.md, whether the ranking improved, and what any change in a component or training loss established about the program's goal
 
 ## Why
 

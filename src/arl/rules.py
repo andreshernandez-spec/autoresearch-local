@@ -3,6 +3,7 @@ when an introspection is due, when the budget is spent, and what comes next."""
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from . import contract
@@ -47,40 +48,51 @@ def compare(cfg: Config, metrics: dict[str, float], reference: Record | None, re
 
     No reference: this run is the reference. A baseline on a track that has one
     is a repeat: it shows the noise and never replaces the reference. Otherwise
-    improve, neutral, worse or gate_fail.
+    improve, neutral, worse or gate_fail. Secondary metrics break exact ties:
+    a nonzero change below min_delta is neutral, not a tie.
     """
     primary = cfg.primary
     value = metrics[primary.name]
     ref_metrics = reference.metrics if reference else None
     fails = gate_failures(cfg, metrics, ref_metrics)
     met = bool(primary.target is not None and not fails and primary.meets(value, primary.target))
+    ranking = [m.name for m in cfg.ranking]
     if reference is None:
-        return Comparison(metric=primary.name, value=value, gate_failures=fails, target_met=met, outcome="reference")
+        return Comparison(metric=primary.name, value=value, gate_failures=fails, target_met=met, outcome="reference", ranking=ranking)
     assert ref_metrics is not None
-    gain = primary.gain(value, ref_metrics[primary.name])
+    compared = primary
+    gain = 0.0
+    for metric in cfg.ranking:
+        change = metric.gain(metrics[metric.name], ref_metrics[metric.name])
+        if change != 0:
+            compared, gain = metric, change
+            break
     ref_failed = bool(reference.comparison and reference.comparison.gate_failures)
+    # Subtracting two decimal scores can put an exact threshold a few bits below it.
+    enough = abs(gain) >= compared.min_delta or math.isclose(abs(gain), compared.min_delta, rel_tol=1e-12, abs_tol=0.0)
     if repeat:
         outcome, met = "repeat", False
     elif fails:
         outcome = "gate_fail"
     elif ref_failed:
         outcome = "improve"  # inside the constraints beats outside them
-    elif gain > 0 and gain >= primary.min_delta:
+    elif gain > 0 and enough:
         outcome = "improve"
-    elif gain < 0 and -gain >= primary.min_delta:
+    elif gain < 0 and enough:
         outcome = "worse"
     else:
         outcome = "neutral"
     return Comparison(
-        metric=primary.name,
-        value=value,
+        metric=compared.name,
+        value=metrics[compared.name],
         gate_failures=fails,
         target_met=met,
         reference=reference.id,
-        reference_value=ref_metrics[primary.name],
+        reference_value=ref_metrics[compared.name],
         gain=gain,
-        min_delta=primary.min_delta,
+        min_delta=compared.min_delta,
         outcome=outcome,
+        ranking=ranking,
     )
 
 

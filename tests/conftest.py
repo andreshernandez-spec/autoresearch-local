@@ -166,10 +166,10 @@ class Project:
         cfg.update(over)
         (self.research / "arl.toml").write_text(ARL_TOML.format(**cfg))
 
-    def setup(self, **over) -> None:
+    def setup(self, evaluator: str = EVAL_PY, **over) -> None:
         self.arl("init")
         self.contract(**over)
-        (self.research / "eval" / "evaluate.py").write_text(EVAL_PY)
+        (self.research / "eval" / "evaluate.py").write_text(evaluator)
         self.fill(self.research / "PROGRAM.md")
         self.arl("freeze", "--reason", "initial")
 

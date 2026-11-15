@@ -45,15 +45,17 @@ def table(headers: list[str], rows: list[list[Any]]) -> str:
 # --- experiments and tracks as tables ---------------------------------------------
 
 
-def _primary(ledger: Ledger, rec: Record | None) -> str:
-    name = ledger.cfg.primary.name
+def _metric(rec: Record | None, name: str) -> str:
     metrics = (rec.metrics if rec else None) or {}
     return fmt(metrics[name]) if name in metrics else ""
 
 
-def _gain(rec: Record) -> str:
+def _gain(rec: Record, primary: str) -> str:
     gain = rec.comparison.gain if rec.comparison else None
-    return f"{gain:+.6g}" if gain is not None else ""
+    if gain is None:
+        return ""
+    metric = need(rec.comparison).metric
+    return f"{gain:+.6g}" + (f" ({metric})" if metric != primary else "")
 
 
 def _verdict(rec: Record) -> str:
@@ -61,26 +63,28 @@ def _verdict(rec: Record) -> str:
 
 
 def exp_table(ledger: Ledger, exps: list[Record]) -> str:
+    ranking = [m.name for m in ledger.cfg.ranking]
     rows = [
         [
             e.id,
             e.track,
             e.type,
             " ".join(e.hypotheses),
-            _primary(ledger, e),
-            _gain(e),
+            *[_metric(e, name) for name in ranking],
+            _gain(e, ledger.cfg.primary.name),
             e.outcome or "",
             _verdict(e),
             e.title,
         ]
         for e in exps
     ]
-    head = ["id", "track", "type", "tests", ledger.cfg.primary.name, "gain", "outcome", "verdict", "title"]
+    head = ["id", "track", "type", "tests", *ranking, "gain", "outcome", "verdict", "title"]
     return table(head, rows)
 
 
 def track_table(ledger: Ledger, lock: dict[str, Any] | None) -> str:
     exps = ledger.experiments()
+    ranking = [m.name for m in ledger.cfg.ranking]
     rows = []
     for t in ledger.tracks():
         mine = [e for e in exps if e.track == t.name]
@@ -94,14 +98,14 @@ def track_table(ledger: Ledger, lock: dict[str, Any] | None) -> str:
                 t.name,
                 t.status,
                 ref.id if ref else "none",
-                _primary(ledger, ref),
+                *[_metric(ref, name) for name in ranking],
                 len(mine),
                 sum(rules.kept(e) for e in mine),
                 run,
                 t.head_commit[:10],
             ]
         )
-    head = ["track", "status", "reference", ledger.cfg.primary.name, "experiments", "kept", "in a row without a keep", "head"]
+    head = ["track", "status", "reference", *ranking, "experiments", "kept", "in a row without a keep", "head"]
     return table(head, rows)
 
 
@@ -131,7 +135,9 @@ def summary(ledger: Ledger, rec: Record) -> str:
         comp = need(rec.comparison)
         for m in cfg.metrics:
             if m.name in rec.metrics:  # a metric added to the contract later is not in older records
-                lines.append(f"  {m.name:28s} {fmt(rec.metrics[m.name])}" + ("  (primary)" if m.role == "primary" else ""))
+                lines.append(f"  {m.name:28s} {fmt(rec.metrics[m.name])}" + (f"  ({m.role})" if m.role in ("primary", "secondary") else ""))
+        if comp.ranking and len(comp.ranking) > 1:
+            lines.append("  ranking: " + ", then ".join(comp.ranking) + "; later metrics break exact ties")
         if comp.reference:
             lines.append(
                 f"  against {comp.reference}: {comp.metric} {fmt(comp.reference_value)} -> {fmt(comp.value)}, "
@@ -304,6 +310,8 @@ def analysis_facts(ledger: Ledger, rec: Record) -> str:
             row += [fmt(before) if before is not None else "", f"{m.gain(metrics[m.name], before):+.6g}" if before is not None else ""]
         rows.append(row)
     lines = [f"Written by arl. Outcome: **{comp.outcome}**.", "", table(head, rows)]
+    if comp.ranking and len(comp.ranking) > 1:
+        lines.append("Ranking: " + ", then ".join(comp.ranking) + ". A later metric is considered only when all earlier metrics tie exactly.")
     if comp.outcome == "repeat":
         lines.append("A repeat of the reference: it shows the noise of the measurement and does not replace the reference.")
     elif ref:

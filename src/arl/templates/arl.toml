@@ -48,6 +48,15 @@ role = "primary"        # exactly one metric is primary
 min_delta = 0.0         # smallest change that counts as better or worse
 # target = 0.95         # reaching it ends the program
 
+# Optional tie-breakers, in declaration order. A secondary metric is considered
+# only when every earlier ranking metric is exactly equal to its reference.
+# A nonzero change smaller than min_delta is neutral, not a tie.
+# [[metric]]
+# name = "quality"
+# goal = "max"
+# role = "secondary"
+# min_delta = 0.0
+
 # [[metric]]
 # name = "seconds"
 # goal = "min"

@@ -98,7 +98,7 @@ class Design:
 class Comparison:
     """A result against the reference of its track."""
 
-    metric: str
+    metric: str  # first differing ranking metric; primary when all tie or there is no reference
     value: float
     gate_failures: list[str]
     target_met: bool
@@ -107,6 +107,7 @@ class Comparison:
     gain: float | None = None
     min_delta: float | None = None
     outcome: str  # reference, repeat, improve, neutral, worse, gate_fail
+    ranking: list[str] | None = None  # the ordering used for this comparison; absent in older records
 
 
 @dataclass(slots=True, kw_only=True)
@@ -154,6 +155,7 @@ class Rerun:
     metrics: dict[str, float] | None = None
     train_metrics: dict[str, float] | None = None
     difference: float | None = None  # from the recorded primary metric
+    differences: dict[str, float] | None = None  # differences on every ranking metric, when there is more than one
     reproduced: bool | None = None  # only on the first split, the same evaluator and the same data
     meets_target: bool | None = None
 
