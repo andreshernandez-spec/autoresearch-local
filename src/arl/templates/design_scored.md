@@ -9,7 +9,7 @@ Written before the run. arl locks this file and params.json when the run starts.
 
 ## Prediction
 
-> FILL: what the evaluator will show if the hypothesis holds: direction and rough size on {primary}, and any other metric you expect to move
+> FILL: what the evaluator will show if the hypothesis holds: direction and rough size on each ranking metric ({ranking}), any constraint you expect to move, and how this advances the program's goal
 
 ## Would count against
 

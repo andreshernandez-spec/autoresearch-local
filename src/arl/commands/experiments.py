@@ -95,6 +95,7 @@ def cmd_exp_new(args: argparse.Namespace) -> int:
             "track": args.track,
             "hyps": ", ".join(hyps) or "no hypothesis",
             "primary": cfg.primary.name,
+            "ranking": ", then ".join(m.name for m in cfg.ranking),
             "change_hint": "params only" if typ == "tune" else "code, and params if the code needs them",
         }
         kind = typ if typ in ("baseline", "diagnose") else "scored"
@@ -339,19 +340,21 @@ def cmd_exp_show(args: argparse.Namespace) -> int:
         print(f"  attempt {a.n}: {took}{state}{saved}")
         if a.warning:
             print(f"    note: {a.warning}")
-    name = ledger.cfg.primary.name
     for r in rec.reruns:
         if r.failed:
             print(f"  rerun {r.n} on {r.split}: FAILED: {r.failed}")
         else:
-            value = fmt(r.metrics[name]) if r.metrics and name in r.metrics else "not reported"
+            scores = ", ".join(
+                f"{m.name} {fmt(r.metrics[m.name]) if r.metrics and m.name in r.metrics else 'not reported'}"
+                for m in ledger.cfg.ranking
+            )
             changed = r.env_changed
             other = f", in another environment ({runner.differences(changed.count)}: {runner.short(changed.first, 3)})" if changed else ""
             if r.data_digest not in (None, rec.data_digest):
                 other += ", on other data than the experiment read"
             if r.meets_target is not None:
                 other += ", meets the target" if r.meets_target else ", does not meet the target"
-            print(f"  rerun {r.n} on {r.split}: {name} {value}" + (f", reproduced: {r.reproduced}" if r.reproduced is not None else "") + other)
+            print(f"  rerun {r.n} on {r.split}: {scores}" + (f", reproduced: {r.reproduced}" if r.reproduced is not None else "") + other)
     env = rec.env
     if env:
         what = [env.get("prefix") or "the python of the shell that ran it"] + ([f"python {env['python']}"] if env.get("python") else [])

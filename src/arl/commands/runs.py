@@ -394,7 +394,10 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
             entry.metrics = metrics
             if split == cfg.splits[0] and same_eval and same_data:
                 entry.difference = abs(metrics[primary.name] - recorded[primary.name])
-                entry.reproduced = bool(entry.difference <= max(primary.min_delta, 1e-12))
+                differences = {m.name: abs(metrics[m.name] - recorded[m.name]) for m in cfg.ranking}
+                if len(differences) > 1:
+                    entry.differences = differences
+                entry.reproduced = all(differences[m.name] <= max(m.min_delta, 1e-12) for m in cfg.ranking)
             if primary.target is not None:
                 entry.meets_target = rules.meets_target(cfg, metrics)
 
@@ -407,7 +410,8 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
     if failed:
         print(f"{eid} rerun on split '{split}' FAILED: {failed}. Log: {log}")
         return EXIT_CRASH
-    print(f"{eid} rerun on split '{split}': {primary.name} = {fmt(metrics[primary.name])}")
+    scores = ", ".join(f"{m.name} = {fmt(metrics[m.name])}" for m in cfg.ranking)
+    print(f"{eid} rerun on split '{split}': {scores}")
     if differs:
         print(f"  the environment is not the one it first ran in ({runner.differences(len(differs))}): {runner.short(differs)}")
         print(f"  all of them: {ARL} exp env {eid}")
@@ -416,7 +420,11 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
     if not same_data:
         print("  the data files are not the ones it first ran on: this is the recorded code on other data, not a repetition of the result")
     if entry.reproduced is not None:
-        print(f"  recorded {fmt(recorded[primary.name])}, difference {entry.difference:.3g}, reproduced: {entry.reproduced}")
+        if entry.differences:
+            print("  recorded ranking: " + ", ".join(f"{m.name} {fmt(recorded[m.name])}" for m in cfg.ranking))
+            print("  differences: " + ", ".join(f"{name} {delta:.3g}" for name, delta in entry.differences.items()) + f", reproduced: {entry.reproduced}")
+        else:
+            print(f"  recorded {fmt(recorded[primary.name])}, difference {entry.difference:.3g}, reproduced: {entry.reproduced}")
     else:
         print("  not compared with the recorded result (another split, another evaluator or other data). Never used for a verdict.")
     hit = rules.claim(ledger, ledger.record(eid), lock) if same_data else None

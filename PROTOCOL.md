@@ -110,7 +110,11 @@ what you had only in your head. So write things down when they happen:
 5. **The verdict follows the recorded outcome.** You choose among the verdicts
    it allows, and the reason goes in the analysis. An improvement may be
    discarded when it buys little and adds much. A neutral result may be kept
-   only when it makes things simpler.
+   only when it makes things simpler. Predict and report every ranking metric:
+   the primary first, then any secondary metrics in contract order. A secondary
+   breaks an exact tie in all earlier metrics; a change below `min_delta` is
+   neutral, not a tie. A better component or training loss needs a measured
+   connection to the program's goal before it counts as progress toward it.
 6. **A hypothesis is judged separately from the change.** "Kept" does not mean
    "supported". Say what each run did to each hypothesis it tested.
 7. **What you notice is written down when you notice it**, in a sentence or
