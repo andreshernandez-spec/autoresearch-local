@@ -227,7 +227,7 @@ not tracked here.
 
 ```sh
 git clone <url> ~/private/open-source/autoresearch-local
-cd ~/private/open-source/autoresearch-local && python -m pytest    # about five minutes
+cd ~/private/open-source/autoresearch-local && python -m pytest    # about seven minutes
 # make the skill visible to Claude Code sessions started under ~/private/open-source
 mkdir -p ../.claude/skills/research-loop
 ln -s ../../../autoresearch-local/skill/SKILL.md ../.claude/skills/research-loop/SKILL.md
@@ -475,7 +475,12 @@ python -m pytest
 ```
 
 Linux only: the tests, like arl itself, read `/proc` and use sessions and
-signals to stop jobs.
+signals to stop jobs. They need pytest, git and bash, and nothing else.
+
+Every pull request runs them on GitHub (`.github/workflows/ci.yml`) on each
+Python from 3.11 to the newest, together with a type check (pyright) and a
+longer random walk through the loop: 40 walks of 150 steps, where the suite
+itself takes 6 of 70.
 
 A toy project in a temporary git repository is driven through the real CLI.
 Every stage and every gate has a test (`tests/test_flow.py`,

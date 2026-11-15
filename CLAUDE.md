@@ -11,6 +11,12 @@ enforced. `PROTOCOL.md` is what an agent reads before using it.
   projects copy.
 - `python -m pytest` runs everything (about seven minutes). The tests drive a
   toy project in a temporary git repository through the real CLI.
+- Every pull request and every commit on main runs `.github/workflows/ci.yml`:
+  the suite on each Python from 3.11 to the newest with nothing installed but
+  pytest, `pyright src`, and the wide walk. A new Python goes into its matrix
+  when the runners have it. pyright is pinned there, and the pin moves in a
+  change of its own, so that a new checker never fails a change that did not
+  touch it.
 - Every gate has a test that hits it through the CLI and checks the message:
   `tests/test_flow.py` for the loop, `tests/test_introspection.py` for the
   introspection step, `tests/test_env.py` for the environment and for going
@@ -20,10 +26,12 @@ enforced. `PROTOCOL.md` is what an agent reads before using it.
 - `tests/test_hardening.py` holds the sequences that once broke a guarantee,
   dead-ended or ended in a traceback. A new one found by trying goes there
   with its fix.
-- `tests/test_walk.py` walks the loop at random. After a change to the stages,
-  the statuses or what a command checks, run it wide before committing:
-  `ARL_WALK_SEEDS=40 ARL_WALK_STEPS=150 python -m pytest tests/test_walk.py`.
-  A new stage or command goes into its `follow` or its list of typed commands.
+- `tests/test_walk.py` walks the loop at random. CI walks it wide on every
+  pull request (40 walks of 150 steps). After a change to the stages, the
+  statuses or what a command checks, do the same before pushing:
+  `ARL_WALK_SEEDS=40 ARL_WALK_STEPS=150 python -m pytest tests/test_walk.py`
+  (about a quarter of an hour). A new stage or command goes into its `follow`
+  or its list of typed commands.
 - A command checks everything before it changes anything. A refusal leaves the
   ledger, the worktrees and git as they were.
 - Where a change takes several steps, the intent is written first and any later
@@ -48,7 +56,9 @@ enforced. `PROTOCOL.md` is what an agent reads before using it.
   is None is not written: a field that is renamed or removed still has to be
   read from old files. What a status promises (`contradiction`) is checked
   when a record is read, which is what lets a command say `need(...)`.
-  `pyright src` stays at zero errors; a test runs it when pyright is there.
+  `pyright src` stays at zero errors, read as Python 3.11 reads the code
+  (`pyproject.toml`). CI runs it, and so does a test where pyright is
+  installed.
 - An interruption is not a failure. A part of a run that ends because arl or
   the job was stopped from outside leaves the run `paused`; only what the job
   itself did wrong uses up an attempt.
