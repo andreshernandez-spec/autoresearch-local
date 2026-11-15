@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import shutil
+from pathlib import Path
 
-from .. import contract, render, rules, runner
+from .. import contract, plot, render, rules, runner
 from ..ledger import Ledger
 from ..record import need
 from ..util import ArlError, as_text, read_json, write_text
@@ -82,6 +85,54 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(json.dumps(render.state(ledger), indent=2, default=as_text))
     else:
         print(render.status(ledger), end="")
+    return 0
+
+
+def cmd_plot(args: argparse.Namespace) -> int:
+    """One metric against the experiment number. Reads the ledger, changes nothing."""
+    ledger = Ledger.locate()
+    cfg, lock = ledger.cfg, contract.load(ledger)
+    if args.track and args.track not in {t.name for t in ledger.tracks()}:
+        raise ArlError(f"there is no track {args.track}. `{ARL} track list` names them")
+    exps = [e for e in ledger.experiments() if not args.track or e.track == args.track]
+    declared = {m.name: m for m in cfg.metrics}
+    name = args.metric or cfg.primary.name
+    scored = sorted({k for e in exps for k in e.metrics or {}})
+    reported = sorted({k for e in exps for k in e.train_metrics or {}})
+    own = args.train or (name not in scored and name in reported)  # what runs say about themselves
+    if name not in (reported if own else scored) and (own or name not in declared):
+        known = [f"the evaluator's: {', '.join(scored)}" if scored else "", f"what runs report about themselves: {', '.join(reported)}" if reported else ""]
+        raise ArlError(f"no experiment has a value called {name}. " + ("Known are " + "; ".join(k for k in known if k) + "." if any(known) else "No experiment has a result yet."))
+
+    points, without = [], []
+    for e in exps:
+        value = ((e.train_metrics if own else e.metrics) or {}).get(name)
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            without.append(f"{e.id} ({e.status})")
+            continue
+        earlier = not own and lock is not None and e.eval_digest != lock["eval_digest"]
+        kind = plot.EARLIER if earlier else plot.KEPT if e.decision == "keep" else plot.SCORED
+        points.append(plot.Point(n=int(e.id[1:]), id=e.id, value=float(value), kind=kind))
+    if not points:
+        print(f"No experiment has a {name} yet.")
+        return 0
+
+    goal = args.goal or (declared[name].goal if not own and name in declared else None)
+    steps = plot.best_so_far(points, goal)
+    title = f"{name} by experiment"
+    title += {"max": ", higher is better", "min": ", lower is better", None: ""}[goal]
+    title += ", as the runs report it" if own else ""
+    title += f", track {args.track}" if args.track else ""
+    width = args.width or shutil.get_terminal_size((100, 24)).columns
+    print(plot.text(points, steps, title, width=width, height=args.height), end="")
+    print(plot.caption(points, steps))
+    if without:
+        print("without a value: " + ", ".join(without[:8]) + (f" and {len(without) - 8} more" if len(without) > 8 else ""))
+    if goal is None:
+        print("Which way is better is not known for this one: --goal max or --goal min draws the best so far.")
+    if args.svg:
+        write_text(Path(args.svg), plot.svg(points, steps, title, name))
+        print(f"wrote {args.svg}")
     return 0
 
 

@@ -394,6 +394,7 @@ class Walk:
                         ("resume",),
                         ("verify",),
                         ("status", "--json"),
+                        ("plot",),
                         ("freeze", "--reason", "typed without looking"),
                     ]
                 )
