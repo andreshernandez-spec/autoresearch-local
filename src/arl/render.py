@@ -124,7 +124,7 @@ def _target_line(ledger: Ledger, lock: dict[str, Any] | None, data: str | None) 
         return ""
     goal = f"{primary.name} {'>=' if primary.goal == 'max' else '<='} {fmt(float(primary.target))}"
     hit = rules.target_claim(ledger, lock, data)
-    fell = [rules.claim_text(c) for c in rules.claims(ledger, lock) if c["state"] in ("missed", "given up")]
+    fell = [rules.claim_text(c) for c in rules.claims(ledger, lock) if c["state"] in rules.NOT_CONFIRMED]
     return f"{goal}: {rules.claim_text(hit) if hit else 'not reached'}." + (f" Not confirmed: {'; '.join(fell)}." if fell else "")
 
 
@@ -318,9 +318,24 @@ def analysis_facts(ledger: Ledger, rec: Record) -> str:
         lines.append(f"A change of at least {fmt(comp.min_delta)} on {comp.metric} counts as better or worse.")
     if comp.gate_failures:
         lines.append("Constraints not met: " + "; ".join(comp.gate_failures) + ".")
-    lines += _reported(rec) + _env_facts(ledger, rec, ref)
+    lines += _reported(rec) + _env_facts(ledger, rec, ref) + _rerun_estimates(ledger, rec)
     lines.append(f"{took}. {where}")
     return "\n".join(lines)
+
+
+def _rerun_estimates(ledger: Ledger, rec: Record) -> list[str]:
+    """With [eval] split_size: how long a rerun on each split that confirms a result would take,
+    so that a result that could never be confirmed is known before it is kept."""
+    out = []
+    for split in rules.confirming_splits(ledger.cfg):
+        est = rules.rerun_estimate(ledger.cfg, rec, split)
+        if est is None:
+            continue
+        text = f"A rerun on {split} would take about {est['seconds']:.0f} s, limit {est['limit']:.0f} s (this run's {est['ran']:.0f} s, scaled by [eval] split_size)"
+        if not est["fits"]:
+            text += ". It would not fit: a result that reaches the target here cannot be confirmed there, until the method is faster or a person raises [run] timeout_s"
+        out.append(text + ".")
+    return out
 
 
 def _section(body: str, heading: str) -> str:

@@ -40,6 +40,9 @@ frozen = ["research/eval"]
 # The first split scores every experiment. The others are used only by
 # 'arl exp reproduce --split', to confirm a result on data the loop never tuned on.
 splits = ["dev"]
+# How many items each split has, when a run's time grows with them. A rerun is then
+# estimated from the run it repeats, and refused when it would pass [run] timeout_s.
+# split_size = { dev = 400, confirm = 2000 }
 
 [[metric]]
 name = "score"

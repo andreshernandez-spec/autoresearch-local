@@ -238,7 +238,10 @@ stays the reference of its track, and an introspection is due. Its part 1
 asks why one split said yes and the other no: a gain smaller than the noise,
 or a method fitted to the split it was tuned on. A result reached under
 another evaluator or on other data files makes no claim: after either
-changes, the tracks are measured again.
+changes, the tracks are measured again. With `[eval] split_size`, a run
+that would pass the run limit there is not started: the claim is set aside
+as not confirmed, and the analysis of a run already says what a rerun would
+take, so a result that could never be confirmed is known before it is kept.
 
 **Introspection** (`arl introspect new`, `arl introspect close`, `arl reload`).
 Due after a set number of judged experiments, after a run of experiments

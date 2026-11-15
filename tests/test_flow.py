@@ -386,6 +386,48 @@ def test_reproduce_and_confirmation_split(project: Project):
     assert not list((p.base / "wt").glob("toy-rerun-*"))
     assert "knows the splits" in p.arl("exp", "reproduce", eid, "--split", "test", code=1)
     assert p.record(eid)["verdict"]["decision"] == "keep"
+    assert "A rerun on confirm would take" not in (p.ledger.exp_dir(eid) / "analysis.md").read_text()  # no split sizes, no estimate
+
+
+def sizes(confirm: int) -> str:
+    """[eval] split_size, in the table the test contract leaves room for at its end."""
+    return f"[eval.split_size]\ndev = 1\nconfirm = {confirm}\n"
+
+
+def test_a_rerun_that_cannot_fit_the_run_limit_is_not_started(project: Project, monkeypatch):
+    p = project
+    h = p.started(extra=sizes(10**6))  # whatever a toy run takes, a million times that is past 60 s
+    eid = p.tune(0.5, "keep", h)
+    ran = p.record(eid)["attempts"][-1]["run_seconds"]
+    analysis = (p.ledger.exp_dir(eid) / "analysis.md").read_text()
+    assert f"A rerun on confirm would take about {ran * 10**6:.0f} s, limit 60 s (this run's {ran:.0f} s, scaled by [eval] split_size). It would not fit" in analysis
+    before, head = p.record(eid), git(p.root, "rev-parse", "HEAD")
+    out = p.arl("exp", "reproduce", eid, "--split", "confirm", code=1)
+    assert f"A rerun of {eid} on 'confirm' would take about {ran * 10**6:.0f} s, and the run limit is 60 s" in out
+    assert "on 'dev' (1 items), scaled to the 1000000 items of 'confirm'" in out
+    assert "a faster method" in out and "a person raising [run] timeout_s" in out
+    assert p.record(eid) == before and git(p.root, "rev-parse", "HEAD") == head and not (p.ledger.exp_dir(eid) / "artifacts" / "rerun-1-confirm").exists()
+    assert "reproduced: True" in p.arl("exp", "reproduce", eid)  # the split it ran on: the same size, it fits
+
+    # The person makes the split smaller in the contract. Sizes do not change a score: the references still count.
+    monkeypatch.setattr(common, "interactive", lambda: True)
+    (p.research / "arl.toml").write_text((p.research / "arl.toml").read_text().replace("confirm = 1000000", "confirm = 2"))
+    p.arl("freeze", "--reason", "the confirming split is smaller", "--yes")
+    assert "score = 0.78" in p.arl("exp", "reproduce", eid, "--split", "confirm")
+    assert "NEXT: hypothesize" in p.arl("next")
+
+
+def test_a_target_that_cannot_be_confirmed_in_time_is_set_aside(project: Project):
+    """Not a dead end at 'confirm': the claim is not confirmed, and the loop goes on from an introspection."""
+    p = project
+    h = p.started(target="target = 0.95", extra=sizes(10**6))
+    eid = p.tune(0.7, "keep", h)  # 1.0 on dev
+    out = p.arl("next")
+    assert "NEXT: introspect" in out and f"{eid} reached the target on dev and cannot be confirmed on confirm: that run would take about" in out
+    assert "Not confirmed:" in (p.research / "STATUS.md").read_text()
+    assert "That has to be confirmed first" not in new_exp(p, "tune", h, code=1)  # the introspection comes first, nothing else
+    p.introspect()
+    assert "NEXT: hypothesize" in p.arl("next")
 
 
 def test_ideas_document(project: Project):

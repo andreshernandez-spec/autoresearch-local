@@ -70,6 +70,7 @@ class Config:
     env_prefix: str | None
     env_command: str | None
     data_files: list[str] = field(default_factory=list)
+    split_size: dict[str, int] | None = None  # items in each split, to tell how long a rerun on another split takes
 
     @property
     def primary(self) -> Metric:
@@ -120,6 +121,23 @@ def _texts(table: dict[str, Any], section: str, key: str, default: list[str]) ->
     if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
         raise ArlError(f"arl.toml: [{section}] {key} must be a list of texts in quotes, not {value!r}")
     return list(value)
+
+
+def _split_size(ev: dict[str, Any], splits: list[str]) -> dict[str, int] | None:
+    """[eval] split_size: how many items each split has. All of them or none, so any two
+    can be compared."""
+    sizes = ev.get("split_size")
+    if sizes is None:
+        return None
+    if not isinstance(sizes, dict):
+        raise ArlError(f"arl.toml: [eval] split_size must be a table of split = number of items, like {{ {splits[0]} = 400 }}, not {sizes!r}")
+    unknown = [str(k) for k in sizes if k not in splits]
+    if unknown:
+        raise ArlError(f"arl.toml: [eval] split_size names {', '.join(unknown)}, which [eval] splits does not ({', '.join(splits)})")
+    missing = [s for s in splits if s not in sizes]
+    if missing:
+        raise ArlError(f"arl.toml: [eval] split_size needs the size of every split, and {', '.join(missing)} has none")
+    return {s: int(_number({f"split_size.{s}": sizes[s]}, "eval", f"split_size.{s}", least=1, whole=True)) for s in splits}
 
 
 def load(path: Path) -> Config:
@@ -175,6 +193,7 @@ def load(path: Path) -> Config:
     splits = _texts(ev, "eval", "splits", ["dev"])
     if not splits:
         raise ArlError("arl.toml: [eval] splits must name at least one split")
+    split_size = _split_size(ev, splits)
     frozen = _texts(ev, "eval", "frozen", [])
     if not frozen:
         raise ArlError("arl.toml: [eval] needs 'frozen', the files and folders of the evaluator")
@@ -215,4 +234,5 @@ def load(path: Path) -> Config:
         env_prefix=_text(env, "env", "prefix"),
         env_command=_text(env, "env", "command"),
         data_files=_texts(data, "data", "files", []),
+        split_size=split_size,
     )

@@ -281,6 +281,17 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
             split = args.split or cfg.splits[0]
             if split not in cfg.splits:
                 raise ArlError(f"arl.toml knows the splits {cfg.splits}, not '{split}'")
+            estimate = rules.rerun_estimate(cfg, rec, split)
+            if estimate is not None and not estimate["fits"]:
+                sizes = need(cfg.split_size)
+                raise ArlError(
+                    f"A rerun of {eid} on '{split}' would take about {estimate['seconds']:.0f} s, and the run limit is {estimate['limit']:.0f} s "
+                    "([run] timeout_s). It is not started: it would fail at the limit.\n"
+                    f"The estimate is its run of {estimate['ran']:.0f} s on '{estimate['split']}' ({sizes[estimate['split']]} items), "
+                    f"scaled to the {sizes[split]} items of '{split}' ([eval] split_size).\n"
+                    "Two ways on: a faster method, tried in an experiment of its own, or a person raising [run] timeout_s\n"
+                    "and freezing the contract again (the tracks are then measured again)."
+                )
             fingerprint, data = common.data_files(ledger)  # a rerun reads the data too: a file that is gone stops it here
             jobs.require_free_machine(cfg)
             exp = ledger.exp_dir(eid)

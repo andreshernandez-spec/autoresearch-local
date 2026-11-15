@@ -339,6 +339,15 @@ experiment and the others are reached only through
 on. Those results are stored and never used for a verdict. They decide one
 thing, whether a target counts as reached.
 
+`[eval] split_size = { dev = 400, confirm = 2000 }` says how many items each
+split has. With it a rerun is estimated before it starts: the recorded run
+time of the experiment (every part of its run, not the evaluation), scaled by
+the sizes. A rerun that would pass `[run] timeout_s` is refused, with the two
+ways on (a faster method, or a person raising the limit), and the analysis of
+every scored run says what a rerun on each confirming split would take.
+Without it nothing is estimated. The sizes are not part of what a score
+depends on: adding them asks for no new baseline.
+
 A `target` on the primary metric ends the program, so reaching it once is
 not enough. A kept result that reaches it on the first split is a claim, and
 `arl next` says `confirm <id>`: the experiment is run once more on every
@@ -351,6 +360,8 @@ other split, or on the first one again when the contract has no other.
   change the answer: a split that is tried until it agrees has been tuned on.
 - A confirming run that itself fails `max_attempts` times sets the claim
   aside as not confirmed. A run that succeeds later still decides.
+- A confirming run that would pass the run limit by `[eval] split_size` is
+  not started, and the claim is set aside as not confirmed in the same way.
 - A claim counts only under the evaluator as it is and on the data files as
   they are. After either changes, the tracks are measured again, and a result
   that reaches the target is confirmed again.
