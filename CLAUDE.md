@@ -21,8 +21,8 @@ enforced. `PROTOCOL.md` is what an agent reads before using it.
   `tests/test_flow.py` for the loop, `tests/test_introspection.py` for the
   introspection step, `tests/test_env.py` for the environment and for going
   back to an old experiment (with a venv of its own), `tests/test_pause.py`
-  for stopping and continuing (with real jobs in processes of their own). A
-  new gate comes with one.
+  for stopping and continuing (with real jobs in processes of their own),
+  `tests/test_guard.py` for `arl guard`. A new gate comes with one.
 - `tests/test_hardening.py` holds the sequences that once broke a guarantee,
   dead-ended or ended in a traceback. A new one found by trying goes there
   with its fix.
@@ -96,7 +96,7 @@ enforced. `PROTOCOL.md` is what an agent reads before using it.
 | `src/arl/cli.py` | the parser, and what happens to what was typed |
 | `src/arl/commands/common.py` | what every command leans on: who is asking, the gates, the worktrees, the ledger lock that finishes a verdict left half applied |
 | `src/arl/commands/jobs.py` | a job arl started: the one path a run and a rerun take (`measure`), what may not change under it (`moved`), writing to a record in the middle of one (`amend`), keeping its outcome (`keep_outcome`), what a dead or interrupted process left (`settle`) |
-| `src/arl/commands/runs.py` | `exp run` and `exp reproduce`: the checks before a job starts, and where each writes what came of it |
+| `src/arl/commands/runs.py` | `exp run` and `exp reproduce`: the checks before a job starts, and where each writes what came of it; `guard`, a command of the agent's own under the same limits, which records nothing |
 | `src/arl/commands/experiments.py` | an experiment from its draft to its verdict (`exp judge` and the order of its checks), and looking one up |
 | `src/arl/commands/` the rest | `project.py` (init, freeze, status, next, verify), `session.py` (pause, resume, reload, notes, lessons), `tracks.py`, `hypotheses.py` (and ideas), `introspections.py` |
 | `src/arl/rules.py` | outcome of a result, allowed verdicts, when an introspection is due, the budget, what comes next |

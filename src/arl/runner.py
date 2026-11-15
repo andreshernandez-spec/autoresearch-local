@@ -101,8 +101,10 @@ def _gpu_free_mb() -> float | None:
 
 
 @contextlib.contextmanager
-def run_lock(ledger: Ledger) -> Generator[None, None, None]:
-    """One run at a time, across every project that names the same lock file."""
+def run_lock(ledger: Ledger, holder: str = "") -> Generator[None, None, None]:
+    """One run at a time, across every project that names the same lock file.
+
+    holder: what holds it, when that is not a run, for whoever finds it taken."""
     cfg = ledger.cfg
     path = Path(os.path.expanduser(cfg.lock)) if cfg.lock else ledger.dir / ".run.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -114,7 +116,7 @@ def run_lock(ledger: Ledger) -> Generator[None, None, None]:
             raise ArlError(f"another run holds {path} ({f.read().strip() or 'unknown'})", EXIT_BUSY) from e
         f.seek(0)
         f.truncate()
-        f.write(f"pid {os.getpid()} {ledger.cfg.name}")
+        f.write(f"pid {os.getpid()} {ledger.cfg.name}" + (f", {holder}" if holder else ""))
         f.flush()
         try:
             yield
@@ -253,13 +255,14 @@ def execute(
     cwd: Path,
     env: dict[str, str],
     timeout: float,
-    log: Path,
+    log: Path | None,
     max_rss_gb: float | None = None,
     min_free_ram_gb: float | None = None,
     on_start: Callable[[int], None] | None = None,
     pause_file: Path | None = None,
     pause_grace: float = QUICK_GRACE,
     heartbeat: Path | None = None,
+    peak: bool = False,
 ) -> dict[str, Any]:
     """Run through bash in a session of its own, output to a file.
 
@@ -269,22 +272,28 @@ def execute(
     low on memory, or arl itself being interrupted). A paused job can be
     continued later; a stopped one failed.
 
+    log: None sends the output where arl's own goes, for a command that is read as it runs.
     heartbeat: a file marked every second while the job is watched. If arl
     dies without a word, its time says how long the job had run by then,
     whether or not the job ever wrote a line.
+    peak: measure the memory of the job's processes every second, and return the
+    highest as peak_gb. Otherwise it is measured only to hold the job to max_rss_gb.
     """
-    log.parent.mkdir(parents=True, exist_ok=True)
+    if log is not None:
+        log.parent.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
     stopped = paused = ""
-    with open(log, "ab") as f:
-        f.write(f"$ cd {cwd} && {command}\n".encode())
-        f.flush()
+    top = 0.0
+    with open(log, "ab") if log is not None else contextlib.nullcontext() as f:
+        if f is not None:
+            f.write(f"$ cd {cwd} && {command}\n".encode())
+            f.flush()
         proc = subprocess.Popen(
             ["bash", "-c", command],
             cwd=cwd,
             env=env,
             stdout=f,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.STDOUT if f is not None else None,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
@@ -301,11 +310,13 @@ def execute(
                     pass
                 ticks += 1
                 mark(heartbeat)
+                held = _session_memory_gb(proc.pid) if peak or (max_rss_gb is not None and ticks % 2 == 0) else None
+                top = max(top, held or 0.0)
                 if time.monotonic() - start > timeout:
                     stopped = f"it passed its limit of {timeout:.0f} s"
                 elif pause_file is not None and pause_file.exists():
                     paused = "a pause was asked for"
-                elif ticks % 2 == 0 and max_rss_gb is not None and (held := _session_memory_gb(proc.pid)) > max_rss_gb:
+                elif max_rss_gb is not None and held is not None and held > max_rss_gb:
                     stopped = f"its processes held {held:.1f} GB of RAM, the limit is {max_rss_gb}"
                 elif min_free_ram_gb is not None and (free := _mem_available_gb()) is not None and free < min_free_ram_gb:
                     paused = f"the machine was down to {free:.1f} GB of free RAM, the floor is {min_free_ram_gb}"
@@ -323,7 +334,8 @@ def execute(
                 pause_file.unlink(missing_ok=True)
         if not (stopped or paused) and session_pids(proc.pid):
             stop_session(proc.pid)  # the job ended and left something running: nothing outlives a run
-    return {"exit_code": proc.returncode, "seconds": round(time.monotonic() - start, 2), "stopped": stopped, "paused": paused}
+    out = {"exit_code": proc.returncode, "seconds": round(time.monotonic() - start, 2), "stopped": stopped, "paused": paused}
+    return out | ({"peak_gb": round(top, 3)} if peak else {})
 
 
 def mark(path: Path | None) -> None:

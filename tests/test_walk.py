@@ -393,6 +393,8 @@ class Walk:
                         ("reload",),
                         ("resume",),
                         ("verify",),
+                        ("guard", "--", "true"),
+                        ("guard", "--no-lock", "--timeout", "30", "--", "false"),
                         ("status", "--json"),
                         ("freeze", "--reason", "typed without looking"),
                     ]

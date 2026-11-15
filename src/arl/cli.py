@@ -40,6 +40,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--reason", help="why it is paused")
     sp.add_argument("--note", help="where you were and what you were about to do, for whoever continues. Can be added after the pause")
     add(sub, "resume", session.cmd_resume, "Continue a paused loop, when the person says so.")
+    sp = add(
+        sub,
+        "guard",
+        runs.cmd_guard,
+        "Run a command of your own (a check, a conversion, a test) in the contract's environment, under the machine's "
+        "memory limits and the run lock. Nothing is recorded and nothing is scored: a score comes only from 'exp run', "
+        "so never run the evaluator through it. One argument is a command line for bash; more are a command and its arguments.",
+    )
+    sp.add_argument("--no-lock", action="store_true", help="do not take the run lock: run beside a run that holds it")
+    sp.add_argument("--timeout", type=float, metavar="SECONDS", help="stop it after this long (default: [run] timeout_s)")
+    sp.add_argument("command", nargs=argparse.REMAINDER, help="after --: what to run")
     sp = add(sub, "note", session.cmd_note, "Write down now what the next introspection should take up.")
     sp.add_argument("--about", required=True, choices=["work", "problem"], help="work: a slip or waste in the way of working. problem: something seen about the problem")
     sp.add_argument("text", nargs="+")
@@ -175,9 +186,21 @@ def _on_signal(signum: int, frame: Any) -> None:
     raise KeyboardInterrupt
 
 
+def _command_after(argv: list[str]) -> tuple[list[str], list[str] | None]:
+    """'arl guard [options] -- what to run': what follows the first -- is the command,
+    as it was typed, whatever the version of argparse does with a --."""
+    if argv[:1] == ["guard"] and "--" in argv:
+        at = argv.index("--")
+        return argv[:at], argv[at + 1 :]
+    return argv, None
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    args = build_parser().parse_args(argv)
+    head, command = _command_after(argv)
+    args = build_parser().parse_args(head)
+    if command is not None:
+        args.command = command
     try:
         # Asked to stop in any of these ways, a run saves its state and takes its job down with it.
         for sig in (signal.SIGTERM, signal.SIGHUP):

@@ -156,6 +156,8 @@ say what is different, because that can explain a different result:
 What an agent types itself (a quick check in python, a test run) uses its own
 shell. `arl reload`, the first command of a session, says where runs happen
 and, when the shell's `python` is another one, which interpreter to call.
+`arl guard -- <command>` runs such a check in the environment runs use and
+under the limits of `[machine]` (below), and records nothing.
 
 ## What an experiment records
 
@@ -374,6 +376,15 @@ its time limit or when its processes hold more RAM than `max_run_rss_gb`
 (a failure), and paused when the machine falls below `stop_below_free_ram_gb`
 (not a failure: it continues when there is room again).
 
+`arl guard [--no-lock] [--timeout SECONDS] -- <command>` holds a command of
+the agent's own (a check, a conversion, a test) to the same: the machine
+gates first, the run lock (so it waits for a run, and a run for it), and the
+memory watch, which here stops the command and everything it started and says
+which limit it passed. It runs in the current folder with the environment a
+job gets, passes the output and the exit code through, and ends with the wall
+time and the peak memory. It works while the loop is paused or waits for a
+person, and records nothing: it is a runner, not a scorer.
+
 The budget counts experiments that ran and the hours of every run: failed
 ones, interrupted parts and reruns included. Without `max_run_hours` nothing
 bounds reruns. The time of a part nobody saw end (arl was killed, the machine
@@ -433,7 +444,7 @@ words that fit any project.
 
 ```
 arl init | freeze | status | next | verify
-arl reload | pause | resume | note
+arl reload | pause | resume | note | guard
 arl track      new | set | sync | worktree | list
 arl hyp        new | set | list
 arl idea       add | set | list
@@ -444,7 +455,8 @@ arl introspect due | new | close | resolve
 
 `arl <command> --help` for each. Exit codes of `exp run`: 0 a result, 2 the run
 or the evaluator failed, 3 the run was paused and can be continued, 75 the
-machine is busy, 1 a gate refused.
+machine is busy, 1 a gate refused. `guard` returns the command's own code, 128
+and the signal when it was stopped, and 75 when the machine is busy.
 
 ## What it does not do
 
@@ -476,8 +488,8 @@ machine is busy, 1 a gate refused.
   rationalization, not someone who edits `frozen.lock` by hand. Git shows that.
   "A person at a terminal" is a check that the command runs in a terminal; a
   program can fake one. The protocol forbids it, nothing prevents it.
-- No way to stop a `diagnose` command from calling the evaluator itself. That
-  is rule 2 of the protocol, not a gate.
+- No way to stop a `diagnose` command, or one run through `arl guard`, from
+  calling the evaluator itself. That is rule 2 of the protocol, not a gate.
 
 ## For agents
 

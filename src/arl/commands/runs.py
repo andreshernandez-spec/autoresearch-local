@@ -1,4 +1,5 @@
-"""Running an experiment, and running a recorded one again."""
+"""Running an experiment, running a recorded one again, and running a check of the
+agent's own under the same limits."""
 
 from __future__ import annotations
 
@@ -7,8 +8,13 @@ import contextlib
 import copy
 import datetime as dt
 import os
+import resource
+import shlex
 import shutil
+import signal
+import sys
 import time
+from pathlib import Path
 
 from .. import contract, render, rules, runner
 from ..gitops import Git
@@ -451,3 +457,49 @@ def cmd_exp_reproduce(args: argparse.Namespace) -> int:
         print()
         print(render.next_text(ledger, common.next_action(ledger)), end="")
     return 0
+
+
+# --- a check of the agent's own -----------------------------------------------------
+
+
+def _size(gb: float) -> str:
+    return f"{gb:.1f} GB" if gb >= 1 else f"{gb * 1024:.0f} MB"
+
+
+def cmd_guard(args: argparse.Namespace) -> int:
+    """One command of the agent's own (a quick check, a conversion, a test) in the
+    contract's environment and under the machine's limits. Not a run: nothing is
+    recorded and nothing is scored, so it waits for no gate of the loop."""
+    if not args.command:
+        raise ArlError(f"say what to run:  {ARL} guard -- <command> [<argument> ...]")
+    if args.timeout is not None and not args.timeout > 0:
+        raise ArlError("--timeout is in seconds, and more than 0")
+    ledger = Ledger.locate()
+    cfg = ledger.cfg
+    # One word is a command line for bash (pipes, &&); more are a command and its arguments.
+    command = args.command[0] if len(args.command) == 1 else shlex.join(args.command)
+    timeout = args.timeout or cfg.run_timeout
+    prefix = runner.env_prefix(ledger)
+    with runner.run_lock(ledger, "arl guard") if not args.no_lock else contextlib.nullcontext():
+        jobs.require_free_machine(cfg)
+        limits = [f"{timeout:.0f} s"]
+        if cfg.max_run_rss_gb is not None:
+            limits.append(f"{cfg.max_run_rss_gb:g} GB for its processes")
+        if cfg.stop_below_free_ram_gb is not None:
+            limits.append(f"stopped below {cfg.stop_below_free_ram_gb:g} GB of free RAM")
+        print(f"arl guard: limits {', '.join(limits)}; {'without' if args.no_lock else 'holding'} the run lock.", file=sys.stderr)
+        if prefix is not None and not (prefix / "bin" / "python").exists():
+            print(f"arl guard: the environment the contract names is not on this machine ({cfg.env_prefix}): python is whatever the PATH has.", file=sys.stderr)
+        res = runner.execute(command, Path.cwd(), runner.job_env(ledger), timeout, None, max_rss_gb=cfg.max_run_rss_gb, min_free_ram_gb=cfg.stop_below_free_ram_gb, peak=True)
+    # The largest single process as the kernel kept it, which a sample a second can miss.
+    # In arl's own process it includes git's, which are small.
+    largest = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024**2
+    stopped = res["stopped"] or res["paused"]  # out of RAM is a stop here: a check is not continued
+    code = res["exit_code"]
+    code = 128 - code if code < 0 else code  # what a shell says for a process a signal ended
+    if stopped:
+        print(f"arl guard: STOPPED, {stopped}. The command and everything it started were ended.", file=sys.stderr)
+        code = code or 128 + signal.SIGTERM
+    print(f"arl guard: exit {code}, {res['seconds']:.1f} s, peak memory {_size(max(res['peak_gb'], largest))}", file=sys.stderr)
+    return code
+

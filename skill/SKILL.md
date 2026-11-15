@@ -64,7 +64,9 @@ the user later says to go on, start at step 2 above with `arl resume`.
   environment `arl.toml` names. Never install into it, create another one or
   run the work elsewhere. If `next` says `environment`, or a run fails on an
   import, stop and tell the user. For your own quick checks use the
-  interpreter `arl reload` names.
+  interpreter `arl reload` names, and run anything heavier than a few
+  seconds through `arl guard -- <command>` (the same environment, the
+  memory limits and the run lock; it records and scores nothing).
 - **Long runs go in the background** (Bash with `run_in_background`), and you
   wait for the notification. Read logs with `arl exp log <id>`, never whole.
 - **Exit codes of `arl exp run`:** 0 a result, 2 the run failed, 3 the run was

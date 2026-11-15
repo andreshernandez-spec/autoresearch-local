@@ -143,7 +143,11 @@ what you had only in your head. So write things down when they happen:
     route a run around it (another interpreter in the command, a venv of your
     own). A package that is missing or broken is not a result and not yours to
     repair: stop and tell the person. For what you run yourself outside arl (a
-    quick check, a test), use the interpreter `arl reload` names.
+    quick check, a test), use the interpreter `arl reload` names, and run
+    anything heavier than a few seconds through `arl guard -- <command>`: the
+    same environment, the machine's memory limits and the run lock, and
+    nothing recorded. It runs whatever it is given and scores nothing, so
+    rule 2 holds for it too: never the evaluator.
 14. **A run is decided by what is on record.** Whatever decides the result is
     in `params.json` or in the committed code: the random seed, the number of
     steps, every setting. Nothing comes from the clock, an environment
@@ -162,6 +166,7 @@ what you had only in your head. So write things down when they happen:
 | "The evaluator misses what my change improves." | It may. Write it in IDEAS.md (kind: evaluator) and raise it at the next introspection. The score stands. |
 | "The gain is just under the threshold but it looks real." | Neutral is neutral. Repeat it with `--allow-duplicate` to see the noise, or discard. |
 | "A quick score outside arl first, to see if it is worth designing." | That is the experiment. Draft it. |
+| "It is only a quick check, it can run on the side." | If it takes more than a few seconds, `arl guard -- <command>`. A check that grows past the memory limit is stopped before it takes the machine down, and it waits while a run holds the lock. |
 | "This is only a small tune, the design can be one word." | The prediction is what makes the result worth anything. Write it. |
 | "The result is odd, I will adjust the design text to match what I meant." | The design is locked. Say in the analysis what you meant and what happened. |
 | "An introspection is due, but one more experiment first." | The gate is closed for a reason. Introspect. |

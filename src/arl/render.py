@@ -453,6 +453,9 @@ def reload_text(ledger: Ledger, handoff: dict[str, Any] | None = None, env: list
     tracks = ", ".join(f"{ledger.name}/tracks/{t.name}.md" for t in ledger.tracks() if t.status == "active") or "none yet"
     out += env or []
     out += [
+        f"==> A check of your own that takes more than a few seconds: {LAUNCHER} guard -- <command>. It runs in the",
+        "    environment runs use, under the machine's memory limits and the run lock, and records and scores nothing.",
+        "",
         "==> Also part of your instructions. Read them again if this session has not, or has been cut short since:",
         f"  {ROOT / 'PROTOCOL.md'}",
         f"  {ledger.program_path}",
